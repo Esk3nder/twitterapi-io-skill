@@ -215,7 +215,15 @@ def stream(c: Client, *, seconds=None, on_event=None):
     Events observed per vendor docs: connected, ping, tweet, fast_tweet.
     Matched tweets arrive batched in `tweets[]` with rule_id and rule_tag.
     """
-    print(f"[realtime] {active_rule_warning(c)}", file=sys.stderr)
+    warning = active_rule_warning(c)
+    print(f"[realtime] {warning}", file=sys.stderr)
+    if "none active" in warning or warning.startswith("0 rule"):
+        # Connecting with no active rule succeeds and then delivers nothing,
+        # which reads as a broken stream rather than an empty one.
+        print("[realtime] NOTE: with no ACTIVE rule the stream will connect and "
+              "stay empty. Create one with `rules add --tag T --value 'QUERY' "
+              "--confirm`, then `rules activate --rule-id ID --tag T --value "
+              "'QUERY' --confirm`.", file=sys.stderr)
     ws = WebSocketClient(c.key).connect()
     print(f"[realtime] connected to wss://{WS_HOST}{WS_PATH}", file=sys.stderr)
     started = time.time()

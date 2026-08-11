@@ -109,6 +109,19 @@ def check_contracts(c, facts, observed_out=None):
         try:
             resp = c._raw("GET", spec["path"], params)
         except APIError as e:
+            # A failed request is NOT contract drift. Reporting "the API
+            # changed" when the real cause is a bad key sends a first-time
+            # user off editing facts.json for nothing.
+            if e.status in (401, 402, 403, 429) or e.status >= 500:
+                raise EnvironmentError(
+                    {401: "TWITTERAPI_IO_KEY is invalid or expired.",
+                     403: "TWITTERAPI_IO_KEY lacks access to this endpoint.",
+                     402: "Account is out of credits — top up at "
+                          "https://twitterapi.io/dashboard.",
+                     429: "Rate limited. Wait and retry; QPS scales with balance.",
+                     }.get(e.status, f"twitterapi.io returned {e.status} — "
+                                     f"likely a transient outage, retry later.")
+                    + f"  (on {name} -> {spec['path']})") from None
             drift.append((name, "request failed", str(e)[:90]))
             print(f"  DRIFT  {name:16s} request failed: {str(e)[:60]}")
             continue
@@ -201,9 +214,17 @@ def main(argv=None):
     drift = check_internal_consistency(facts)   # offline, free, runs first
     c = Client(verbose=False)
     observed = {}
-    drift += check_contracts(c, facts, observed)
-    if a.pricing:
-        drift += check_pricing(c, facts)
+    try:
+        drift += check_contracts(c, facts, observed)
+        if a.pricing:
+            drift += check_pricing(c, facts)
+    except EnvironmentError as e:
+        # Setup/account problem, not a contract change. Exit 2 so callers and
+        # CI can tell "fix your key" apart from "the API moved" (exit 1).
+        print(f"\nCANNOT VERIFY — this is a setup problem, not API drift:\n  {e}\n"
+              f"\nNothing about the recorded facts has been called into question. "
+              f"Fix the above and re-run.", file=sys.stderr)
+        return 2
 
     print(f"\n  spent ${c.spent_usd:.4f} on verification")
 

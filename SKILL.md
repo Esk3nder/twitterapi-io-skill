@@ -1,6 +1,6 @@
 ---
 name: twitterapi-io
-description: Use when reading X/Twitter data — scraping followers or an audience graph, pulling a user's tweet history over a date range, searching tweets with X operators, monitoring accounts for new posts, or streaming matched tweets in real time — via twitterapi.io, api.twitterapi.io, or an x-api-key REST call without the official X developer portal.
+description: Use when reading X/Twitter data — followers or an audience graph, a user's tweet history over a date range, searching tweets with X operators, monitoring accounts for new posts, or streaming matched tweets — and whenever a request names an X/Twitter @handle, an x.com or twitter.com link, or a tweet ID and asks what was posted, who follows whom, or how something spread. Also for twitterapi.io, api.twitterapi.io, or x-api-key REST calls without the official X developer portal.
 ---
 
 # twitterapi.io

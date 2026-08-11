@@ -4,6 +4,12 @@ An [Agent Skill](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/o
 for reading X/Twitter data through [twitterapi.io](https://twitterapi.io) —
 for Claude Code, Codex, Cursor, and any agent that loads `SKILL.md`.
 
+**Invoke it as `/twitterapi-io`, or just mention an account.** The skill
+advertises its own triggers, so an agent loads it on its own when you write
+`@jack`, paste an `x.com` link or a tweet ID, or ask anything about followers,
+tweet history, or how a post spread. The slash command is there for when you
+want to force it or read what it says.
+
 **Read-only. Standard library only — nothing to `pip install`.** 31 endpoints,
 with every path, parameter spelling, response shape and price confirmed by live
 API calls and re-checkable in 15 seconds.
@@ -68,7 +74,23 @@ cd ~/.claude/skills/twitterapi-io && python3 scripts/verify.py
 # -> All recorded facts still hold.        (~$0.002, ~15s)
 ```
 
-Non-zero exit means something is wrong — see [`tests/TRIAGE.md`](tests/TRIAGE.md).
+`verify.py` distinguishes the two failure modes: **exit 2** means a setup
+problem (bad key, no credits, rate limited) with the cause named, **exit 1**
+means the API itself has drifted from the recorded facts. See
+[`tests/TRIAGE.md`](tests/TRIAGE.md).
+
+**Platform:** developed and tested on macOS and Linux. The Python is portable,
+but `run_e2e.sh` is a bash script and the setup lines above assume a POSIX
+shell — on Windows use WSL, or set the environment variable your own way and
+call the Python entry points directly.
+
+**To remove it:** delete the clone and the symlink; the skill keeps no state
+elsewhere except the cache.
+
+```bash
+rm -rf ~/.claude/skills/twitterapi-io ~/.agents/skills/twitterapi-io
+rm -rf ~/.twitterapi-cache          # optional: the local data cache
+```
 
 ## 3. Use it from your agent
 
@@ -108,14 +130,17 @@ python3 scripts/workflows.py history openai --since 2026-06-01 --until 2026-07-0
 # poll for new posts; --state makes it resumable across restarts
 python3 scripts/workflows.py monitor openai,elonmusk --interval 60 --state s.json
 
-# analytical jobs, JSON to stdout
-python3 scripts/jobs.py brief openai --days 7
-python3 scripts/jobs.py overlap stripe vercel
-python3 scripts/jobs.py authority "crypto AI"
-python3 scripts/jobs.py authenticity someaccount --sample 500
-python3 scripts/jobs.py diffusion 2084352161404920316
-python3 scripts/jobs.py benchmark anthropicai,openai --days 30
-python3 scripts/jobs.py drift my_cohort
+# analytical jobs, JSON to stdout — cents unless marked
+python3 scripts/jobs.py brief openai --days 7            # ~$0.01
+python3 scripts/jobs.py authenticity someaccount --sample 500   # ~$0.01
+python3 scripts/jobs.py diffusion 2084352161404920316    # ~$0.02
+python3 scripts/jobs.py benchmark anthropicai,openai --days 30  # ~$0.02
+python3 scripts/jobs.py drift my_cohort                  # $0, reads the store
+
+# these two crawl graphs — DOLLARS, not cents. Start with a low ceiling.
+python3 scripts/jobs.py authority "crypto AI" --max-usd 1   # ~$1.50 uncapped
+python3 scripts/jobs.py overlap stripe vercel --max-usd 1   # scales with both
+                                                            # follower counts
 ```
 
 `--max-usd` (default $5) caps every command. **Exit codes:** `0` complete ·
