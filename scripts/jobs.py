@@ -74,7 +74,10 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
             queries.append(q)
         try:
             from store import parse_ts
-            for h, tweets in zip(chunk, c.bulk_search(queries)):
+            chunk_tweets = []
+            for h, res in zip(chunk, c.bulk_search(queries)):
+                tweets = res["tweets"]
+                chunk_tweets.extend(tweets)
                 stamps = []
                 for t in tweets:
                     ts = parse_ts(t.get("createdAt") or "")
@@ -82,18 +85,33 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
                         stamps.append(ts)
                     if t.get("id") not in seen:
                         seen.add(t.get("id")); out.append(t)
-                if len(tweets) >= PAGE and stamps:
-                    # Resume the walk BELOW this page rather than re-fetching
-                    # it: overlapping would bill the first page twice. Same
-                    # boundary rule as _search_window — re-include the oldest
-                    # second unless the whole page shares it.
+                # has_next_page is authoritative. A SHORT page can still have
+                # more behind it (results get filtered), so inferring
+                # completeness from len(tweets) < 20 silently loses data.
+                if not res["has_next_page"]:
+                    continue
+                if stamps:
                     oldest = min(stamps)
-                    resume = oldest if max(stamps) == oldest else oldest + 1
-                    needs_walk.append((h, resume))
-                elif len(tweets) >= PAGE:
+                    if max(stamps) == oldest and len(tweets) >= PAGE:
+                        # A full page inside ONE second: resuming below it would
+                        # drop the rest of that second silently. Hand the walk
+                        # the original bound so its own gap detection reports it.
+                        needs_walk.append((h, until_ts or int(time.time())))
+                    else:
+                        # Resume BELOW this page rather than re-fetching it.
+                        needs_walk.append((h, oldest + 1))
+                else:
                     needs_walk.append((h, until_ts or int(time.time())))
             if c.store:
-                c.store.put_tweets(out)
+                c.store.put_tweets(chunk_tweets)   # this chunk only, not all of `out`
+            # A batch is charged AFTER _raw_json's pre-check, so a single batch
+            # can cross the ceiling and return success. Check here or the
+            # "hard ceiling" silently isn't one.
+            if c._over_ceiling():
+                raise CostLimitExceeded(
+                    f"Spend ceiling hit at ${c.spent_usd:,.2f} of "
+                    f"${c.max_usd:,.2f} after a batched page; the corpus is "
+                    f"INCOMPLETE. Raise max_usd to fetch it fully.")
         except CostLimitExceeded:
             raise
         except Exception as e:
@@ -420,10 +438,19 @@ def cohort_drift(name, v_old=None, v_new=None, *, client=None):
 def competitive_benchmark(handles, *, days=30, client=None):
     """N entities on shared axes: reach, recent volume, top-post engagement."""
     c = client or _client()
+    # ONE corpus call for all handles so bulk_search actually batches them.
+    # Calling corpus([h]) per handle made every batch a single query, which
+    # defeated the point entirely.
+    since = _days_ago(days)
+    allt = corpus(handles, since_ts=since, client=c)
+    by_handle = {}
+    for t in allt:
+        by_handle.setdefault(
+            ((t.get("author") or {}).get("userName") or "").lower(), []).append(t)
     rows = []
     for h in handles:
         info = c.user_info(h)
-        tw = corpus([h], since_ts=_days_ago(days), client=c)
+        tw = by_handle.get(h.lstrip("@").lower(), [])
         peak = max((t.get("likeCount", 0) for t in tw), default=0)
         rows.append({"handle": h, "followers": info.get("followers"),
                      "tweets_in_window": len(tw), "peak_likes": peak,

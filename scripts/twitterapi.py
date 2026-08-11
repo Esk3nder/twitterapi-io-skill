@@ -602,8 +602,21 @@ class Client:
         for i in range(len(body["queries"])):
             r = results.get(f"query_{i}") or {}
             tweets = r.get("tweets") or []
-            self._charge("search", len(tweets), 20)
-            out.append(tweets)
+            # _charge() subtracts the per-request floor because _bill_request
+            # booked it — but ONE request produced all N sub-results here, so
+            # subtracting per sub-result under-counts by (N-1) x floor.
+            # Charge sub-results at full rate; the request's own floor is
+            # already on the books.
+            with self._lock:
+                self.spent_credits += max(
+                    self.page_credits("search", len(tweets), 20)
+                    - (MIN_REQUEST_CREDITS if i == 0 else 0), 0.0)
+            # has_next_page is authoritative for "more exists"; a short page is
+            # NOT proof of completeness (results can be filtered). Callers that
+            # infer from length alone silently lose data.
+            out.append({"tweets": tweets,
+                        "has_next_page": bool(r.get("has_next_page")),
+                        "next_cursor": r.get("next_cursor") or ""})
         return out
 
     def community_info(self, community_id) -> dict:
