@@ -55,13 +55,63 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
     """
     c = client or _client()
     handles = [h.lstrip("@") for h in handles if h]
-    out = []
-    for h in handles:
+    out, seen, needs_walk = [], set(), []
+
+    # Batch the FIRST page of every handle: bulk_search runs N queries in one
+    # request, the only lever against the 20 QPS ceiling. A handle whose first
+    # page is short is already complete and needs no walk at all; only handles
+    # that filled a page can have more behind them.
+    BATCH, PAGE = 10, 20
+    for i in range(0, len(handles), BATCH):
+        chunk = handles[i:i + BATCH]
+        queries = []
+        for h in chunk:
+            q = f"from:{h}"
+            if since_ts:
+                q += f" since_time:{since_ts}"
+            if until_ts:
+                q += f" until_time:{until_ts}"
+            queries.append(q)
+        try:
+            from store import parse_ts
+            for h, tweets in zip(chunk, c.bulk_search(queries)):
+                stamps = []
+                for t in tweets:
+                    ts = parse_ts(t.get("createdAt") or "")
+                    if ts:
+                        stamps.append(ts)
+                    if t.get("id") not in seen:
+                        seen.add(t.get("id")); out.append(t)
+                if len(tweets) >= PAGE and stamps:
+                    # Resume the walk BELOW this page rather than re-fetching
+                    # it: overlapping would bill the first page twice. Same
+                    # boundary rule as _search_window — re-include the oldest
+                    # second unless the whole page shares it.
+                    oldest = min(stamps)
+                    resume = oldest if max(stamps) == oldest else oldest + 1
+                    needs_walk.append((h, resume))
+                elif len(tweets) >= PAGE:
+                    needs_walk.append((h, until_ts or int(time.time())))
+            if c.store:
+                c.store.put_tweets(out)
+        except CostLimitExceeded:
+            raise
+        except Exception as e:
+            # Batching is an optimisation, never a correctness dependency:
+            # fall back to walking every handle rather than losing data.
+            print(f"[jobs] bulk_search unavailable ({type(e).__name__}); "
+                  f"falling back to per-handle walks", file=sys.stderr)
+            needs_walk = [(h, until_ts or int(time.time())) for h in chunk] + needs_walk
+
+    # Only the busy handles pay for a full sliding-window walk. Dedupe by id
+    # absorbs the first page the walk re-fetches.
+    for h, resume_ts in needs_walk:
         # CostLimitExceeded propagates: a truncated corpus must never be
         # returned as if it were complete — brief/narrative/benchmark would
         # silently compare complete-vs-partial windows.
-        out.extend(_search_window(c, f"from:{h}",
-                                  since_ts or 0, until_ts or int(time.time())))
+        for t in _search_window(c, f"from:{h}", since_ts or 0, resume_ts):
+            if t.get("id") not in seen:      # the walk re-fetches page 1
+                seen.add(t.get("id")); out.append(t)
     return out
 
 
