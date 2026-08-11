@@ -1,0 +1,16 @@
+# Never commit credentials. The key belongs in the environment only.
+.env
+*.key
+secrets*
+
+# Local cache: contains fetched X data and is machine-specific.
+*.db
+*.db-wal
+*.db-shm
+
+# Crawl output
+*.jsonl
+
+__pycache__/
+*.pyc
+.DS_Store

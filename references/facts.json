@@ -1,0 +1,49 @@
+{
+  "_readme": [
+    "MACHINE-CHECKABLE EVIDENCE. Regenerate with: python3 scripts/verify.py --update",
+    "Prose lives in verified-facts.md; THIS file is what scripts/verify.py diffs",
+    "the live API against, and what Client reads to warn when it has gone stale.",
+    "Never hand-edit `observed_at` — it is a claim about when someone looked."
+  ],
+  "verified_at": "2026-08-10",
+  "verified_against": "https://api.twitterapi.io",
+  "staleness_warn_days": 90,
+
+  "response_contracts": {
+    "_note": "top_level_keys is the exact key SET (stable even when content is not). items_key is where the records live; items_in 'data' means the array is nested under `data` while pagination stays at the ROOT.",
+    "user_info":       {"top_level_keys": ["data", "msg", "status"], "items_in": "data", "items_key": null},
+    "follower_ids":    {"top_level_keys": ["code", "has_next_page", "ids", "msg", "next_cursor", "status"], "items_in": "root", "items_key": "ids", "page_max": 5000},
+    "followers":       {"top_level_keys": ["code", "followers", "has_next_page", "msg", "next_cursor", "status"], "items_in": "root", "items_key": "followers", "page_max": 200},
+    "followings":      {"top_level_keys": ["code", "followings", "has_next_page", "msg", "next_cursor", "status"], "items_in": "root", "items_key": "followings", "page_max": 200},
+    "last_tweets":     {"top_level_keys": ["code", "data", "has_next_page", "msg", "next_cursor", "status"], "items_in": "data", "items_key": "tweets", "page_max": 20},
+    "search":          {"top_level_keys": ["has_next_page", "next_cursor", "tweets"], "items_in": "root", "items_key": "tweets", "page_max": 20},
+    "replies_v2":      {"top_level_keys": ["has_next_page", "msg", "next_cursor", "status", "tweets"], "items_in": "root", "items_key": "tweets", "page_max": 38},
+    "retweeters":      {"top_level_keys": ["has_next_page", "next_cursor", "users"], "items_in": "root", "items_key": "users", "page_max": 20},
+    "trends":          {"top_level_keys": ["metadata", "msg", "status", "trends"], "items_in": "root", "items_key": "trends"},
+    "community_info":  {"top_level_keys": ["community_info", "msg", "status"], "items_in": "root", "items_key": null}
+  },
+
+  "pricing": {
+    "_note": "credits per record, measured by balance delta. 100000 credits = $1. Re-measure with: python3 scripts/verify.py --pricing (takes ~3 min of settle waits).",
+    "credits_per_usd": 100000,
+    "min_request_credits": 15,
+    "free_endpoints": ["/oapi/my/info"],
+    "tiers": {
+      "follower_ids": [[4000, 0.45], [200, 1.0], [50, 2.0]],
+      "followers":    [[200, 1.0], [100, 2.0], [20, 3.0]]
+    },
+    "flat": {"profile": 18, "tweet": 15}
+  },
+
+  "qps_ladder": {
+    "_note": "Documented at twitterapi.io/qps-limits, not independently measurable. The advertised '200 QPS' is marketing copy; 20 is the observed ceiling.",
+    "source": "https://twitterapi.io/qps-limits",
+    "ladder": [[50000, 20], [10000, 10], [5000, 6], [1000, 3], [0, 0.2]]
+  },
+
+  "error_semantics": {
+    "http_200_body_error": {"status": "error", "note": "failure arrives as HTTP 200 with a body-level status; must be raised, never cached"},
+    "missing_path": 404,
+    "existing_path_no_params": 400
+  }
+}

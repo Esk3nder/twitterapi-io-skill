@@ -1,0 +1,51 @@
+# Paid E2E suite against the live twitterapi.io API (~$0.13/run).
+#
+# Deliberately NOT per-push: every run spends real money from the account
+# behind the TWITTERAPI_IO_KEY secret. Manual dispatch + a weekly canary is
+# enough to catch vendor contract drift (envelopes, pricing, pagination).
+#
+# If the secret is unset, run_e2e.sh prints a notice and exits 0 (skip, not
+# failure) — so forks without the secret stay green.
+name: e2e-paid
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC — weekly contract canary
+
+concurrency:
+  group: e2e-paid          # never two paid runs racing one QPS budget
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # stdlib only — no pip install step
+
+      # Runs first: ~$0.002 and ~15s. If the API's response contracts have
+      # drifted, every recorded fact downstream is suspect, so fail here
+      # before spending the suite's budget proving it in a slower way.
+      - name: Verify recorded API facts still hold
+        env:
+          TWITTERAPI_IO_KEY: ${{ secrets.TWITTERAPI_IO_KEY }}
+        run: python3 scripts/verify.py
+
+      - name: Run paid E2E suite (budget-capped at $0.25)
+        env:
+          TWITTERAPI_IO_KEY: ${{ secrets.TWITTERAPI_IO_KEY }}
+        run: bash run_e2e.sh
+
+      - name: Explain a drift failure
+        if: failure()
+        run: |
+          echo "::warning::If 'Verify recorded API facts' failed, the live API no"
+          echo "::warning::longer matches references/facts.json. Re-probe the named"
+          echo "::warning::endpoints, run 'python3 scripts/verify.py --update', and"
+          echo "::warning::fix any prose in references/verified-facts.md that repeats"
+          echo "::warning::the changed value. See tests/TRIAGE.md."
