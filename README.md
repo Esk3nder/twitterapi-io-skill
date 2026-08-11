@@ -55,18 +55,56 @@ ln -s ~/.claude/skills/twitterapi-io ~/.agents/skills/twitterapi-io
 
 Restart your agent session. Requires **Python 3.11+** (tested on 3.11 and 3.14).
 
-## 3. Quickstart
+**Confirm it works** — this re-probes the live API and exits non-zero if
+anything is wrong with your key or the install:
+
+```bash
+cd ~/.claude/skills/twitterapi-io && python3 scripts/verify.py
+# -> All recorded facts still hold.        (~$0.002, ~15s)
+```
+
+If that fails, see [`tests/TRIAGE.md`](tests/TRIAGE.md).
+
+## 3. Use it from your agent
+
+This is the intended path. Ask in plain language; the agent reads `SKILL.md`
+and runs the right command with the right cost guard.
+
+| You say | The agent does |
+|---|---|
+| "Get me @jack's follower IDs" | picks `followers_ids` (the cheap endpoint), prints an estimate, streams the IDs |
+| "What has @openai tweeted in the last month?" | `history` with a sliding time window, deduped |
+| "Who follows both @stripe and @vercel?" | crawls both, caches them, returns the intersection — the second run is free |
+| "Is @someaccount's audience real?" | samples followers and returns account-age and empty-profile signals for you to judge |
+| "Who reacted first to this tweet?" | orders repliers and quoters by time; counts retweeters separately |
+| "Give me an update on @polymarket" | pulls the profile plus recent posts and hands you the raw material |
+
+Two behaviors worth expecting:
+
+- **It will refuse expensive things and tell you the price.** Ask for all of a
+  large account's followers and you get "this is ~$1,085, over the $5 ceiling"
+  rather than a surprise bill. Raise it deliberately with `--max-usd`.
+- **It won't invent conclusions.** Jobs return structured data and the model
+  interprets it. If it says an audience looks inorganic, that judgment is the
+  model reading real signals, not a score the API returned.
+
+## 4. Quickstart (running the scripts directly)
+
+> **On a new account your first runs will feel slow, and that is correct.**
+> Rate limit scales with credit balance: a near-zero balance means **one
+> request every 5 seconds**. Nothing is broken; add credit and it speeds up to
+> 20 requests/second. See [Rate limits](#rate-limits).
 
 ```bash
 cd ~/.claude/skills/twitterapi-io
 
-# cheapest follower enumeration: IDs, 5,000 per request
+# cheapest follower enumeration: IDs, 5,000 per request   (~$0.02)
 python3 scripts/workflows.py --max-usd 1 audience jack --limit 5000
 
-# every tweet in a date range (sliding window, not cursors)
+# every tweet in a date range (sliding window, not cursors)  (~$0.02)
 python3 scripts/workflows.py history openai --since 2026-06-01 --until 2026-07-01
 
-# analytical jobs, JSON out
+# analytical jobs, JSON out                                  (~$0.01 each)
 python3 scripts/jobs.py brief openai --days 7
 python3 scripts/jobs.py diffusion 2084352161404920316
 ```
