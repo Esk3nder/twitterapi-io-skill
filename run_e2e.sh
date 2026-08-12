@@ -35,6 +35,7 @@ echo
 # real crawls.
 FILES=(
   test_00_pure
+  test_05_invariants
   test_10_errors
   test_20_envelopes
   test_30_refusals

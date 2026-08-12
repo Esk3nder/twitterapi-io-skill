@@ -262,6 +262,31 @@ query exhausted a $0.40 ceiling even with `min_faves:100` filtering. The guard
 correctly raised rather than returning a partial corpus. Bound narrative work
 with a tighter window, an engagement filter, or a deliberate higher ceiling.
 
+## `from:` search EXCLUDES native retweets — verified 2026-08-12
+
+A `from:USER` advanced_search never returns native retweets. Measured on two
+accounts, so this is search-syntax behaviour, not an account quirk:
+
+| query | tweets | with `retweeted_tweet` |
+|---|---|---|
+| `from:doodlestein` | 20 | **0** |
+| `from:doodlestein filter:nativeretweets` | 1 | 1 |
+| `from:elonmusk` | 20 | **0** |
+| `from:elonmusk filter:nativeretweets` | 20 | **20** |
+
+Consequences:
+
+- **A "complete history" built from `from:USER` is originals + replies +
+  quote tweets only.** Retweets require a SECOND pass with
+  `filter:nativeretweets`. Reporting the first pass as an account's full
+  output silently omits everything they amplified.
+- **`-filter:retweets` is a no-op** on a `from:` query — the records were
+  never there. Adding it changes nothing and implies a filter that is not
+  doing any work.
+- `-filter:replies` DOES work: it drops replies (19 -> 0 in the same sample).
+- Quote tweets are NOT retweets and ARE returned by `from:` (1,191 of them in
+  a 12,262-tweet doodlestein archive), carrying `quoted_tweet`.
+
 ## Errors
 
 - `400` -> `{"detail": "..."}` naming the bad/missing field. Also what an

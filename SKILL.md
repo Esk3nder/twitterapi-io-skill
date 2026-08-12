@@ -9,9 +9,11 @@ Read-only access to X data. Standard library only; nothing to install.
 
 Key in `TWITTERAPI_IO_KEY` (environment, never hardcoded). Scripts in `scripts/`.
 
-**Run the workflows; do not hand-roll requests.** Parameter casing, response
-envelopes, pagination and pricing all differ per endpoint, and `Client` encodes
-the correct answer for each.
+Use the workflows and jobs for their documented end-to-end tasks. Use the
+`Client`, `Cohort`, and `Store` library surface for composition, cache reuse,
+and endpoints without a dedicated workflow. Do not hand-roll HTTP requests:
+parameter casing, response envelopes, pagination, and pricing differ per
+endpoint, and `Client` encodes the measured contract.
 
 ## Which command
 
@@ -29,6 +31,8 @@ the correct answer for each.
 | Who moved early on a post | `jobs.py diffusion TWEET_ID` |
 | N entities on shared axes | `jobs.py benchmark a,b,c --days 30` |
 | Who joined/left a saved cohort | `jobs.py drift COHORT_NAME` |
+| Summarise a cached account corpus ($0) | `jobs.py catalogue USER` |
+| Reconstruct cached conversations ($0) | `jobs.py threads USER` |
 | Replies, quotes, lists, trends, bulk fan-out | `import twitterapi.Client` |
 
 ```bash
@@ -38,8 +42,8 @@ python3 scripts/jobs.py brief openai --days 7
 
 `--max-usd` (default $5) is a hard ceiling on every command.
 
-**Exit codes:** `0` complete · `2` refused before spending · `3` truncated by
-the ceiling — the dataset is partial, not broken.
+**Exit codes:** `0` complete for the stated scope · `2` refused before spending ·
+`3` partial because a ceiling or completeness boundary stopped the result.
 
 Jobs return JSON for you to interpret. They compute who and what; they do not
 compute themes, consensus, or whether engagement is organic. Do not present a
@@ -63,8 +67,9 @@ balance immediately after a request shows no change.
 3. **You cannot buy a partial page.** Asking for 3,000 IDs bills the full
    5,000-record page.
 
-`Client.estimate()` gives a figure before spending. Confirm with the user
-before any crawl over a few dollars.
+`Client.estimate()` gives a conservative upper bound before spending, not a
+prediction. Deleted/filtered posts and finite search-index depth can make a
+history cost less. Confirm with the user before any crawl over a few dollars.
 
 `overlap` and `authority` estimate up front and refuse rather than start an
 unaffordable crawl. `authority` returns `complete: false` when the ceiling
@@ -97,6 +102,23 @@ this; getting the boundary wrong drops ~10% of results.
 inside one second. `history_search` reports `INCOMPLETE` with the affected
 timestamps rather than dropping them silently.
 
+**`from:USER` excludes native retweets.** Default `history` is originals +
+replies + quote tweets and prints that scope. Pass `--include-retweets` for a
+second `filter:nativeretweets` pass under the same ceiling. The two passes are
+deduplicated by id. `--exclude-retweets` is retained only as an explicit no-op.
+`--max-pages N` applies separately to each search pass, so including native
+retweets can fetch up to `2N` pages total.
+
+**Search-index depth is not account age.** For an open-ended handle history,
+the workflow compares the oldest reached tweet with the author's profile
+`createdAt`. If lifetime coverage cannot be established it prints
+`INDEX COVERAGE: PARTIAL` and exits `3`; do not call the result a full archive.
+
+`IncompleteDataError` means records already returned are valid but the client
+cannot prove the requested result complete (contract drift, cursor failure,
+unsplittable timestamp, page cap, or equivalent). Propagate it or label the
+result partial; never convert it to an empty list or confident count.
+
 **Failures can arrive as HTTP 200** with `{"status": "error", ...}` in the
 body. Check the body, not just the status code; `Client` does.
 
@@ -117,14 +139,26 @@ them by their profile `createdAt` invents a false timeline.
 Resolving a cohort costs money; re-querying it is free. Graph and membership
 endpoints cache indefinitely; content endpoints always refetch.
 
+`Client.spend_report()` includes cache hits and dollars saved when nonzero.
+`$0.00` spent plus saved credits is a successful cached rerun, not a billing bug.
+`jobs.py catalogue USER` and `jobs.py threads USER` are pure local computations
+over cached tweet rows and make no API calls. Thread output covers only cached
+posts by that handle; external and uncached posts may be absent.
+
 ```python
 from cohort import Cohort
 from twitterapi import Client
 from store import Store
-c = Client(store=Store(), max_usd=10)
-Cohort.from_search("polymarket", client=c).save("pm_talkers")
-both = Cohort.load("pm_talkers", client=c).intersect(Cohort.load("crypto_ai", client=c))
+s = Store()
+c = Client(store=s, max_usd=10)
+Cohort.from_search("polymarket", client=c, store=s).save("pm_talkers")
+both = Cohort.load("pm_talkers", client=c, store=s).intersect(
+    Cohort.load("crypto_ai", client=c, store=s))
 ```
+
+Use `Cohort.from_ids(s.follower_ids_for("account"), client=c, store=s)` to
+compose a cohort from follower IDs already bought. `hydrate(max_usd=...)`
+returns the fetched profiles and fills the cohort's member handles.
 
 ## Not implemented
 

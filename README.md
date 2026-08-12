@@ -125,7 +125,9 @@ python3 scripts/workflows.py audience jack --verified-only # verified subset
 
 # history over a date range, streamed to JSONL
 python3 scripts/workflows.py history openai --since 2026-06-01 --until 2026-07-01 \
-  --exclude-replies --exclude-retweets --out tweets.jsonl
+  --exclude-replies --out tweets.jsonl
+# `from:` omits native retweets; opt into the second, deduplicated search pass
+python3 scripts/workflows.py history openai --include-retweets --out tweets.jsonl
 
 # poll for new posts; --state makes it resumable across restarts
 python3 scripts/workflows.py monitor openai,elonmusk --interval 60 --state s.json
@@ -136,6 +138,8 @@ python3 scripts/jobs.py authenticity someaccount --sample 500   # ~$0.01
 python3 scripts/jobs.py diffusion 2084352161404920316    # ~$0.02
 python3 scripts/jobs.py benchmark anthropicai,openai --days 30  # ~$0.02
 python3 scripts/jobs.py drift my_cohort                  # $0, reads the store
+python3 scripts/jobs.py catalogue openai                 # $0, cached summary
+python3 scripts/jobs.py threads openai                   # $0, cached threads
 
 # these two crawl graphs — DOLLARS, not cents. Start with a low ceiling.
 python3 scripts/jobs.py authority "crypto AI" --max-usd 1   # ~$1.50 uncapped
@@ -143,12 +147,15 @@ python3 scripts/jobs.py overlap stripe vercel --max-usd 1   # scales with both
                                                             # follower counts
 ```
 
-`--max-usd` (default $5) caps every command. **Exit codes:** `0` complete ·
-`2` refused before spending · `3` truncated by the ceiling, so the output is
-partial rather than wrong.
+`--max-usd` (default $5) caps every command. **Exit codes:** `0` complete for
+the stated scope · `2` refused before spending · `3` partial because a spend,
+pagination, timestamp, page-cap, or search-index boundary prevented a complete
+result.
 
 Add `--out FILE` to stream JSONL instead of stdout, and `--max-pages N` to
-bound an open-ended history walk.
+bound an open-ended history walk. The page cap applies separately to each
+search pass; `--include-retweets --max-pages N` can therefore fetch up to
+`2N` pages total.
 
 ## 5. Python API
 
@@ -156,44 +163,60 @@ The scripts are thin wrappers; the library is the real surface.
 
 ```python
 import sys; sys.path.insert(0, "scripts")
-from twitterapi import Client
+from twitterapi import Client, IncompleteDataError
 from store import Store
 from cohort import Cohort
 
-c = Client(store=Store(), max_usd=10)      # caching on, hard ceiling
+s = Store()
+c = Client(store=s, max_usd=10)            # caching on, hard ceiling
 
 c.estimate("follower_ids", 200_000_000)    # -> 900.0 dollars, before spending
 c.bulk_search(["from:openai", "from:anthropicai", "from:google"])  # 3 queries, 1 request
-c.paginate("community_members", "1493446837214187523", limit=500)  # any of 31 endpoints
+c.paginate("community_members", "1493446837214187523", limit=500)  # one of the 27 paginated endpoints
 ```
+
+Pagination and history calls raise `IncompleteDataError` when the API claims
+more data exists but omits a required field/cursor, a time window cannot split
+a busy second, a page cap stops the walk, or another safe completion boundary
+is unavailable. Treat records already yielded as valid but partial; do not turn
+the exception into a zero count.
 
 **Cohorts** are named, versioned account sets — the reusable asset. Build one,
 save it, and every later question over it is free:
 
 ```python
-team = (Cohort.from_search("polymarket", limit=200, client=c)
-        .hydrate()                              # IDs -> full profiles
-        .filter(bio_matches=r"polymarket", min_followers=500))
+team = Cohort.from_search("polymarket", limit=200, client=c, store=s)
+profiles = team.hydrate(max_usd=1)          # returns profiles; fills handles
+team = team.filter(bio_matches=r"polymarket", min_followers=500)
 team.save("pm_team")                            # versioned
 
 # set algebra across cohorts, matching on id OR handle
-both = Cohort.load("pm_talkers", client=c).intersect(Cohort.load("crypto_ai", client=c))
+both = Cohort.load("pm_talkers", client=c, store=s).intersect(
+    Cohort.load("crypto_ai", client=c, store=s))
+
+# reuse follower IDs already present in paid cached pages; no API call
+followers = Cohort.from_ids(s.follower_ids_for("openai"), client=c, store=s)
 
 # who does this scene itself follow? in-degree over its own follow graph
 Cohort.from_search("crypto AI", limit=150, client=c).authority(max_usd=5).top(20)
 ```
 
-Resolvers: `from_account`, `from_search`, `from_engagers`, `from_community`,
-`from_list`. Combine with `union` / `intersect` / `minus`.
+Resolvers: `from_ids`, `from_account`, `from_search`, `from_engagers`,
+`from_community`, `from_list`. Combine with `union` / `intersect` / `minus`.
 
 **The store** answers questions over already-paid-for data at no cost:
 
 ```python
-s = Store()
-s.tweets_for(user_names=["openai"], since=1780000000)   # cached corpus, free
+s.tweets_for(user_names=["openai"], since=1780000000)   # cached posts authored by these accounts; free
+s.follower_ids_for("openai")                            # paid crawl pages, free
 s.list_cohorts(); s.cohort_versions("pm_team")          # what you've saved
+s.delete_cohort("test_cohort")                          # members + metadata
 s.stats()                                               # rows held, credits saved
 ```
+
+`tweets_for(...)` filters by tweet author. Cached mentions *of* an account are
+authored by other users and therefore are not returned when filtering for the
+mentioned account's handle.
 
 ## Money
 
@@ -214,6 +237,9 @@ at the default page size. Same data.
 - You cannot buy a partial page — 3,000 IDs bills the full 5,000-record page.
 - Billing settles 20–60s late, so a balance read straight after a call shows no
   change. Use `client.spend_report()` for the live figure.
+- `Client.estimate()` is a conservative **upper bound**, not a prediction of
+  actual history spend. Deleted posts, query filters, native-retweet exclusion,
+  and finite search-index depth can make the reachable corpus smaller.
 
 `overlap` and `authority` estimate first and refuse rather than start a crawl
 they cannot afford. `authority` returns `complete: false` if a ceiling cut its
@@ -240,6 +266,10 @@ request; bigger pages cut request count (`follower_ids` 5,000 vs `followers`
 Graph and membership endpoints cache indefinitely in local sqlite; content
 endpoints always refetch. A repeated 10,000-follower crawl costs **$0.045 the
 first time and $0.00 the second** — asserted in the test suite.
+
+Every workflow's final `spend_report()` names both session spend and, when
+present, cache hits plus dollars saved. A `$0.00` rerun with saved credits means
+the cache worked; it is not missing accounting.
 
 The cache lives at `~/.twitterapi-cache/store.db`. Deleting it is safe; it only
 makes the next crawl paid again.
@@ -273,7 +303,7 @@ Four layers keep a stale fact from passing as true:
 |---|---|---|
 | `verify.py` | contract or price drift | on demand, ~$0.002 |
 | Runtime warning | facts older than 90 days | at first API call |
-| `run_e2e.sh` (40 tests) | behavioural regressions | before release, ~$0.12 |
+| `run_e2e.sh` (80 tests) | behavioural regressions | before release, ~$0.12 |
 | Weekly CI | drift nobody looked for | Mondays, automatic |
 
 Without a key, all of these skip with a notice rather than failing.
@@ -281,6 +311,18 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
 
 ## Known limitations
 
+- **`from:USER` search excludes native retweets.** Default `history` output is
+  originals + replies + quote tweets and prints that scope. Pass
+  `--include-retweets` for a second `filter:nativeretweets` pass under the same
+  spend ceiling; results are deduplicated by tweet id.
+- **Search-index depth is not account age.** An open-ended history may stop
+  years after the account was created even when the profile states more posts.
+  `history` compares the oldest reached date with profile `createdAt`, prints
+  `INDEX COVERAGE: PARTIAL`, and exits `3` when lifetime coverage cannot be
+  established. `statusesCount`-based prices are therefore upper bounds.
+- **Cached thread reconstruction is scoped, not omniscient.** `jobs.py threads`
+  groups that handle's cached posts by `conversationId`; external participants
+  and uncached or deleted posts may be absent, and the output says so.
 - **Community IDs are not discoverable** — the all-community search returns
   `communityInfo: null`. `community/info` and `community/members` need an ID
   from a community URL.
@@ -311,11 +353,11 @@ references/verified-facts.md  prose evidence and rationale
 scripts/twitterapi.py         31 endpoints: casing, envelopes, cost, QPS, cache
 scripts/store.py              sqlite cache, normalisers, versioned cohorts
 scripts/cohort.py             resolvers, set algebra, authority ranking
-scripts/jobs.py               8 analytical jobs
+scripts/jobs.py               analytical jobs, including $0 catalogue/threads
 scripts/workflows.py          audience, history, monitor
 scripts/realtime.py           filter rules + stdlib websocket client
 scripts/verify.py             re-probe the API, diff against facts.json
-tests/ + run_e2e.sh           40-test live E2E suite, cost-capped
+tests/ + run_e2e.sh           cost-capped deterministic + live E2E suite
 tests/TRIAGE.md               failure class -> cause -> next step
 ```
 

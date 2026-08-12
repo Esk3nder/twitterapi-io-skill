@@ -22,7 +22,8 @@ import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, CostLimitExceeded, credits_to_usd  # noqa: E402
+from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
+                        credits_to_usd)  # noqa: E402
 
 TW_FMT = "%a %b %d %H:%M:%S %z %Y"      # verified: "Mon Aug 10 17:16:53 +0000 2026"
 
@@ -136,7 +137,6 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         int(datetime.strptime(until, "%Y-%m-%d")
             .replace(tzinfo=timezone.utc).timestamp()) if until else None)
     seen, pages = set(), 0
-    gaps = []                       # seconds where tweets were provably dropped
     while True:
         q = query
         if since_ts:
@@ -144,7 +144,8 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         if until_ts:
             q += f" until_time:{until_ts}"
         resp = c._raw("GET", "/twitter/tweet/advanced_search",
-                      {"query": q, "queryType": "Latest"})
+                      {"query": q, "queryType": "Latest"},
+                      max_credits=Client.page_credits("search", 20, 20))
         batch = resp.get("tweets") or []
         c._charge("search", len(batch), 20)
         pages += 1
@@ -168,18 +169,25 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
             print(f"  page {pages}: {len(batch)} returned, {fresh} new, "
                   f"{len(seen):,} total, ${c.spent_usd:,.4f}", file=sys.stderr)
 
-        # Ceiling is checked before deciding to fetch another page, not after
-        # an early return, so a low ceiling cannot be silently overrun.
+        if len(batch) < 20:
+            break                       # short page = genuinely end of range
+        if not stamps:
+            raise IncompleteDataError(
+                f"full search page had no parseable createdAt timestamps; "
+                f"the {len(seen):,} tweets already yielded are valid, but no "
+                f"safe resume boundary exists")
+        # A full page may require another paid request. At exact exhaustion,
+        # stop honestly before that next request; a short terminal page above
+        # already proves completeness and is allowed to finish at the ceiling.
         if c._over_ceiling():
             raise CostLimitExceeded(
                 f"Spend ceiling hit at ${c.spent_usd:,.2f} after {pages} pages; "
                 f"the {len(seen):,} tweets already yielded are valid and paid for.")
-        if len(batch) < 20 or not stamps:
-            break                       # short page = genuinely end of range
         if max_pages and pages >= max_pages:
-            print(f"  stopped at --max-pages {max_pages}; range NOT exhausted",
-                  file=sys.stderr)
-            break
+            raise IncompleteDataError(
+                f"stopped at --max-pages {max_pages} before the range was "
+                f"exhausted; the {len(seen):,} tweets already yielded are valid "
+                f"but the result is partial.")
 
         oldest = min(stamps)
         if max(stamps) == oldest:
@@ -187,14 +195,15 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
             # cannot page within a single second, so advancing past it drops
             # whatever else was posted in that second. Record it — never lose
             # data silently.
-            gaps.append(oldest)
             if progress:
                 print(f"  WARNING: 20+ tweets share second {oldest} "
                       f"({datetime.fromtimestamp(oldest, timezone.utc):%Y-%m-%d %H:%M:%S}Z). "
                       f"Time-window paging cannot split a second — some tweets "
                       f"in it are unreachable and are being skipped.",
                       file=sys.stderr)
-            new_until = oldest
+            raise IncompleteDataError(
+                f"20+ tweets share second {oldest}; time-window paging cannot "
+                f"split it, so the result is partial.")
         else:
             # Re-include the boundary second; dedupe by id handles the overlap.
             new_until = oldest + 1
@@ -204,39 +213,132 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         until_ts = new_until
         if since_ts and until_ts <= since_ts:
             break
-    if gaps:
-        print(f"  INCOMPLETE: {len(gaps)} second(s) had more tweets than a "
-              f"time window can retrieve; results are missing some tweets at "
-              f"{gaps[:5]}{'...' if len(gaps) > 5 else ''}", file=sys.stderr)
-
-
 def _history_cli(a):
     c = Client(max_usd=a.max_usd)
     q = f"from:{a.user}" if a.user else a.query
     if a.exclude_replies:
         q += " -filter:replies"
     if a.exclude_retweets:
-        q += " -filter:retweets"
+        # No-op kept for compatibility: a `from:` query never returns native
+        # retweets in the first place, so this filter removes nothing. Say so
+        # rather than implying work is being done.
+        print("[history] note: --exclude-retweets is redundant — `from:` search "
+              "never returns native retweets. Use --include-retweets to fetch "
+              "them in a second pass.", file=sys.stderr)
+    if a.include_retweets and not a.user:
+        print("REFUSED: --include-retweets needs the USER shorthand; with "
+              "--query, put filter:nativeretweets in the query explicitly.",
+              file=sys.stderr)
+        return 2
+
+    if not a.user:
+        scope = ("raw query results; composition depends on the query and "
+                 "native retweets are not added automatically")
+    elif a.include_retweets:
+        scope = ("originals + replies + quote tweets + native retweets included "
+                 "(two search passes)")
+    elif a.exclude_replies:
+        scope = ("originals + quote tweets; replies excluded; native retweets "
+                 "excluded by `from:` search")
+    else:
+        scope = ("originals + replies + quote tweets; native retweets excluded "
+                 "by `from:` search (pass --include-retweets for a second pass)")
+    print(f"[history] scope: {scope}", file=sys.stderr)
     print(f"query: {q!r}  window {a.since or 'any'} -> {a.until or 'now'}",
           file=sys.stderr)
     fh = open(a.out, "w") if a.out else sys.stdout
-    n = 0
+    queries = [q]
+    if a.include_retweets:
+        queries.append(f"from:{a.user} filter:nativeretweets")
+
+    seen, n = set(), 0
+    oldest_ts = account_created_ts = stated_posts = None
+    composition = {"originals": 0, "replies": 0, "quotes": 0,
+                   "native retweets": 0}
+    truncated = False
     try:
-        for t in history_search(q, a.since, a.until, client=c, max_pages=a.max_pages):
-            # isRetweet is not 100% reliable per the vendor guide; re-check here
-            if a.exclude_retweets and t.get("retweeted_tweet"):
-                continue
-            fh.write(json.dumps(t, ensure_ascii=False) + "\n")
-            n += 1
-        truncated = False
-    except CostLimitExceeded as e:
+        for search_query in queries:
+            if len(queries) > 1:
+                label = ("native-retweet pass" if "filter:nativeretweets" in search_query
+                         else "original/reply/quote pass")
+                print(f"[history] {label}: {search_query!r}", file=sys.stderr)
+            for t in history_search(search_query, a.since, a.until, client=c,
+                                    max_pages=a.max_pages):
+                # isRetweet is not 100% reliable per the vendor guide; corroborate
+                # it with retweeted_tweet, and dedupe across the two searches.
+                is_retweet = bool(t.get("isRetweet") or t.get("retweeted_tweet"))
+                if a.exclude_retweets and is_retweet:
+                    continue
+                tweet_id = t.get("id")
+                if tweet_id in seen:
+                    continue
+                seen.add(tweet_id)
+
+                try:
+                    stamp = int(parse_created_at(t["createdAt"]).timestamp())
+                    oldest_ts = stamp if oldest_ts is None else min(oldest_ts, stamp)
+                except Exception:
+                    pass
+                author = t.get("author") or {}
+                try:
+                    created = int(parse_created_at(author["createdAt"]).timestamp())
+                    account_created_ts = (created if account_created_ts is None
+                                          else min(account_created_ts, created))
+                except Exception:
+                    pass
+                try:
+                    posts = int(author.get("statusesCount"))
+                    stated_posts = max(stated_posts or 0, posts)
+                except (TypeError, ValueError):
+                    pass
+
+                is_reply = bool(t.get("isReply") or t.get("inReplyToId"))
+                is_quote = bool(t.get("quoted_tweet"))
+                if is_retweet:
+                    composition["native retweets"] += 1
+                if is_reply:
+                    composition["replies"] += 1
+                if is_quote:
+                    composition["quotes"] += 1
+                if not (is_retweet or is_reply or is_quote):
+                    composition["originals"] += 1
+
+                fh.write(json.dumps(t, ensure_ascii=False) + "\n")
+                n += 1
+    except (CostLimitExceeded, IncompleteDataError) as e:
         truncated = True
         print(f"\nSTOPPED: {e}", file=sys.stderr)
     finally:
         if a.out:
             fh.close()
+
+    print("[history] composition: " + " | ".join(
+        f"{name} {count:,}" for name, count in composition.items())
+        + " (reply/quote flags can overlap)", file=sys.stderr)
+    if stated_posts is not None:
+        upper_usd = credits_to_usd(stated_posts * 15 + len(queries) * 15)
+        print(f"[history] cost upper bound from {stated_posts:,} stated posts: "
+              f"<= ${upper_usd:,.2f} at 15 credits/post plus request floors. "
+              f"Actual spend can be lower because filters, deletions, excluded "
+              f"native retweets, and search-index depth reduce reachable results.",
+              file=sys.stderr)
+
+    index_limited = False
+    if (not truncated and a.user and not a.since and oldest_ts is not None
+            and account_created_ts is not None
+            and stated_posts is not None and stated_posts > n
+            and oldest_ts > account_created_ts + 86400):
+        index_limited = True
+        oldest_day = datetime.fromtimestamp(oldest_ts, timezone.utc).date()
+        created_day = datetime.fromtimestamp(account_created_ts, timezone.utc).date()
+        print(f"[history] INDEX COVERAGE: PARTIAL — the search ended at "
+              f"{oldest_day}, before @{a.user}'s {created_day} account creation. "
+              f"The emitted data is valid, but full-lifetime coverage cannot be "
+              f"established: search-index depth, filters, deletions, and quiet "
+              f"periods can all separate these dates.",
+              file=sys.stderr)
     print(f"{n:,} tweets | {c.spend_report()}", file=sys.stderr)
-    return 3 if truncated else 0
+    return 3 if truncated or index_limited else 0
 
 
 # ----------------------------------------------------------------- monitor --
@@ -314,7 +416,7 @@ def _monitor_cli(a):
                 once=a.once, lookback=a.lookback)
     except KeyboardInterrupt:
         print(f"\nstopped | {c.spend_report()}", file=sys.stderr)
-    except CostLimitExceeded as e:
+    except (CostLimitExceeded, IncompleteDataError) as e:
         # Non-zero on truncation, same contract as audience/history: a run cut
         # short by the ceiling must not report success.
         print(f"\nSTOPPED: {e}", file=sys.stderr)
@@ -345,7 +447,12 @@ def main(argv=None):
     h.add_argument("--since", help="YYYY-MM-DD")
     h.add_argument("--until", help="YYYY-MM-DD")
     h.add_argument("--exclude-replies", action="store_true")
-    h.add_argument("--exclude-retweets", action="store_true")
+    retweets = h.add_mutually_exclusive_group()
+    retweets.add_argument("--exclude-retweets", action="store_true",
+                          help="no-op: `from:` search never returns native retweets")
+    retweets.add_argument("--include-retweets", action="store_true",
+                          help="second pass with filter:nativeretweets to capture "
+                               "retweets, which `from:` alone omits entirely")
     h.add_argument("--max-pages", type=int)
     h.add_argument("--out")
     h.set_defaults(func=_history_cli)

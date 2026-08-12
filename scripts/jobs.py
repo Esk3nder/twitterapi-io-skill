@@ -28,9 +28,11 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from statistics import median
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, CostLimitExceeded, APIError  # noqa: E402
+from twitterapi import (APIError, Client, CostLimitExceeded,
+                        IncompleteDataError)  # noqa: E402
 from store import Store  # noqa: E402
 from cohort import Cohort  # noqa: E402
 
@@ -54,7 +56,17 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
     Content is time-sensitive, so this always hits the API.
     """
     c = client or _client()
-    handles = [h.lstrip("@") for h in handles if h]
+    # Normalize once and preserve first-seen spelling/order. Repeating @Name as
+    # name must not create another paid subquery for the same account.
+    normalized, handle_keys = [], set()
+    for handle in handles:
+        clean = handle.lstrip("@") if handle else ""
+        key = clean.casefold()
+        if not clean or key in handle_keys:
+            continue
+        handle_keys.add(key)
+        normalized.append(clean)
+    handles = normalized
     out, seen, needs_walk = [], set(), []
 
     # Batch the FIRST page of every handle: bulk_search runs N queries in one
@@ -73,45 +85,7 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
                 q += f" until_time:{until_ts}"
             queries.append(q)
         try:
-            from store import parse_ts
-            chunk_tweets = []
-            for h, res in zip(chunk, c.bulk_search(queries)):
-                tweets = res["tweets"]
-                chunk_tweets.extend(tweets)
-                stamps = []
-                for t in tweets:
-                    ts = parse_ts(t.get("createdAt") or "")
-                    if ts:
-                        stamps.append(ts)
-                    if t.get("id") not in seen:
-                        seen.add(t.get("id")); out.append(t)
-                # has_next_page is authoritative. A SHORT page can still have
-                # more behind it (results get filtered), so inferring
-                # completeness from len(tweets) < 20 silently loses data.
-                if not res["has_next_page"]:
-                    continue
-                if stamps:
-                    oldest = min(stamps)
-                    if max(stamps) == oldest and len(tweets) >= PAGE:
-                        # A full page inside ONE second: resuming below it would
-                        # drop the rest of that second silently. Hand the walk
-                        # the original bound so its own gap detection reports it.
-                        needs_walk.append((h, until_ts or int(time.time())))
-                    else:
-                        # Resume BELOW this page rather than re-fetching it.
-                        needs_walk.append((h, oldest + 1))
-                else:
-                    needs_walk.append((h, until_ts or int(time.time())))
-            if c.store:
-                c.store.put_tweets(chunk_tweets)   # this chunk only, not all of `out`
-            # A batch is charged AFTER _raw_json's pre-check, so a single batch
-            # can cross the ceiling and return success. Check here or the
-            # "hard ceiling" silently isn't one.
-            if c._over_ceiling():
-                raise CostLimitExceeded(
-                    f"Spend ceiling hit at ${c.spent_usd:,.2f} of "
-                    f"${c.max_usd:,.2f} after a batched page; the corpus is "
-                    f"INCOMPLETE. Raise max_usd to fetch it fully.")
+            results = c.bulk_search(queries)
         except CostLimitExceeded:
             raise
         except Exception as e:
@@ -120,6 +94,47 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
             print(f"[jobs] bulk_search unavailable ({type(e).__name__}); "
                   f"falling back to per-handle walks", file=sys.stderr)
             needs_walk = [(h, until_ts or int(time.time())) for h in chunk] + needs_walk
+            continue
+        if len(results) != len(chunk):
+            print(f"[jobs] bulk_search returned {len(results)} results for "
+                  f"{len(chunk)} queries; falling back to per-handle walks",
+                  file=sys.stderr)
+            needs_walk = [(h, until_ts or int(time.time())) for h in chunk] + needs_walk
+            continue
+        from store import parse_ts
+        chunk_tweets = []
+        for h, res in zip(chunk, results):
+            tweets = res["tweets"]
+            chunk_tweets.extend(tweets)
+            stamps = []
+            for t in tweets:
+                ts = parse_ts(t.get("createdAt") or "")
+                if ts:
+                    stamps.append(ts)
+                if t.get("id") not in seen:
+                    seen.add(t.get("id")); out.append(t)
+            # has_next_page is authoritative. A SHORT page can still have
+            # more behind it (results get filtered), so inferring
+            # completeness from len(tweets) < 20 silently loses data.
+            if not res["has_next_page"]:
+                continue
+            if stamps:
+                oldest = min(stamps)
+                if max(stamps) == oldest and len(tweets) >= PAGE:
+                    # A full page inside ONE second: resuming below it would
+                    # drop the rest of that second silently. Hand the walk
+                    # the original bound so its own gap detection reports it.
+                    needs_walk.append((h, until_ts or int(time.time())))
+                else:
+                    # Resume BELOW this page rather than re-fetching it.
+                    needs_walk.append((h, oldest + 1))
+            else:
+                needs_walk.append((h, until_ts or int(time.time())))
+        # Persistence happens after the paid acquisition/fallback boundary. A
+        # local SQLite failure must propagate; it is not permission to spend
+        # again by walking every handle.
+        if c.store:
+            c.store.put_tweets(chunk_tweets)       # this chunk only, not all of `out`
 
     # Only the busy handles pay for a full sliding-window walk. Dedupe by id
     # absorbs the first page the walk re-fetches.
@@ -131,6 +146,160 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
             if t.get("id") not in seen:      # the walk re-fetches page 1
                 seen.add(t.get("id")); out.append(t)
     return out
+
+
+# ----------------------------------------------------- cached catalogue ----
+def _cached_rows(handle, store):
+    """Read one handle's already-paid tweets without constructing a Client."""
+    own_store = store is None
+    s = store or Store()
+    try:
+        return s.tweets_for(user_names=[handle])
+    finally:
+        if own_store:
+            s.close()
+
+
+def _raw_tweet(row):
+    raw = row.get("raw") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def catalogue(handle, *, store=None):
+    """Summarise a cached account corpus. Pure local computation; $0 API spend.
+
+    Composition flags intentionally overlap: a quote may also be a reply, and
+    self-thread replies are a subset of replies. `originals` is the exclusive
+    remainder with none of the reply/quote/native-retweet flags.
+    """
+    rows = _cached_rows(handle, store)
+    unique_ids = {r.get("id") for r in rows if r.get("id")}
+    counts = {
+        "total": len(rows), "unique": len(unique_ids), "originals": 0,
+        "replies": 0, "self_thread_replies": 0, "quotes": 0,
+        "native_retweets": 0,
+    }
+    metric_names = ("likes", "retweets", "replies", "quotes", "views",
+                    "bookmarks")
+    metric_values = {name: [] for name in metric_names}
+    monthly = {}
+    stamps = []
+
+    for row in rows:
+        raw = _raw_tweet(row)
+        is_reply = bool(row.get("is_reply"))
+        is_quote = bool(row.get("is_quote"))
+        is_retweet = bool(row.get("is_retweet"))
+        if is_reply:
+            counts["replies"] += 1
+        if is_quote:
+            counts["quotes"] += 1
+        if is_retweet:
+            counts["native_retweets"] += 1
+        if not (is_reply or is_quote or is_retweet):
+            counts["originals"] += 1
+
+        author = raw.get("author") or {}
+        reply_uid = str(raw.get("inReplyToUserId") or "")
+        reply_name = (raw.get("inReplyToUsername") or "").casefold()
+        author_uid = str(author.get("id") or row.get("author_id") or "")
+        author_name = (author.get("userName") or row.get("author_name")
+                       or "").casefold()
+        if is_reply and ((reply_uid and reply_uid == author_uid)
+                         or (reply_name and reply_name == author_name)):
+            counts["self_thread_replies"] += 1
+
+        values = {
+            "likes": row.get("likes", raw.get("likeCount", 0)),
+            "retweets": row.get("retweets", raw.get("retweetCount", 0)),
+            "replies": row.get("replies", raw.get("replyCount", 0)),
+            "quotes": row.get("quotes", raw.get("quoteCount", 0)),
+            "views": row.get("views", raw.get("viewCount", 0)),
+            "bookmarks": raw.get("bookmarkCount", 0),
+        }
+        for name, value in values.items():
+            try:
+                metric_values[name].append(int(value or 0))
+            except (TypeError, ValueError):
+                metric_values[name].append(0)
+
+        stamp = int(row.get("created_ts") or 0)
+        if stamp:
+            stamps.append(stamp)
+            month = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m")
+            monthly.setdefault(month, []).append(metric_values["likes"][-1])
+
+    engagement = {}
+    for name, values in metric_values.items():
+        total = sum(values)
+        engagement[name] = {
+            "total": total,
+            "average": round(total / len(values), 2) if values else None,
+        }
+    month_series = [
+        {"month": month, "volume": len(likes),
+         "median_likes": float(median(likes))}
+        for month, likes in sorted(monthly.items())
+    ]
+    return {
+        "handle": handle.lstrip("@"),
+        "counts": counts,
+        "date_range": {
+            "earliest": (datetime.fromtimestamp(min(stamps), timezone.utc).isoformat()
+                         if stamps else None),
+            "latest": (datetime.fromtimestamp(max(stamps), timezone.utc).isoformat()
+                       if stamps else None),
+        },
+        "engagement": engagement,
+        "monthly": month_series,
+        "_composition_note": ("replies, self_thread_replies, and quotes can "
+                              "overlap; originals is the exclusive remainder"),
+        "spend": "$0.00 (local cache only)",
+    }
+
+
+def reconstruct_threads(handle, *, store=None, min_posts=2):
+    """Group one account's cached posts by conversationId, oldest first."""
+    rows = _cached_rows(handle, store)
+    grouped = {}
+    for row in rows:
+        conversation_id = str(row.get("conversation_id") or "")
+        if conversation_id:
+            grouped.setdefault(conversation_id, []).append(row)
+
+    threads = []
+    for conversation_id, posts in grouped.items():
+        if len(posts) < min_posts:
+            continue
+        posts.sort(key=lambda r: (int(r.get("created_ts") or 0), str(r.get("id") or "")))
+        threads.append({
+            "conversation_id": conversation_id,
+            "tweet_count": len(posts),
+            "cached_root_present": any(str(r.get("id")) == conversation_id
+                                       for r in posts),
+            "tweets": [{
+                "id": r.get("id"),
+                "created_at": (datetime.fromtimestamp(
+                    int(r.get("created_ts")), timezone.utc).isoformat()
+                    if r.get("created_ts") else None),
+                "in_reply_to": r.get("in_reply_to") or None,
+                "text": r.get("text") or "",
+            } for r in posts],
+        })
+    threads.sort(key=lambda t: (-t["tweet_count"], t["conversation_id"]))
+    return {
+        "handle": handle.lstrip("@"),
+        "thread_count": len(threads),
+        "threads": threads,
+        "_scope": ("Reconstructed from this handle's cached posts only; external "
+                   "participants and uncached or deleted posts may be absent."),
+        "spend": "$0.00 (local cache only)",
+    }
 
 
 # ------------------------------------------------------------ entity brief --
@@ -203,12 +372,13 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
     smaller value only when a deliberate cap is wanted. A low fixed cap here
     silently truncates a busy window — the bug that biased narrative_tracker."""
     from store import parse_ts
-    out, seen, gaps = [], set(), []
+    out, seen = [], set()
     ut = until_ts
     for _ in range(max_pages):
         q = f"{query} since_time:{since_ts} until_time:{ut}"
         resp = c._raw("GET", "/twitter/tweet/advanced_search",
-                      {"query": q, "queryType": "Latest"})
+                      {"query": q, "queryType": "Latest"},
+                      max_credits=Client.page_credits("search", 20, 20))
         batch = resp.get("tweets") or []
         c._charge("search", len(batch), 20)
         if c.store:
@@ -220,8 +390,12 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
                 stamps.append(ts)
             if t.get("id") not in seen:
                 seen.add(t.get("id")); out.append(t)
-        if len(batch) < 20 or not stamps:
+        if len(batch) < 20:
             break                       # short page = range genuinely exhausted
+        if not stamps:
+            raise IncompleteDataError(
+                f"full search page for {query!r} had no parseable createdAt "
+                f"timestamps, so no safe resume boundary exists")
         # Ceiling stop is an ERROR, not an end-of-data: raise so the caller
         # knows the corpus is partial. (A bare break here made corpus()'s
         # except-CostLimitExceeded dead code and silently truncated windows.)
@@ -236,11 +410,12 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
             # a single second, so whatever else was posted in it is dropped.
             # Record it — never lose data silently. (Same guard as
             # workflows.history_search.)
-            gaps.append(oldest)
             print(f"[jobs] WARNING: 20+ tweets share second {oldest}; "
                   f"time-window paging cannot split a second — some tweets "
                   f"in it are being skipped.", file=sys.stderr)
-            new_ut = oldest
+            raise IncompleteDataError(
+                f"20+ tweets share second {oldest}; a time window cannot split "
+                f"that second, so the corpus for {query!r} is INCOMPLETE.")
         else:
             new_ut = oldest + 1         # re-include boundary; dedupe handles it
         if new_ut >= ut:
@@ -248,10 +423,10 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
         ut = new_ut
         if ut <= since_ts:
             break                       # boundary reached = clean exhaustion
-    if gaps:
-        print(f"[jobs] INCOMPLETE: {len(gaps)} second(s) had more tweets than "
-              f"a time window can retrieve; results are missing some tweets at "
-              f"{gaps[:5]}{'...' if len(gaps) > 5 else ''}", file=sys.stderr)
+    else:
+        raise IncompleteDataError(
+            f"search hit max_pages={max_pages} before exhausting {query!r}; "
+            f"the corpus is INCOMPLETE.")
     return out
 
 
@@ -374,25 +549,17 @@ def diffusion_trace(tweet_id, *, limit=500, client=None):
     c = client or _client()
     timed, retweeters = [], 0
     for kind, ep in (("reply", "replies_v2"), ("quote", "quotes")):
-        try:
-            for rec in c.paginate(ep, str(tweet_id), limit=limit):
-                a = rec.get("author") or {}
-                ts = parse_ts(rec.get("createdAt") or "")
-                if ts:
-                    timed.append({"kind": kind,
-                                  "handle": a.get("userName") or a.get("screen_name"),
-                                  "followers": a.get("followers"),
-                                  "createdAt": rec.get("createdAt"), "_ts": ts})
-        except CostLimitExceeded:
-            raise               # partial data must not masquerade as a trace
-        except Exception as e:
-            print(f"[jobs] {kind} fetch failed: {e}", file=sys.stderr)
-    try:
-        retweeters = len(list(c.paginate("retweeters", str(tweet_id), limit=limit)))
-    except CostLimitExceeded:
-        raise
-    except Exception as e:
-        print(f"[jobs] retweeter fetch failed: {e}", file=sys.stderr)
+        for rec in c.paginate(ep, str(tweet_id), limit=limit):
+            a = rec.get("author") or {}
+            ts = parse_ts(rec.get("createdAt") or "")
+            if ts:
+                timed.append({"kind": kind,
+                              "handle": a.get("userName") or a.get("screen_name"),
+                              "followers": a.get("followers"),
+                              "createdAt": rec.get("createdAt"), "_ts": ts})
+    # Transport, API, incompleteness, and ceiling failures all propagate. A
+    # partial three-leg crawl cannot be represented by confident zero counts.
+    retweeters = len(list(c.paginate("retweeters", str(tweet_id), limit=limit)))
     timed.sort(key=lambda e: e["_ts"])
     for e in timed:
         e.pop("_ts", None)
@@ -473,11 +640,16 @@ JOBS = {
                                                     days=a.days, client=c),
 }
 
+LOCAL_JOBS = {
+    "catalogue": lambda a, s: catalogue(a.target, store=s),
+    "threads": lambda a, s: reconstruct_threads(a.target, store=s),
+}
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("job", choices=JOBS)
+    p.add_argument("job", choices=sorted(set(JOBS) | set(LOCAL_JOBS)))
     p.add_argument("target", help="handle / query / tweet_id / cohort name / csv")
     p.add_argument("target2", nargs="?", help="second handle for overlap")
     p.add_argument("--days", type=int, default=30)
@@ -485,12 +657,25 @@ def main(argv=None):
     p.add_argument("--max-usd", type=float, default=5.0)
     p.add_argument("--v-old", type=int)
     p.add_argument("--v-new", type=int)
+    p.add_argument("--store", help="sqlite store path (catalogue/threads only)")
     a = p.parse_args(argv)
     if a.job == "overlap" and not a.target2:
         p.error("overlap needs two handles: jobs.py overlap A B")
+    if a.job in LOCAL_JOBS:
+        s = Store(a.store) if a.store else Store()
+        try:
+            print(json.dumps(LOCAL_JOBS[a.job](a, s), indent=1,
+                             ensure_ascii=False))
+        finally:
+            s.close()
+        return 0
+
     c = _client(a.max_usd)          # one client, one ceiling, shared cache
     try:
         print(json.dumps(JOBS[a.job](a, c), indent=1, ensure_ascii=False))
+    except IncompleteDataError as e:
+        print(f"INCOMPLETE: {e}", file=sys.stderr)
+        return 3
     except (CostLimitExceeded, ValueError) as e:
         print(f"REFUSED/STOPPED: {e}", file=sys.stderr)
         return 2

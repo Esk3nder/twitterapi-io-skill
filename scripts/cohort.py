@@ -34,7 +34,15 @@ class Cohort:
 
     def __init__(self, members=None, client=None, store=None, label=""):
         self.c = client or Client(verbose=False)
-        self.s = store or Store()
+        client_store = getattr(self.c, "store", None)
+        self.s = (store if store is not None else
+                  client_store if client_store is not None else Store())
+        # A caller who explicitly injects a Store into the cohort expects paid
+        # hydration pages to use it too. Keep the Client's cache path aligned
+        # when it has not already selected another store.
+        if (store is not None and hasattr(self.c, "store")
+                and self.c.store is None):
+            self.c.store = store
         self.label = label
         # Deep-copy member dicts so set ops can't mutate an operand's members
         # in place (union() shared dict objects before this).
@@ -82,6 +90,20 @@ class Cohort:
         d = co.c.user_info(handle)
         co._add(d.get("id"), d.get("userName") or handle, 1.0, "seed_account")
         co.s.put_accounts([d]) if d else None
+        return co
+
+    @classmethod
+    def from_ids(cls, account_ids, **kw):
+        """Build a zero-request cohort from account IDs already in hand."""
+        label = kw.pop("label", "provided_ids")
+        co = cls(label=label, **kw)
+        seen = set()
+        for account_id in account_ids:
+            account_id = str(account_id or "")
+            if not account_id or account_id in seen:
+                continue
+            seen.add(account_id)
+            co._add(account_id=account_id, provenance="provided_id")
         return co
 
     @classmethod
@@ -198,18 +220,33 @@ class Cohort:
     # -- enrichment -------------------------------------------------------
     def hydrate(self, max_usd=1.0):
         """Fill full profiles for members we only have ids/handles for, via the
-        batch endpoint (100 ids/call). Needed before filter() on profile fields."""
+        batch endpoint (100 ids/call). Return the purchased profiles and fill
+        member handles. Needed before filter() on profile fields."""
         need_ids = [m["account_id"] for m in self.members.values() if m["account_id"]]
-        for i in range(0, len(need_ids), 100):
-            chunk = need_ids[i:i + 100]
-            resp = self.c._raw("GET", "/twitter/user/batch_info_by_ids",
-                               {"userIds": ",".join(chunk)})
-            self.c._charge("batch_users", len(chunk), 100)
-            users = resp.get("users") or []
-            self.s.put_accounts(users)
-            if self.c.max_usd and self.c.spent_usd > (self.c.max_usd or max_usd):
-                break
-        return self
+        profiles = []
+        prior = self.c.max_usd
+        method_ceiling = (self.c.spent_usd + max_usd
+                          if max_usd is not None else None)
+        ceilings = [v for v in (prior, method_ceiling) if v is not None]
+        self.c.max_usd = min(ceilings) if ceilings else None
+        try:
+            for i in range(0, len(need_ids), 100):
+                chunk = need_ids[i:i + 100]
+                users = list(self.c.paginate(
+                    "batch_users", ",".join(chunk), page_size=len(chunk)))
+                profiles.extend(users)
+                names = {
+                    str(u.get("id") or u.get("user_id") or ""):
+                    (u.get("userName") or u.get("screen_name") or "").lstrip("@")
+                    for u in users if isinstance(u, dict)
+                }
+                for member in self.members.values():
+                    if member["account_id"] in names and names[member["account_id"]]:
+                        member["user_name"] = names[member["account_id"]]
+                self.s.put_accounts(users)
+        finally:
+            self.c.max_usd = prior
+        return profiles
 
     def filter(self, bio_matches=None, min_followers=None, verified=None):
         """Keep members whose STORED profile matches. Call hydrate() first, or

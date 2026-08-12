@@ -80,7 +80,14 @@ def normalize_account(u: dict) -> dict:
         "id": str(g("id", "user_id") or ""),
         "user_name": g("userName", "screen_name", "username") or "",
         "name": g("name") or "",
-        "description": g("description", "bio") or "",
+        # Tweet-embedded author objects return description="" and put the real
+        # bio at profile_bio.description. Reading only the top-level key makes
+        # every tweet-sourced account look bio-less — and then overwrite a
+        # richer row. Measured: 143 chars -> 0.
+        "description": (g("description", "bio")
+                        or ((u.get("profile_bio") or {}).get("description")
+                            if isinstance(u.get("profile_bio"), dict) else None)
+                        or ""),
         "followers": int(g("followers", "followers_count") or 0),
         "following": int(g("following", "following_count", "friends_count") or 0),
         "statuses": int(g("statusesCount", "statuses_count") or 0),
@@ -178,6 +185,15 @@ class Store:
             return None
         return json.loads(r["body"])
 
+    def page_age(self, path, params):
+        """Seconds since this page was fetched, or None if absent.
+
+        Cached graph data has no expiry by default, so a caller cannot tell a
+        fresh crawl from a year-old snapshot without asking."""
+        r = self.db.execute("SELECT fetched_at FROM pages WHERE key=?",
+                            (self._key(path, params),)).fetchone()
+        return None if not r else time.time() - r["fetched_at"]
+
     def put_page(self, path, params, body, credits=0.0):
         with self._wlock:
             self.db.execute(
@@ -185,6 +201,42 @@ class Store:
                 (self._key(path, params), path, json.dumps(params or {}, sort_keys=True),
                  json.dumps(body), time.time(), credits))
             self.db.commit()
+
+    def follower_ids_for(self, user_name=None, *, user_id=None):
+        """Return follower IDs already present in paid cached pages.
+
+        This is a local read: it never constructs a Client or calls the API.
+        It intentionally ignores cursor and count so callers do not need to
+        reproduce an earlier crawl's exact cache keys. When several cached
+        crawls exist, IDs are returned once in first-fetched order.
+        """
+        if not (user_name or user_id):
+            raise ValueError("pass user_name or user_id")
+        wanted_id = str(user_id) if user_id is not None else None
+        wanted_name = ((user_name or "").lstrip("@").casefold()
+                       if user_name is not None else None)
+        seen, out = set(), []
+        rows = self.db.execute(
+            "SELECT params, body FROM pages WHERE path=? ORDER BY fetched_at, key",
+            ("/twitter/user/followers_ids",))
+        for row in rows:
+            try:
+                params = json.loads(row["params"] or "{}")
+                body = json.loads(row["body"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            matches = (str(params.get("userId")) == wanted_id
+                       if wanted_id is not None else
+                       str(params.get("userName") or "").lstrip("@").casefold()
+                       == wanted_name)
+            if not matches or not isinstance(body.get("ids"), list):
+                continue
+            for account_id in body["ids"]:
+                account_id = str(account_id)
+                if account_id not in seen:
+                    seen.add(account_id)
+                    out.append(account_id)
+        return out
 
     # -- records ----------------------------------------------------------
     def put_accounts(self, users):
@@ -202,8 +254,26 @@ class Store:
                              n["location"], json.dumps(u), time.time()))
         if rows:
             with self._wlock:
+                # Never let a THIN record overwrite a richer one. Tweet-embedded
+                # authors carry fewer fields than a paid profile crawl, so a
+                # blind REPLACE silently destroys data the caller already paid
+                # for. Keep the better value per column instead.
                 self.db.executemany(
-                    "INSERT OR REPLACE INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                    """INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         user_name   = COALESCE(NULLIF(excluded.user_name,''), user_name),
+                         name        = COALESCE(NULLIF(excluded.name,''), name),
+                         description = COALESCE(NULLIF(excluded.description,''), description),
+                         followers   = MAX(excluded.followers, followers),
+                         following   = MAX(excluded.following, following),
+                         statuses    = MAX(excluded.statuses, statuses),
+                         is_blue     = MAX(excluded.is_blue, is_blue),
+                         is_verified = MAX(excluded.is_verified, is_verified),
+                         created_at  = COALESCE(NULLIF(excluded.created_at,''), created_at),
+                         location    = COALESCE(NULLIF(excluded.location,''), location),
+                         raw         = CASE WHEN LENGTH(excluded.raw) > LENGTH(raw)
+                                            THEN excluded.raw ELSE raw END,
+                         seen_at     = excluded.seen_at""", rows)
                 self.db.commit()
         return len(rows)
 
@@ -283,6 +353,28 @@ class Store:
     def cohort_versions(self, name):
         return [r["version"] for r in self.db.execute(
             "SELECT version FROM cohort_meta WHERE name=? ORDER BY version", (name,))]
+
+    def delete_cohort(self, name, version=None):
+        """Delete one saved version, or all versions when version is omitted.
+
+        Returns the number of metadata versions removed. Member and metadata
+        rows share one transaction so deletion cannot leave an orphaned half.
+        """
+        where = "name=?" + (" AND version=?" if version is not None else "")
+        params = (name, version) if version is not None else (name,)
+        with self._wlock:
+            count = self.db.execute(
+                f"SELECT COUNT(*) c FROM cohort_meta WHERE {where}",
+                params).fetchone()["c"]
+            try:
+                self.db.execute("BEGIN")
+                self.db.execute(f"DELETE FROM cohorts WHERE {where}", params)
+                self.db.execute(f"DELETE FROM cohort_meta WHERE {where}", params)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+        return count
 
     # -- queries ----------------------------------------------------------
     def tweets_for(self, account_ids=None, user_names=None, since=None, until=None):

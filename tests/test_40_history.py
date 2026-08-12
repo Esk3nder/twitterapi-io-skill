@@ -109,8 +109,14 @@ class TestTruncationHonesty(E2ETest):
         if spend:
             requests, credits = spend
             self.log(f"subprocess spend: {requests} requests, {credits} credits")
-            self.assertGreater(credits / 100_000, 0.005,
-                               "exit 3 means the ceiling was actually hit")
+            # A hard ceiling must never be CROSSED. The walk refuses the page
+            # that would exceed it, so a truncated run stops at or under the
+            # limit and signals partial data via exit 3. Asserting overspend
+            # here would lock in the weaker "spend past it, then notice"
+            # behaviour this guard exists to prevent.
+            self.assertLessEqual(credits / 100_000, 0.005,
+                                 "a truncated run must stop at or under the "
+                                 "ceiling, never above it")
             self.charge_external(credits=credits, requests=requests)
         else:
             self.charge_external(credits=600, requests=3, derived=True)

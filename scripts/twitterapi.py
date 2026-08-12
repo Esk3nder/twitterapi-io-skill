@@ -176,6 +176,10 @@ class CostLimitExceeded(RuntimeError):
     pass
 
 
+class IncompleteDataError(RuntimeError):
+    """The API indicated more data exists but the client cannot retrieve it safely."""
+
+
 def credits_to_usd(c: float) -> float:
     return c / CREDITS_PER_USD
 
@@ -198,7 +202,6 @@ def _warn_if_facts_stale():
     global _stale_warned
     if _stale_warned:
         return
-    _stale_warned = True
     try:
         with open(_FACTS_PATH) as f:
             facts = json.load(f)
@@ -206,8 +209,14 @@ def _warn_if_facts_stale():
         limit = int(facts.get("staleness_warn_days", 90))
         age = int((time.time() - time.mktime(time.strptime(stamped, "%Y-%m-%d")))
                   / 86400)
-    except Exception:
+    except Exception as e:
+        _stale_warned = True
+        print(f"[twitterapi] NOTE: cannot verify API fact freshness from "
+              f"{_FACTS_PATH}: {type(e).__name__}. Prices and response shapes "
+              f"may be stale. Re-verify with: python3 scripts/verify.py",
+              file=sys.stderr)
         return                              # never let a warning break a run
+    _stale_warned = True
     if age >= limit:
         print(f"[twitterapi] NOTE: API facts (prices, response shapes) were last "
               f"verified {age} days ago on {stamped}, over the {limit}-day limit. "
@@ -229,6 +238,7 @@ class Client:
         self.cache_max_age = cache_max_age  # seconds; None = cached copy never expires
         self.requests_made = 0
         self.cache_hits = 0
+        self.oldest_cache_age = None   # seconds; how stale the served data is
         self.spent_credits = 0.0
         self.saved_credits = 0.0          # credits NOT spent thanks to cache hits
         self._last_call = 0.0
@@ -271,7 +281,7 @@ class Client:
             self._last_call = time.monotonic()
 
     # -- transport --------------------------------------------------------
-    def _raw(self, method, path, params=None):
+    def _raw(self, method, path, params=None, *, max_credits=None):
         url = BASE + path
         if params:
             url += "?" + urllib.parse.urlencode(
@@ -282,6 +292,8 @@ class Client:
         attempts = 5
         for attempt in range(attempts):
             if path != "/oapi/my/info":
+                self._require_budget(max_credits or MIN_REQUEST_CREDITS,
+                                     f"{method} {path} request attempt")
                 self._throttle()
             self._bill_request(path)    # non-data calls still bill the 15cr floor
             try:
@@ -316,20 +328,18 @@ class Client:
                     time.sleep(2 ** attempt)
         raise last if isinstance(last, Exception) else RuntimeError("retries exhausted")
 
-    def _raw_json(self, method, path, body):
+    def _raw_json(self, method, path, body, *, max_credits=None):
         """Request with a JSON body. Used by bulk_search and the filter-rule
         endpoints — note DELETE /oapi/tweet_filter/delete_rule takes its
         rule_id in the BODY, not the query string.
 
         Mirrors _raw's ceiling check and 5xx/429 retry so a data path
         (bulk_search) isn't less resilient than a GET."""
-        if self._over_ceiling():
-            raise CostLimitExceeded(
-                f"${self.spent_usd:,.2f} already spent, at the ${self.max_usd:,.2f} "
-                f"ceiling; refusing {method} {path}.")
         data = json.dumps(body).encode()
         attempts, last = 5, None
         for attempt in range(attempts):
+            self._require_budget(max_credits or MIN_REQUEST_CREDITS,
+                                 f"{method} {path} request attempt")
             self._throttle()
             self._bill_request(path)   # non-data calls still bill the 15cr floor
             req = urllib.request.Request(BASE + path, data=data, method=method)
@@ -378,7 +388,15 @@ class Client:
         if spec["items"] is None:
             items = container
         else:
-            items = container.get(spec["items"]) or []
+            if spec["items"] not in container:
+                raise IncompleteDataError(
+                    f"response omitted required {spec['items']!r} field; "
+                    f"refusing to interpret contract drift as an empty result")
+            items = container.get(spec["items"])
+            if not isinstance(items, list):
+                raise IncompleteDataError(
+                    f"response field {spec['items']!r} must be a list, got "
+                    f"{type(items).__name__}; results are INCOMPLETE")
         return items, bool(resp.get("has_next_page")), resp.get("next_cursor") or ""
 
     # -- cost -------------------------------------------------------------
@@ -461,7 +479,18 @@ class Client:
                 self.spent_credits += MIN_REQUEST_CREDITS
 
     def _over_ceiling(self) -> bool:
-        return self.max_usd is not None and self.spent_usd > self.max_usd
+        return self.max_usd is not None and self.spent_usd >= self.max_usd
+
+    def _require_budget(self, credits, operation):
+        """Refuse before transport when a bounded next charge is unauthorized."""
+        if self.max_usd is None:
+            return
+        projected = self.spent_usd + credits_to_usd(credits)
+        if projected > self.max_usd:
+            raise CostLimitExceeded(
+                f"{operation} can reach ${projected:,.5f}, over the "
+                f"${self.max_usd:,.5f} ceiling (${self.spent_usd:,.5f} "
+                f"already spent); refusing before the paid request.")
 
     def _preflight(self, name, n_records, page_size=None):
         if self.max_usd is None or not n_records:
@@ -480,6 +509,15 @@ class Client:
 
         Handles both envelope shapes, charges each page against the cumulative
         ceiling, and refuses to loop when the cursor stops advancing."""
+        if name not in ENDPOINTS:
+            from difflib import get_close_matches
+            valid = sorted(n for n, endpoint in ENDPOINTS.items()
+                           if endpoint["items"] is not None)
+            suggestion = get_close_matches(name, valid, n=1)
+            hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+            raise ValueError(
+                f"unknown paginated endpoint {name!r}.{hint} Valid names: "
+                f"{', '.join(valid)}")
         spec = ENDPOINTS[name]
         if spec["items"] is None:
             raise ValueError(
@@ -498,7 +536,8 @@ class Client:
             params[k] = v
 
         cacheable = self.store is not None and name in CACHEABLE
-        cursor, seen, seen_cursors, empty_pages = "", 0, set(), 0
+        cursor, seen = "", 0
+        seen_cursors, seen_items, empty_pages = set(), set(), 0
         while True:
             params["cursor"] = cursor
             cached = (self.store.get_page(spec["path"], params, self.cache_max_age)
@@ -509,8 +548,21 @@ class Client:
                 # Cache hit = no API call: don't charge, record what we avoided.
                 self.cache_hits += 1
                 self.saved_credits += self.page_credits(name, len(items), ps)
+                # Track HOW OLD the served data is. A follow graph cached
+                # indefinitely will answer "who follows X" with last year's
+                # snapshot, free and instantly, and look identical to a fresh
+                # crawl. Age must be visible or the caller cannot tell.
+                age = self.store.page_age(spec["path"], params)
+                if age is not None:
+                    self.oldest_cache_age = max(self.oldest_cache_age or 0, age)
             else:
-                resp = self._raw("GET", spec["path"], params)
+                # The page has a known maximum. Reserve against that bound,
+                # not the hoped-for record count, or a terminal full page can
+                # cross the caller's ceiling and still return as "complete".
+                self._require_budget(self.page_credits(name, ps, ps),
+                                     f"next '{name}' page")
+                resp = self._raw("GET", spec["path"], params,
+                                 max_credits=self.page_credits(name, ps, ps))
                 items, has_next, next_cursor = self._unpack(resp, spec)
                 self._charge(name, len(items), ps)
                 if cacheable:
@@ -526,19 +578,32 @@ class Client:
 
             if not items:
                 empty_pages += 1
-                if empty_pages >= 2:
-                    return          # API insists there is more but sends nothing
             else:
                 empty_pages = 0
             for it in items:
+                identity = self._item_identity(it)
+                if identity is not None and identity in seen_items:
+                    continue
+                if identity is not None:
+                    seen_items.add(identity)
                 yield it
                 seen += 1
                 if limit and seen >= limit:
                     return
-            if not has_next or not next_cursor:
+            if not has_next:
                 return
+            if not next_cursor:
+                raise IncompleteDataError(
+                    f"'{name}' asserted has_next_page but returned no cursor "
+                    f"after {seen:,} unique records; results are INCOMPLETE.")
+            if empty_pages >= 2:
+                raise IncompleteDataError(
+                    f"'{name}' returned {empty_pages} empty pages while asserting "
+                    f"more data; results are INCOMPLETE.")
             if next_cursor in seen_cursors:
-                return              # cursor repeated: would loop forever, paid
+                raise IncompleteDataError(
+                    f"'{name}' repeated cursor {next_cursor!r} after {seen:,} "
+                    f"unique records; refusing a paid loop. Results are INCOMPLETE.")
             # Ceiling is checked here, after this page has been yielded, so the
             # caller keeps every record they were charged for.
             if self._over_ceiling():
@@ -550,6 +615,18 @@ class Client:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
+    @staticmethod
+    def _item_identity(item):
+        """Stable cross-page identity, or None when deduplication is unsafe."""
+        if isinstance(item, (str, int)):
+            return ("scalar", str(item))
+        if isinstance(item, dict):
+            for key in ("id", "id_str", "user_id", "tweet_id"):
+                value = item.get(key)
+                if value not in (None, ""):
+                    return (key, str(value))
+        return None
+
     # -- convenience ------------------------------------------------------
     def user_info(self, user_name) -> dict:
         spec = ENDPOINTS["user_info"]
@@ -558,7 +635,10 @@ class Client:
         # for it rather than returning {}, so callers can't mistake "no such
         # user" for "user with zero followers". `data` is coalesced in case it
         # is ever null on a success envelope.
-        resp = self._raw("GET", spec["path"], {"userName": user_name})
+        self._require_budget(self.page_credits("user_info", 1, 1),
+                             "user_info lookup")
+        resp = self._raw("GET", spec["path"], {"userName": user_name},
+                         max_credits=self.page_credits("user_info", 1, 1))
         self._charge("user_info", 1, 1)     # a profile lookup bills 18 credits
         return resp.get("data") or {}
 
@@ -593,44 +673,70 @@ class Client:
         This is the only lever against the QPS ceiling — 20 req/s is the hard
         maximum, so batching N queries per request multiplies throughput by N.
         Use it whenever you have several independent searches."""
+        if not queries:
+            return []
         body = {"queries": [
             q if isinstance(q, dict) else {"query": q, "queryType": query_type}
             for q in queries]}
-        resp = self._raw_json("POST", "/twitter/tweet/bulk_advanced_search", body)
+        full_page = self.page_credits("search", 20, 20)
+        self._require_budget(len(body["queries"]) * full_page,
+                             f"bulk_search batch of {len(body['queries'])} queries")
+        resp = self._raw_json("POST", "/twitter/tweet/bulk_advanced_search", body,
+                              max_credits=len(body["queries"]) * full_page)
         results = resp.get("results") or {}
+        if not isinstance(results, dict):
+            results = {}
         out = []
+        invalid = []
+        charges = []
         for i in range(len(body["queries"])):
-            r = results.get(f"query_{i}") or {}
-            tweets = r.get("tweets") or []
-            # _charge() subtracts the per-request floor because _bill_request
-            # booked it — but ONE request produced all N sub-results here, so
-            # subtracting per sub-result under-counts by (N-1) x floor.
-            # Charge sub-results at full rate; the request's own floor is
-            # already on the books.
-            with self._lock:
-                self.spent_credits += max(
-                    self.page_credits("search", len(tweets), 20)
-                    - (MIN_REQUEST_CREDITS if i == 0 else 0), 0.0)
+            result_key = f"query_{i}"
+            r = results.get(result_key)
+            if not isinstance(r, dict) or "tweets" not in r:
+                invalid.append(result_key)
+                charges.append(full_page)  # unknown response: never undercount
+                continue
+            tweets = r.get("tweets")
+            if not isinstance(tweets, list):
+                invalid.append(result_key)
+                charges.append(full_page)
+                continue
+            charges.append(self.page_credits("search", len(tweets), 20))
             # has_next_page is authoritative for "more exists"; a short page is
             # NOT proof of completeness (results can be filtered). Callers that
             # infer from length alone silently lose data.
             out.append({"tweets": tweets,
                         "has_next_page": bool(r.get("has_next_page")),
                         "next_cursor": r.get("next_cursor") or ""})
+        # ONE request produced N billable search results. _bill_request booked
+        # one 15-credit request floor, so add the combined pages minus that one
+        # floor. Missing/malformed subresults are conservatively booked full.
+        with self._lock:
+            self.spent_credits += max(sum(charges) - MIN_REQUEST_CREDITS, 0.0)
+        if invalid:
+            raise IncompleteDataError(
+                f"bulk_search response omitted or malformed {invalid}; refusing "
+                f"to report those queries as empty. Results are INCOMPLETE.")
         return out
 
     def community_info(self, community_id) -> dict:
+        self._require_budget(self.page_credits("community_info", 1, 1),
+                             "community_info lookup")
         resp = self._raw("GET", "/twitter/community/info",
-                         {"community_id": community_id}) or {}
+                         {"community_id": community_id},
+                         max_credits=self.page_credits("community_info", 1, 1)) or {}
         self._charge("community_info", 1, 1)   # single record, profile-priced
         return resp.get("community_info", {})
 
     def check_follow(self, source_user_name, target_user_name) -> dict:
         """Returns {following, followed_by}. NOTE: this endpoint uniquely uses
         `message` instead of `msg` in its envelope."""
+        self._require_budget(self.page_credits("check_follow", 1, 1),
+                             "check_follow lookup")
         resp = self._raw("GET", "/twitter/user/check_follow_relationship",
                          {"source_user_name": source_user_name,
-                          "target_user_name": target_user_name}) or {}
+                          "target_user_name": target_user_name},
+                         max_credits=self.page_credits("check_follow", 1, 1)) or {}
         self._charge("check_follow", 1, 1)     # single record, profile-priced
         return resp.get("data", {})
 
@@ -645,8 +751,17 @@ class Client:
     def spend_report(self) -> str:
         saved = (f" | {self.cache_hits} cache hits saved "
                  f"${credits_to_usd(self.saved_credits):,.4f}" if self.cache_hits else "")
+        # Served-data age is part of the result's meaning: a follow graph has
+        # no expiry, so a free instant answer may be an old snapshot. Say how
+        # old rather than letting it pass for fresh.
+        stale = ""
+        if self.oldest_cache_age:
+            a = self.oldest_cache_age
+            human = (f"{a/86400:.1f} days" if a >= 86400 else
+                     f"{a/3600:.1f} hours" if a >= 3600 else f"{a/60:.0f} min")
+            stale = f" | oldest cached data served: {human} old"
         return (f"{self.requests_made} requests, ~${self.spent_usd:,.4f} "
-                f"({self.spent_credits:,.0f} credits) this session{saved}. "
+                f"({self.spent_credits:,.0f} credits) this session{saved}{stale}. "
                 f"Server-side billing settles ~60s late, so .balance() will "
                 f"trail this figure briefly.")
 

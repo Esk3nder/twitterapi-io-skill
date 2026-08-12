@@ -8,8 +8,11 @@ key in the environment but performs no HTTP here.
 """
 import threading
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
-from tests.e2e_base import E2ETest, HAVE_KEY, require_key
+from tests.e2e_base import E2ETest, HAVE_KEY, SKILL, require_key
 
 
 class TestCostTable(E2ETest):
@@ -85,12 +88,21 @@ class TestEnvelopeUnpack(E2ETest):
         self.assertEqual(items, ["9", "8"])
         self.assertFalse(has_next)
 
-    def test_missing_items_key_is_empty_not_crash(self):
-        from twitterapi import Client, ENDPOINTS
-        items, has_next, _ = Client._unpack({"status": "success"},
-                                            ENDPOINTS["search"])
-        self.assertEqual(items, [])
-        self.assertFalse(has_next)
+    def test_missing_items_key_is_incomplete_not_empty(self):
+        """An omitted required array is contract drift, not proof of zero rows."""
+        from twitterapi import Client, ENDPOINTS, IncompleteDataError
+        with self.assertRaises(IncompleteDataError):
+            Client._unpack({"status": "success"}, ENDPOINTS["search"])
+
+    def test_unknown_paginate_name_lists_the_valid_alias(self):
+        """The API-path plural typo must not escape as an unexplained KeyError."""
+        from twitterapi import Client
+        c = Client(api_key="test", verbose=False)
+        with self.assertRaises(ValueError) as cm:
+            list(c.paginate("followers_ids", "alice"))
+        message = str(cm.exception)
+        self.assertIn("follower_ids", message)
+        self.assertIn("unknown", message.lower())
 
 
 class TestNormalisers(E2ETest):
@@ -125,6 +137,119 @@ class TestNormalisers(E2ETest):
         self.assertEqual(Store.member_key("", "@Alice"), "@alice")
         self.assertEqual(Store.member_key(None, None), "@",
                          "degenerate key is filtered by save_cohort")
+
+    def test_tweet_author_bio_fallback_cannot_destroy_rich_profile(self):
+        """Verification for F1: thin tweet authors must not erase paid fields."""
+        s = self.fresh_store("profile-preservation")
+        self.addCleanup(s.close)
+        rich_bio = "researcher building reliable social-data systems"
+        s.put_accounts([{
+            "id": "1", "userName": "alice", "description": rich_bio,
+            "followers": 1234,
+        }])
+        s.put_tweets([{
+            "id": "tweet", "text": "hello",
+            "createdAt": "Mon Aug 10 17:16:53 +0000 2026",
+            "author": {
+                "id": "1", "userName": "alice", "description": "",
+                "profile_bio": {"description": rich_bio},
+            },
+        }])
+        row = s.db.execute(
+            "SELECT description, followers FROM accounts WHERE id='1'").fetchone()
+        self.assertEqual(row["description"], rich_bio)
+        self.assertEqual(row["followers"], 1234)
+
+
+class TestPaidGraphReadback(E2ETest):
+    def test_follower_ids_for_ignores_crawl_cursor_and_page_size(self):
+        """Paid follower pages must be readable without reproducing cache keys."""
+        s = self.fresh_store("follower-readback")
+        self.addCleanup(s.close)
+        path = "/twitter/user/followers_ids"
+        s.put_page(path, {"userName": "Alice", "count": 5000, "cursor": ""},
+                   {"ids": ["1", "2"], "has_next_page": True,
+                    "next_cursor": "next"}, credits=2250)
+        s.put_page(path, {"userName": "Alice", "count": 5000,
+                          "cursor": "next"},
+                   {"ids": ["2", "3"], "has_next_page": False,
+                    "next_cursor": ""}, credits=2250)
+        s.put_page(path, {"userName": "alice", "count": 1000,
+                          "cursor": "different-call"},
+                   {"ids": ["3", "4"], "has_next_page": False,
+                    "next_cursor": ""}, credits=450)
+        s.put_page(path, {"userName": "bob", "count": 5000, "cursor": ""},
+                   {"ids": ["not-alice"], "has_next_page": False,
+                    "next_cursor": ""}, credits=2250)
+
+        self.assertEqual(s.follower_ids_for("@ALICE"), ["1", "2", "3", "4"])
+
+
+class TestPublicCohortConstruction(E2ETest):
+    def test_from_ids_builds_without_network_or_private_add(self):
+        """Already-owned IDs must have a public, zero-request cohort path."""
+        from cohort import Cohort
+        client = object()
+        s = self.fresh_store("from-ids")
+        self.addCleanup(s.close)
+        co = Cohort.from_ids(["1", 2, "1"], client=client, store=s,
+                             label="paid followers")
+        self.assertEqual(co.ids(), ["1", "2"])
+        self.assertEqual(co.label, "paid followers")
+        self.assertTrue(all(m["provenance"] == "provided_id" for m in co))
+
+    def test_delete_cohort_removes_members_and_metadata_atomically(self):
+        """Deleting a saved test cohort must not require orphan-prone raw SQL."""
+        s = self.fresh_store("delete-cohort")
+        self.addCleanup(s.close)
+        s.save_cohort("test", [("1", "alice", 1.0, "test")])
+        s.save_cohort("test", [("2", "bob", 1.0, "test")])
+        s.save_cohort("keep", [("3", "carol", 1.0, "test")])
+
+        self.assertEqual(s.delete_cohort("test"), 2)
+        self.assertEqual(s.load_cohort("test"), [])
+        self.assertEqual(s.cohort_versions("test"), [])
+        self.assertEqual(s.cohort_versions("keep"), [1])
+
+    def test_cohort_inherits_client_store_without_opening_default_cache(self):
+        """Client store injection must not be lost at the Cohort boundary."""
+        from cohort import Cohort
+        s = self.fresh_store("inherited-store")
+        self.addCleanup(s.close)
+        client = SimpleNamespace(store=s)
+        with mock.patch("cohort.Store",
+                        side_effect=AssertionError("default Store() opened")):
+            co = Cohort(client=client)
+        self.assertIs(co.s, s)
+
+
+class TestDocumentationContracts(E2ETest):
+    @staticmethod
+    def _read(name):
+        return Path(SKILL, name).read_text()
+
+    def test_skill_and_readme_present_one_library_story(self):
+        """The skill must not forbid the library surface the README teaches."""
+        skill = self._read("SKILL.md")
+        self.assertNotIn("Run the workflows; do not hand-roll requests", skill)
+        self.assertIn("library", skill.lower())
+
+    def test_composition_example_preserves_the_injected_store(self):
+        """Following the skill example must not silently open the home cache."""
+        skill = self._read("SKILL.md")
+        self.assertIn('Cohort.load("pm_talkers", client=c, store=s)', skill)
+        self.assertIn('Cohort.load("crypto_ai", client=c, store=s)', skill)
+
+    def test_readme_describes_only_paginated_endpoints(self):
+        """Four single-object methods must not be advertised through paginate()."""
+        readme = self._read("README.md")
+        self.assertIn("one of the 27 paginated endpoints", readme)
+
+    def test_readme_scopes_cached_tweets_and_two_pass_page_caps(self):
+        """Cached authorship and per-pass caps must not imply broader coverage."""
+        readme = self._read("README.md")
+        self.assertIn("cached posts authored by these accounts", readme)
+        self.assertRegex(readme, r"applies separately to each\s+search pass")
 
 
 @unittest.skipUnless(HAVE_KEY, "Cohort construction requires the API key "
