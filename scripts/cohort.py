@@ -404,9 +404,22 @@ class Cohort:
         return co
 
 
+def main(argv=None):
+    from axi import run_cli
+    return run_cli("cohort.py", _main, argv)
+
+
+def _main(argv=None):
+    from axi import ArgumentParser, dashboard, emit, fast_version
+    if fast_version(argv):
+        return 0
+    p = ArgumentParser(description="Inspect saved twitterapi.io cohorts")
+    p.add_argument("--store", help="SQLite store path")
+    args = p.parse_args(argv)
+    emit(dashboard(__file__, "Build, combine, persist, and inspect account cohorts",
+                   store_path=args.store))
+    return 0
+
+
 if __name__ == "__main__":
-    import json
-    s = Store()
-    print("saved cohorts:")
-    for c in s.list_cohorts():
-        print(f"  {c['name']} v{c['version']}  {c['size']} members")
+    raise SystemExit(main())

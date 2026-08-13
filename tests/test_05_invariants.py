@@ -838,9 +838,12 @@ class TestHistoryHonesty(E2ETest):
             ("from:alpha", 2),
             ("from:alpha filter:nativeretweets", 2),
         ], "each history pass must receive its own full page budget")
-        self.assertEqual([json.loads(line)["id"] for line in out.getvalue().splitlines()],
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([row["id"] for row in lines[:-1]],
                          ["original", "shared", "retweet"],
                          "the second pass must deduplicate ids across both searches")
+        self.assertTrue(lines[-1]["complete"])
+        self.assertEqual(lines[-1]["completeness"]["records_returned"], 3)
         banner = err.getvalue().lower()
         self.assertIn("scope", banner)
         self.assertIn("native retweets included", banner)
@@ -870,15 +873,16 @@ class TestHistoryHonesty(E2ETest):
             rc = workflows._history_cli(
                 self._args(include_retweets=True, max_pages=1))
 
-        self.assertEqual(rc, 3, "one capped pass still makes the result partial")
+        self.assertEqual(rc, 0, "valid partial data uses exit 0 under AXI")
         self.assertEqual(calls, [
             ("from:alpha", 1),
             ("from:alpha filter:nativeretweets", 1),
         ])
-        self.assertEqual(
-            [json.loads(line)["id"] for line in out.getvalue().splitlines()],
-            ["original", "retweet"],
-        )
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual([row["id"] for row in lines[:-1]], ["original", "retweet"])
+        self.assertFalse(lines[-1]["complete"])
+        self.assertEqual(lines[-1]["completeness"]["status"], "partial")
+        self.assertEqual(lines[-1]["completeness"]["records_returned"], 2)
         self.assertIn("native retweets 1", err.getvalue().lower())
 
     def test_raw_query_with_exclude_retweets_is_refused_before_search(self):
@@ -907,7 +911,10 @@ class TestHistoryHonesty(E2ETest):
 
         self.assertEqual(rc, 2)
         self.assertEqual(calls, [], "refusal must happen before a paid search")
-        self.assertIn("refused", err.getvalue().lower())
+        body = json.loads(out.getvalue())
+        self.assertEqual(body["error"]["type"], "refusal")
+        self.assertIn("--exclude-retweets", body["error"]["message"])
+        self.assertEqual(err.getvalue(), "")
         self.assertNotIn("redundant", err.getvalue().lower())
 
     def test_default_history_explicitly_declares_native_retweets_excluded(self):
@@ -953,15 +960,16 @@ class TestHistoryHonesty(E2ETest):
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
                                  store=MemoryStore(),
                                  spend_report=lambda: "1 request, ~$0.0030")
-        err = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         with tempfile.NamedTemporaryFile() as output, \
              mock.patch.object(workflows, "Client", return_value=client), \
              mock.patch.object(workflows, "history_search", fake_history), \
-             contextlib.redirect_stderr(err):
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = workflows._history_cli(self._args(out=output.name))
 
         report = err.getvalue().lower()
-        self.assertEqual(rc, 3)
+        self.assertEqual(rc, 0)
+        self.assertFalse(json.loads(out.getvalue())["complete"])
         self.assertIn(
             "reached back to 2021-05-14, 2 days after @alpha's "
             "2021-05-12 account creation",
@@ -984,15 +992,18 @@ class TestHistoryHonesty(E2ETest):
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
                                  store=MemoryStore(),
                                  spend_report=lambda: "1 request, ~$0.0030")
-        err = io.StringIO()
+        out, err = io.StringIO(), io.StringIO()
         with tempfile.NamedTemporaryFile() as output, \
              mock.patch.object(workflows, "Client", return_value=client), \
              mock.patch.object(workflows, "history_search", fake_history), \
-             contextlib.redirect_stderr(err):
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = workflows._history_cli(self._args(out=output.name))
 
         report = err.getvalue().lower()
-        self.assertEqual(rc, 3, "an index-limited archive is partial, not complete")
+        self.assertEqual(rc, 0, "valid partial data uses exit 0 under AXI")
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["completeness"]["status"], "partial")
         self.assertIn("index coverage: partial", report)
         self.assertIn("2009", report)
         self.assertIn("2018", report)
@@ -1018,11 +1029,14 @@ class TestJobsCliContracts(E2ETest):
         for module, argv in cases:
             with self.subTest(module=module.__name__), \
                  mock.patch.object(module, "Client", side_effect=RuntimeError(message)), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
                  contextlib.redirect_stderr(io.StringIO()) as err:
                 rc = module.main(argv)
 
             self.assertNotEqual(rc, 0)
-            self.assertEqual(err.getvalue().strip(), message)
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["error"]["message"], message)
+            self.assertEqual(err.getvalue(), "")
             self.assertNotIn("Traceback", err.getvalue())
 
     def test_sample_limits_authority_cohort(self):
@@ -1053,8 +1067,8 @@ class TestJobsCliContracts(E2ETest):
 
         self.assertEqual(cm.exception.code, 2)
 
-    def test_partial_authority_json_exits_three_without_losing_payload(self):
-        """Shell callers must distinguish a usable partial frontier from success."""
+    def test_partial_authority_json_exits_zero_with_payload_signal(self):
+        """Shell callers must distinguish usable partial data inside the payload."""
         import jobs
 
         client = SimpleNamespace()
@@ -1069,8 +1083,12 @@ class TestJobsCliContracts(E2ETest):
              contextlib.redirect_stdout(out):
             rc = jobs.main(["authority", "seed", "--max-usd", "1.60"])
 
-        self.assertEqual(rc, 3)
-        self.assertEqual(json.loads(out.getvalue()), result)
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["completeness"]["status"], "partial")
+        self.assertEqual(payload["completeness"]["records_returned"], 1)
+        self.assertEqual(payload["frontier"][0]["handle"], "alice")
 
 
 class TestAuthorityContracts(E2ETest):

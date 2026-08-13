@@ -24,6 +24,8 @@ content changes daily, so a changed key set means a real API change.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -85,6 +87,8 @@ UNPROBEABLE = {
         "route"),
     "space_detail": "needs a Space id; none is available to the suite",
 }
+
+_LAST_SETUP_ERROR = None
 
 
 def probe_endpoint_names(*, quick=False):
@@ -331,8 +335,11 @@ def check_pricing(c, facts):
     return drift
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
+def _legacy_main(argv=None):
+    global _LAST_SETUP_ERROR
+    _LAST_SETUP_ERROR = None
+    from axi import ArgumentParser
+    p = ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pricing", action="store_true",
                    help="also re-measure prices by balance delta (~3 min)")
@@ -374,6 +381,7 @@ def main(argv=None):
         print(f"\nCANNOT VERIFY — this is a setup problem, not API drift:\n  {e}\n"
               f"\nNothing about the recorded facts has been called into question. "
               f"Fix the above and re-run.", file=sys.stderr)
+        _LAST_SETUP_ERROR = str(e)
         return 2
 
     skipped_quick = len(ENDPOINTS) - len(endpoint_names) if a.quick else 0
@@ -415,6 +423,39 @@ def main(argv=None):
     elif age is not None and age >= facts.get("staleness_warn_days", 90):
         print(f"NOTE: the stamp is {age} days old. Re-run with --update to refresh it.")
     return 0
+
+
+def _axi_main(argv=None):
+    from axi import emit, error, fast_version, success
+    if fast_version(argv):
+        return 0
+    if not os.environ.get("TWITTERAPI_IO_KEY"):
+        emit(error("setup", "TWITTERAPI_IO_KEY not set; verification was not run",
+                   "verify.py", "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
+        return 2
+    progress = io.StringIO()
+    with contextlib.redirect_stdout(progress):
+        rc = _legacy_main(argv)
+    rendered = progress.getvalue()
+    if rendered:
+        print(rendered, file=sys.stderr, end="")
+    lines = [line.strip() for line in rendered.splitlines() if line.strip()]
+    coverage = next((line for line in lines if line.startswith("COVERAGE")), None)
+    detail = (_LAST_SETUP_ERROR if rc == 2 and _LAST_SETUP_ERROR else
+              coverage or (lines[-1] if lines else "verification produced no summary"))
+    if rc == 0:
+        emit(success("verify.py", {"verification": "passed", "summary": detail,
+                                   "help": ["Run `verify.py --quick` for a lower-cost smoke sweep"]}))
+    else:
+        kind = "setup" if rc == 2 else "runtime"
+        emit(error(kind, detail, "verify.py",
+                   "Inspect stderr diagnostics, fix the reported condition, and rerun `verify.py`"))
+    return rc
+
+
+def main(argv=None):
+    from axi import run_cli
+    return run_cli("verify.py", _axi_main, argv)
 
 
 if __name__ == "__main__":

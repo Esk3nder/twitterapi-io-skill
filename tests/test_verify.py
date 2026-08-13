@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -190,10 +191,12 @@ class TestVerifyFailures(unittest.TestCase):
 
         rendered = output.getvalue()
         self.assertEqual(rc, 1)
-        self.assertIn("probed 22/32", rendered)
-        self.assertIn("10 unprobeable", rendered)
-        self.assertIn("1 FAILING", rendered)
-        self.assertIn("spent $0.00120", rendered)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["error"]["type"], "runtime")
+        self.assertIn("probed 22/32", payload["error"]["message"])
+        self.assertIn("10 unprobeable", payload["error"]["message"])
+        self.assertIn("1 FAILING", payload["error"]["message"])
+        self.assertIn("spent $0.00120", payload["error"]["message"])
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
                         credits_to_usd, enrich_tweet_media, filter_search_tweets,
                         prepare_search_query)  # noqa: E402
 from store import Store  # noqa: E402
+from axi import (ACCOUNT_FIELDS, TWEET_FIELDS, ArgumentParser, UsageError,
+                 HelpFormatter, add_common_output_flags, dashboard, emit, error, fast_version,
+                 format_record, parse_fields, run_cli, success)  # noqa: E402
 
 TW_FMT = "%a %b %d %H:%M:%S %z %Y"      # verified: "Mon Aug 10 17:16:53 +0000 2026"
 
@@ -70,6 +73,8 @@ def audience(user, *, ids_only=True, limit=None, max_usd=5.0,
     info = c.user_info(user)            # Client.user_info charges its own 18 credits
     total, uid = int(info.get("followers") or 0), info.get("id")
     want = min(limit, total) if limit else total
+    c.last_audience_total = total
+    c.last_audience_context = {"account_followers": total, "requested": want}
     endpoint = ("verified_followers" if verified_only
                 else "follower_ids" if ids_only else "followers")
     est = c.estimate(endpoint, want)
@@ -91,28 +96,68 @@ def audience(user, *, ids_only=True, limit=None, max_usd=5.0,
               else c.followers(user, limit=limit))
     for r in stream:
         yield {"id": r} if isinstance(r, (str, int)) else r
+    if getattr(stream, "complete", True) is False:
+        raise IncompleteDataError(
+            getattr(stream, "_warning", None) or
+            f"the follower walk for @{user} ended before completeness was proven")
 
 
 def _audience_cli(a):
     c = Client(max_usd=a.max_usd)
     got = 0
     fh = open(a.out, "w") if a.out else sys.stdout
+    was_truncated = False
+    truncated_reason = None
+    refused = False
     try:
         for rec in audience(a.user, ids_only=a.ids_only, limit=a.limit,
                             max_usd=a.max_usd, verified_only=a.verified_only,
                             client=c):
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            rendered, clipped = format_record(
+                rec, command="workflows.py audience <user>",
+                schema=ACCOUNT_FIELDS, fields=getattr(a, "fields", None),
+                defaults=(("id",) if a.ids_only else ("id", "user_name", "name")),
+                full=getattr(a, "full", False))
+            fh.write(json.dumps(rendered, ensure_ascii=False) + "\n")
+            was_truncated = was_truncated or clipped
             got += 1
         truncated = False
     except CostLimitExceeded as e:
         truncated = True
-        print(f"{'STOPPED' if got else 'REFUSED'}: {e}", file=sys.stderr)
+        refused = not got
+        truncated_reason = str(e)
+        print(f"[audience] {'stopped' if got else 'refused'}: {e}", file=sys.stderr)
+    except IncompleteDataError as e:
+        truncated = True
+        truncated_reason = str(e)
+        print(f"[audience] partial: {e}", file=sys.stderr)
     finally:
         if a.out:
             fh.close()
     print(f"{got:,} records | {c.spend_report()}", file=sys.stderr)
-    # Non-zero on truncation: a partial dataset must not look like success.
-    return 0 if not truncated else (2 if not got else 3)
+    if refused:
+        emit(error("refusal", truncated_reason, "workflows.py audience",
+                   "Pass `--limit <count>` or raise `--max-usd <amount>`"))
+        return 2
+    complete = not truncated
+    total = getattr(c, "last_audience_total", got)
+    summary = success(
+        "workflows.py audience", {
+            "records_count": f"{got} of {total} total",
+            "records_state": (None if got else
+                              f"0 followers found for @{a.user} in the requested scope"),
+            "artifact": a.out,
+            "help": (["Run `workflows.py audience <user> --profiles` for profile fields"]
+                     + (["Run `workflows.py audience <user> --limit <count>` with a larger count to show more"]
+                        if got < total and complete else [])
+                     + (["Run `workflows.py audience <user> --full` for complete text"]
+                        if was_truncated else [])),
+        }, complete=complete, reason=truncated_reason,
+        resume=("Raise `--max-usd <amount>` and rerun" if truncated else None),
+        records_returned=got)
+    print(json.dumps(summary, ensure_ascii=False) if not a.out else
+          json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
 
 
 # ----------------------------------------------------------------- history --
@@ -229,10 +274,10 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
             break
 def _history_cli(a):
     if a.exclude_retweets and not a.user:
-        print("REFUSED: --exclude-retweets cannot be combined with --query; "
-              "a raw query may explicitly select native retweets, so dropping "
-              "them after retrieval would silently under-return paid results.",
-              file=sys.stderr)
+        emit(error("refusal", "--exclude-retweets cannot be combined with --query; "
+                   "a raw query may explicitly select native retweets",
+                   "workflows.py history",
+                   "Put `-filter:nativeretweets` in `<query>` explicitly"))
         return 2
     c = Client(max_usd=a.max_usd)
     if c.store is None:
@@ -249,9 +294,9 @@ def _history_cli(a):
               "never returns native retweets. Use --include-retweets to fetch "
               "them in a second pass.", file=sys.stderr)
     if a.include_retweets and not a.user:
-        print("REFUSED: --include-retweets needs the USER shorthand; with "
-              "--query, put filter:nativeretweets in the query explicitly.",
-              file=sys.stderr)
+        emit(error("refusal", "--include-retweets needs the USER shorthand",
+                   "workflows.py history",
+                   "Put `filter:nativeretweets` in `<query>` explicitly"))
         return 2
 
     if not a.user:
@@ -279,6 +324,8 @@ def _history_cli(a):
     composition = {"originals": 0, "replies": 0, "quotes": 0,
                    "native retweets": 0}
     truncated = False
+    truncated_reason = None
+    was_text_truncated = False
     stop_all_passes = False
     try:
         for search_query in queries:
@@ -299,12 +346,14 @@ def _history_cli(a):
                     # search pass. Preserve the partial status, but still run
                     # the independent native-retweet pass with its own cap.
                     truncated = True
+                    truncated_reason = str(e)
                     print(f"\nSTOPPED: {e}", file=sys.stderr)
                     break
                 except CostLimitExceeded as e:
                     # The spend ceiling is shared across passes, so another
                     # pass cannot make useful progress once it is exhausted.
                     truncated = True
+                    truncated_reason = str(e)
                     stop_all_passes = True
                     print(f"\nSTOPPED: {e}", file=sys.stderr)
                     break
@@ -347,7 +396,13 @@ def _history_cli(a):
                 if not (is_retweet or is_reply or is_quote):
                     composition["originals"] += 1
 
-                fh.write(json.dumps(t, ensure_ascii=False) + "\n")
+                rendered, clipped = format_record(
+                    t, command="workflows.py history <user>", schema=TWEET_FIELDS,
+                    fields=getattr(a, "fields", None),
+                    defaults=("id", "created_at", "text"),
+                    full=getattr(a, "full", False))
+                fh.write(json.dumps(rendered, ensure_ascii=False) + "\n")
+                was_text_truncated = was_text_truncated or clipped
                 n += 1
             if stop_all_passes:
                 break
@@ -372,6 +427,8 @@ def _history_cli(a):
             and stated_posts is not None and stated_posts > n
             and oldest_ts > account_created_ts + 86400):
         index_limited = True
+        truncated_reason = ("full-lifetime coverage cannot be established because "
+                            "the search index does not reach account creation")
         oldest_day = datetime.fromtimestamp(oldest_ts, timezone.utc).date()
         created_day = datetime.fromtimestamp(account_created_ts, timezone.utc).date()
         gap_days = (oldest_day - created_day).days
@@ -384,7 +441,22 @@ def _history_cli(a):
               f"periods can all separate these dates.",
               file=sys.stderr)
     print(f"{n:,} tweets | {c.spend_report()}", file=sys.stderr)
-    return 3 if truncated or index_limited else 0
+    complete = not (truncated or index_limited)
+    summary = success(
+        "workflows.py history", {
+            "tweets_count": f"{n} of {n if complete else 'unknown'} total",
+            "tweets_state": (None if n else
+                             f"0 posts found for {q!r} between {a.since or 'any'} "
+                             f"and {a.until or 'now'}"),
+            "artifact": a.out,
+            "help": (["Run `workflows.py history <user> --full` for complete text"]
+                     if was_text_truncated else []),
+        }, complete=complete, reason=truncated_reason,
+        resume=("Raise `--max-usd <amount>`, raise `--max-pages <count>`, or narrow "
+                "the date window" if not complete else None), records_returned=n)
+    print(json.dumps(summary, ensure_ascii=False) if not a.out else
+          json.dumps(summary, indent=2, ensure_ascii=False))
+    return 0
 
 
 # ----------------------------------------------------------------- monitor --
@@ -457,37 +529,88 @@ def _monitor_cli(a):
     print(f"monitoring {users} every {a.interval}s "
           f"(~${credits_to_usd(15) * (86400 / a.interval):.2f}/day at minimum billing)",
           file=sys.stderr)
+    state = {"text_truncated": False, "records": 0}
+    interrupted = False
+
+    def output_tweet(tweet):
+        record = {
+            "id": tweet.get("id"),
+            "author": (tweet.get("author") or {}).get("userName", "?"),
+            "createdAt": tweet.get("createdAt"), "text": tweet.get("text"),
+            "likeCount": tweet.get("likeCount"),
+        }
+        rendered, clipped = format_record(
+            record, command="workflows.py monitor <users>", schema=TWEET_FIELDS,
+            fields=getattr(a, "fields", None), defaults=("id", "created_at", "text"),
+            full=getattr(a, "full", False))
+        state["text_truncated"] = state["text_truncated"] or clipped
+        state["records"] += 1
+        print(json.dumps(rendered, ensure_ascii=False))
     try:
         monitor(users, interval=a.interval, client=c, state_file=a.state,
-                once=a.once, lookback=a.lookback)
+                once=a.once, lookback=a.lookback, on_tweet=output_tweet)
     except KeyboardInterrupt:
+        interrupted = True
         print(f"\nstopped | {c.spend_report()}", file=sys.stderr)
     except (CostLimitExceeded, IncompleteDataError) as e:
-        # Non-zero on truncation, same contract as audience/history: a run cut
-        # short by the ceiling must not report success.
+        # Preserve usable records and carry truncation in the final payload;
+        # exit 0 alone never claims completeness.
         print(f"\nSTOPPED: {e}", file=sys.stderr)
-        return 3
+        emit(success("workflows.py monitor", {
+                         "records_count": f"{state['records']} of unknown total",
+                         "records_state": (None if state["records"] else
+                                           "0 new posts emitted before the monitor stopped")},
+                     complete=False, reason=str(e),
+                     resume="Raise `--max-usd <amount>` and restart from `--state <path>`",
+                     records_returned=state["records"]))
+        return 0
+    summary = success("workflows.py monitor", {
+        "records_count": (f"{state['records']} of "
+                          f"{'unknown' if interrupted else state['records']} total"),
+        "records_state": (None if state["records"] else
+                          "0 new posts found for the monitored accounts"),
+        "help": (["Run `workflows.py monitor <users> --full` for complete text"]
+                 if state["text_truncated"] else [])},
+        complete=not interrupted,
+        reason=("monitor stopped by the user" if interrupted else None),
+        resume=("Rerun with `--state <path>` to resume" if interrupted else None),
+        records_returned=state["records"])
+    print(json.dumps(summary, ensure_ascii=False))
     return 0
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+def _main(argv=None):
+    if fast_version(argv):
+        return 0
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        emit(dashboard(__file__, "Run streaming twitterapi.io audience, history, and monitor workflows"))
+        return 0
+    p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     p.add_argument("--max-usd", type=float, default=5.0,
                    help="hard spend ceiling for this run (default 5.00)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    a = sub.add_parser("audience", help="enumerate an account's followers")
-    a.add_argument("user")
-    a.add_argument("--limit", type=int)
-    a.add_argument("--ids-only", action="store_true", default=True)
+    a = sub.add_parser("audience", help="enumerate an account's followers",
+                       formatter_class=HelpFormatter,
+                       epilog="Examples:\n  workflows.py audience <user> --limit <count>\n  workflows.py audience <user> --profiles --fields id,user_name,name")
+    a.add_argument("user", help="account handle")
+    a.add_argument("--limit", type=int, help="maximum follower records")
+    a.add_argument("--ids-only", action="store_true", default=True,
+                   help="return only account IDs")
     a.add_argument("--profiles", dest="ids_only", action="store_false",
                    help="fetch full profiles (2.2x cost) instead of IDs")
-    a.add_argument("--verified-only", action="store_true")
-    a.add_argument("--out")
+    a.add_argument("--verified-only", action="store_true",
+                   help="use the verified-followers endpoint")
+    a.add_argument("--out", help="write record JSONL to this path")
+    a.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
+                   help="hard spend ceiling (default 5.00)")
+    add_common_output_flags(a)
     a.set_defaults(func=_audience_cli)
 
-    h = sub.add_parser("history", help="historical tweet search")
+    h = sub.add_parser("history", help="historical tweet search",
+                       formatter_class=HelpFormatter,
+                       epilog="Examples:\n  workflows.py history <user> --since <YYYY-MM-DD>\n  workflows.py history --query \"<query>\" --max-pages <count>")
     h.add_argument("user", nargs="?", help="account handle (shorthand for from:USER)")
     h.add_argument("--query", help="raw X search query instead of a handle")
     h.add_argument("--since", help="YYYY-MM-DD")
@@ -500,28 +623,50 @@ def main(argv=None):
     retweets.add_argument("--include-retweets", action="store_true",
                           help="second pass with filter:nativeretweets to capture "
                                "retweets, which `from:` alone omits entirely")
-    h.add_argument("--max-pages", type=int)
+    h.add_argument("--max-pages", type=int, help="maximum pages per search pass")
     h.add_argument("--store", help="sqlite path for the persisted history corpus")
-    h.add_argument("--out")
+    h.add_argument("--out", help="write record JSONL to this path")
+    h.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
+                   help="hard spend ceiling (default 5.00)")
+    add_common_output_flags(h)
     h.set_defaults(func=_history_cli)
 
-    m = sub.add_parser("monitor", help="poll accounts for new tweets")
+    m = sub.add_parser("monitor", help="poll accounts for new tweets",
+                       formatter_class=HelpFormatter,
+                       epilog="Examples:\n  workflows.py monitor <user>,<user> --once\n  workflows.py monitor <users> --state <path>")
     m.add_argument("users", help="comma-separated handles")
-    m.add_argument("--interval", type=int, default=60)
-    m.add_argument("--state", help="checkpoint file for resume")
-    m.add_argument("--once", action="store_true")
+    m.add_argument("--interval", type=int, default=60,
+                   help="poll interval in seconds")
+    m.add_argument("--state", help="checkpoint JSON path for resume")
+    m.add_argument("--once", action="store_true", help="poll once and exit")
     m.add_argument("--lookback", type=int, default=900,
                    help="cold-start lookback window in seconds (default 900)")
+    m.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
+                   help="hard spend ceiling (default 5.00)")
+    add_common_output_flags(m)
     m.set_defaults(func=_monitor_cli)
 
     args = p.parse_args(argv)
     if args.cmd == "history" and not (args.user or args.query):
         p.error("history needs a USER or --query")
     try:
+        parse_fields(args.fields,
+                     ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
+                     f"workflows.py {args.cmd}")
+    except UsageError as exc:
+        emit(error("usage", str(exc), f"workflows.py {args.cmd}",
+                   f"Run `workflows.py {args.cmd} --help` for valid fields"))
+        return 2
+    try:
         return args.func(args)
     except RuntimeError as e:
-        print(str(e), file=sys.stderr)
+        emit(error("runtime", str(e), f"workflows.py {args.cmd}",
+                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
         return 1
+
+
+def main(argv=None):
+    return run_cli("workflows.py", _main, argv)
 
 
 if __name__ == "__main__":

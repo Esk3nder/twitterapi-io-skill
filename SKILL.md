@@ -43,8 +43,18 @@ python3 scripts/jobs.py brief openai --days 7
 
 `--max-usd` (default $5) is a hard ceiling on every command.
 
-**Exit codes:** `0` complete for the stated scope · `2` refused before spending ·
-`3` partial because a ceiling or completeness boundary stopped the result.
+**Exit codes:** `0` valid complete or valid partial result · `2` usage, refusal,
+or setup failure · `1` runtime, API, or internal failure. An exit 0 is not proof
+of completeness: inspect `complete` and `completeness.status`. Partial payloads
+repeat the signal as `complete: false` and `status: partial`, and include a
+reason, records returned, and an actionable resume command.
+
+Stdout is JSON (or JSON Lines for streaming records); progress, spend, and
+warnings stay on stderr. Lists default to brief fields. Use `--fields <a,b,c>`
+for additional supported fields and `--full` for complete long text. Default
+text previews end with `... (truncated, N chars total)`, and bounded lists state
+the displayed and total counts. Use `<command> --help` for each command's exact
+flags and examples; `-v`, `-V`, and `--version` print only the version.
 
 Jobs return JSON for you to interpret. They compute who and what; they do not
 compute themes, consensus, or whether engagement is organic. Do not present a
@@ -75,8 +85,9 @@ history cost less. Confirm with the user before any crawl over a few dollars.
 `overlap` and `authority` estimate up front and refuse rather than start an
 unaffordable crawl. `authority` uses a conservative 2,000-followings/member
 estimate and prints member progress plus running spend to stderr. It returns
-`complete: false` and the CLI exits `3` when the ceiling truncated its
-follow-graph walk — do not present a partial frontier as whole. `--sample`
+`complete: false` plus `completeness.status: partial` when the ceiling truncates
+its follow-graph walk — do not present a partial frontier as whole even though
+the valid partial payload exits 0. `--sample`
 limits the authority cohort (or the authenticity tweet sample) and is rejected
 for other jobs.
 
@@ -146,12 +157,23 @@ explicitly select native retweets.
 **Search-index depth is not account age.** For an open-ended handle history,
 the workflow compares the oldest reached tweet with the author's profile
 `createdAt`. If lifetime coverage cannot be established it prints
-`INDEX COVERAGE: PARTIAL` and exits `3`; do not call the result a full archive.
+`INDEX COVERAGE: PARTIAL` and emits an explicit partial completeness object;
+do not call the result a full archive.
 
 `IncompleteDataError` means records already returned are valid but the client
 cannot prove the requested result complete (contract drift, cursor failure,
 unsplittable timestamp, page cap, or equivalent). Propagate it or label the
 result partial; never convert it to an empty list or confident count.
+
+## Optional session context
+
+This `SKILL.md` is the on-demand integration. For ambient local state at every
+session start, the user may explicitly run `python3 scripts/jobs.py setup`.
+That installs or repairs directory-scoped SessionStart and SessionEnd integration
+for Claude Code, Codex, and OpenCode; ordinary commands never install anything.
+Use `--agent <claude|codex|opencode>` to select targets or `--scope user` for
+user scope. The hook command is path-repaired on repeat setup and captures only
+scoped timestamps, working directory, and changed file paths at session end.
 
 **Communities and lists do not provide general ID discovery.**
 `community_tweets_all` returns tweets across communities, not communities;

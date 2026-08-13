@@ -255,6 +255,8 @@ def normalize_tweet(t: dict) -> dict:
 
 class Store:
     def __init__(self, path=DEFAULT_DB):
+        self.path = os.path.abspath(os.path.expanduser(path))
+        path = self.path
         # A bare filename ("store.db") has no dirname; makedirs("") raises
         # FileNotFoundError. Only create a parent when there is one.
         parent = os.path.dirname(path)
@@ -610,8 +612,39 @@ class Store:
                 "usd_saved_on_rerun": round(cached / 100_000, 4)}
 
 
+def main(argv=None):
+    from axi import run_cli
+    return run_cli("store.py", _main, argv)
+
+
+def _main(argv=None):
+    from axi import (ArgumentParser, UsageError, dashboard, emit, error,
+                     fast_version, parse_fields, prepare_output)
+    if fast_version(argv):
+        return 0
+    p = ArgumentParser(description="Inspect the local twitterapi.io cache and cohorts")
+    p.add_argument("--store", help="SQLite store path")
+    p.add_argument("--fields", help="cohort fields: name,version,size,created_at")
+    args = p.parse_args(argv)
+    if args.fields:
+        schema = {field: (field,) for field in ("name", "version", "size", "created_at")}
+        try:
+            parse_fields(args.fields, schema, "store.py")
+        except UsageError as exc:
+            emit(error("usage", str(exc), "store.py",
+                       "Run `store.py --help` for valid fields")); return 2
+    body = dashboard(__file__, "Inspect the local twitterapi.io cache and saved cohorts",
+                     store_path=args.store)
+    if args.fields:
+        body = prepare_output(
+            body, command="store.py", fields=args.fields,
+            collections={"cohorts": {field: (field,) for field in
+                                      ("name", "version", "size", "created_at")}},
+            context=f"in local store {body['store']}",
+            help_lines=body.pop("help", ()))
+    emit(body)
+    return 0
+
+
 if __name__ == "__main__":
-    s = Store()
-    print(json.dumps(s.stats(), indent=1))
-    for c in s.list_cohorts():
-        print(f"  {c['name']} v{c['version']}  {c['size']} members")
+    raise SystemExit(main())

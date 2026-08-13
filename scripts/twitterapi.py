@@ -969,11 +969,40 @@ class Client:
                 f"trail this figure briefly.")
 
 
+def main(argv=None):
+    from axi import run_cli
+    return run_cli("twitterapi.py", _main, argv)
+
+
+def _main(argv=None):
+    from axi import ArgumentParser, display_path, emit, error, fast_version, success
+    if fast_version(argv):
+        return 0
+    p = ArgumentParser(description="Inspect the read-only twitterapi.io client")
+    p.add_argument("--balance", action="store_true",
+                   help="read the current credit balance (live, free endpoint)")
+    args = p.parse_args(argv)
+    body = {
+        "bin": display_path(__file__),
+        "description": "Standard-library read-only client for twitterapi.io",
+        "endpoint_count": len(ENDPOINTS),
+        "write_operations": "none",
+        "help": ["Run `twitterapi.py --balance` to read account balance",
+                 "Run `jobs.py` for cached and analytical workflows"],
+    }
+    if not args.balance:
+        emit(success("twitterapi.py", body)); return 0
+    try:
+        c = Client(verbose=False)
+        credits = c.balance()
+    except RuntimeError as exc:
+        emit(error("runtime", str(exc), "twitterapi.py --balance",
+                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun")); return 1
+    emit(success("twitterapi.py --balance", {
+        "balance_credits": credits, "balance_usd": round(credits_to_usd(credits), 2),
+        "qps": c.qps}))
+    return 0
+
+
 if __name__ == "__main__":
-    c = Client()
-    print(f"balance ${credits_to_usd(c.balance()):,.2f} | {c.qps} QPS\n")
-    print("200M followers of a mega-account:")
-    for n in ("follower_ids", "followers"):
-        print(f"  {n:14s} -> ${c.estimate(n, 200_000_000):>12,.2f}")
-    print(f"  {'followers@20':14s} -> ${c.estimate('followers', 200_000_000, 20):>12,.2f}"
-          "   <- same data, default page size")
+    raise SystemExit(main())

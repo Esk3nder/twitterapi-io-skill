@@ -16,6 +16,7 @@ crawls are what refusal must prevent, and these tests pin the spend to
 exactly the identity lookups and nothing else.
 """
 import os
+import json
 import sqlite3
 import unittest
 
@@ -30,8 +31,10 @@ class TestOverlapRefusal(E2ETest):
         self.assertEqual(p.returncode, 2,
                          f"expected refusal exit 2, got {p.returncode}; "
                          f"stderr: {p.stderr[-500:]}")
-        self.assertIn("REFUSED", p.stderr)
-        self.assertIn("$5.00", p.stderr, "refusal must cite the ceiling it enforced")
+        payload = json.loads(p.stdout)
+        self.assertEqual(payload["error"]["type"], "refusal")
+        self.assertIn("$5.00", payload["error"]["message"],
+                      "refusal must cite the ceiling it enforced")
         # Zero crawl pages may exist in the (HOME-isolated) store.
         db = os.path.join(STORE_DIR, ".twitterapi-cache", "store.db")
         pages = 0
@@ -53,9 +56,9 @@ class TestAudienceRefusal(E2ETest):
                           "elonmusk"])
         self.assertEqual(p.returncode, 2,
                          f"expected exit 2, got {p.returncode}; stderr: {p.stderr[-500:]}")
-        self.assertEqual(p.stdout.strip(), "",
-                         f"refusal must emit ZERO records, got {len(p.stdout.splitlines())} lines")
-        self.assertIn("REFUSED", p.stderr)
+        payload = json.loads(p.stdout)
+        self.assertEqual(payload["error"]["type"], "refusal")
+        self.assertIn("--limit", payload["help"][0])
         self.assertIn("0 records", p.stderr)
         spend = self.parse_cli_spend(p.stderr)
         self.log(f"parsed subprocess spend: {spend}")
@@ -120,8 +123,9 @@ class TestRealtimeGuard(E2ETest):
         self.assertEqual(p.returncode, 2,
                          f"expected refusal exit 2, got {p.returncode}; "
                          f"stderr: {p.stderr[-500:]}")
-        self.assertIn("REFUSED", p.stderr)
-        self.assertIn("--confirm", p.stderr)
+        payload = json.loads(p.stdout)
+        self.assertEqual(payload["error"]["type"], "refusal")
+        self.assertIn("--confirm", payload["error"]["message"])
         # Read-only verification that no rule leaked (listing is allowed).
         from twitterapi import Client
         from realtime import list_rules

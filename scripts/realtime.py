@@ -31,6 +31,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import Client, APIError  # noqa: E402
+from axi import (RULE_FIELDS, TWEET_FIELDS, ArgumentParser, HelpFormatter, add_common_output_flags,
+                 emit, error, fast_version, format_record, prepare_output,
+                 parse_fields, run_cli, success, UsageError)  # noqa: E402
 
 WS_HOST = "ws.twitterapi.io"
 WS_PATH = "/twitter/tweet/websocket"
@@ -244,98 +247,188 @@ def stream(c: Client, *, seconds=None, on_event=None):
         ws.close()
 
 
-def _print_event(evt):
+def _print_event(evt, *, fields=None, full=False, state=None):
     et = evt.get("event_type")
     if et in ("connected", "ping"):
         print(f"  [{et}]", file=sys.stderr)
         return
     for t in evt.get("tweets") or []:
-        print(json.dumps({"rule": evt.get("rule_tag"), "id": t.get("id"),
-                          "author": (t.get("author") or {}).get("userName")
-                                    or t.get("screen_name"),
-                          "text": t.get("text")}, ensure_ascii=False))
+        raw = {"id": t.get("id"), "createdAt": t.get("createdAt"),
+               "author": (t.get("author") or {}).get("userName")
+                         or t.get("screen_name"),
+               "text": t.get("text"), "rule": evt.get("rule_tag")}
+        schema = dict(TWEET_FIELDS)
+        schema["rule"] = ("rule",)
+        rendered, clipped = format_record(
+            raw, command="realtime.py stream", schema=schema, fields=fields,
+            defaults=("id", "created_at", "text", "rule"), full=full)
+        if state is not None:
+            state["records"] += 1
+            state["truncated"] = state["truncated"] or clipped
+        print(json.dumps(rendered, ensure_ascii=False))
 
 
 # -------------------------------------------------------------------- cli --
-def main(argv=None):
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def _main(argv=None):
+    if fast_version(argv):
+        return 0
+    p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("rules", help="manage filter rules (these BILL while active)")
-    r.add_argument("action",
-                   choices=["list", "add", "activate", "deactivate", "delete"])
-    r.add_argument("--tag")
-    r.add_argument("--value", help="X search query, <=255 chars")
-    r.add_argument("--interval", type=float, default=60)
-    r.add_argument("--rule-id")
-    r.add_argument("--confirm", action="store_true",
-                   help="required for add/activate/deactivate/delete: all change billable state")
+    r = sub.add_parser("rules", help="manage filter rules (these BILL while active)",
+                       formatter_class=HelpFormatter)
+    actions = r.add_subparsers(dest="action", required=True)
+    listing = actions.add_parser("list", help="list current filter rules",
+                                 formatter_class=HelpFormatter,
+                                 epilog="Examples:\n  realtime.py rules list\n  realtime.py rules list --fields id,tag,active")
+    add_common_output_flags(listing)
+    add = actions.add_parser("add", help="create an inactive rule",
+                             formatter_class=HelpFormatter,
+                             epilog="Examples:\n  realtime.py rules add --tag <tag> --value \"<query>\" --confirm\n  realtime.py rules list")
+    add.add_argument("--tag", required=True, help="rule label")
+    add.add_argument("--value", required=True, help="X search query, <=255 chars")
+    add.add_argument("--interval", type=float, default=60,
+                     help="delivery interval in seconds")
+    add.add_argument("--confirm", action="store_true",
+                     help="required: acknowledges server-side mutation")
+    for action in ("activate", "deactivate"):
+        q = actions.add_parser(action, help=f"{action} an existing rule",
+                               formatter_class=HelpFormatter,
+                               epilog=f"Examples:\n  realtime.py rules {action} --rule-id <id> --tag <tag> --value \"<query>\" --confirm\n  realtime.py rules list")
+        q.add_argument("--rule-id", required=True, help="existing rule ID")
+        q.add_argument("--tag", required=True, help="complete replacement tag")
+        q.add_argument("--value", required=True, help="complete replacement query")
+        q.add_argument("--interval", type=float, default=60,
+                       help="delivery interval in seconds")
+        q.add_argument("--confirm", action="store_true",
+                       help="acknowledge server-side mutation and billing risk")
+    delete = actions.add_parser("delete", help="delete an existing rule",
+                                formatter_class=HelpFormatter,
+                                epilog="Examples:\n  realtime.py rules delete --rule-id <id> --confirm\n  realtime.py rules list")
+    delete.add_argument("--rule-id", required=True, help="existing rule ID")
+    delete.add_argument("--confirm", action="store_true",
+                        help="acknowledge server-side mutation")
 
-    s = sub.add_parser("stream", help="consume the websocket stream")
-    s.add_argument("--seconds", type=int, help="stop after N seconds")
+    s = sub.add_parser("stream", help="consume the websocket stream",
+                       formatter_class=HelpFormatter,
+                       epilog="Examples:\n  realtime.py stream --seconds <seconds>\n  realtime.py stream --fields id,created_at,text,rule")
+    s.add_argument("--seconds", type=int, help="stop after this many seconds")
+    add_common_output_flags(s)
 
     a = p.parse_args(argv)
+    if a.cmd == "rules" and a.action == "list":
+        try:
+            parse_fields(a.fields, RULE_FIELDS, "realtime.py rules list")
+        except UsageError as exc:
+            emit(error("usage", str(exc), "realtime.py rules list",
+                       "Run `realtime.py rules list --help` for valid fields"))
+            return 2
+    if a.cmd == "stream":
+        schema = dict(TWEET_FIELDS); schema["rule"] = ("rule",)
+        try:
+            parse_fields(a.fields, schema, "realtime.py stream")
+        except UsageError as exc:
+            emit(error("usage", str(exc), "realtime.py stream",
+                       "Run `realtime.py stream --help` for valid fields"))
+            return 2
+    if a.cmd == "rules" and a.action != "list" and not a.confirm:
+        emit(error("refusal", f"rules {a.action} changes server-side rule state; "
+                   "--confirm is required", f"realtime.py rules {a.action}",
+                   f"Run `realtime.py rules {a.action} --help` and review the billing warning"))
+        return 2
     try:
         c = Client(verbose=False)
     except RuntimeError as e:
-        print(str(e), file=sys.stderr)
+        emit(error("runtime", str(e), f"realtime.py {a.cmd}",
+                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
         return 1
 
     if a.cmd == "rules":
         try:
             if a.action == "list":
                 rules = list_rules(c)
-                print(json.dumps(rules, indent=1))
+                payload = prepare_output(
+                    {"rules": rules}, command="realtime.py rules list",
+                    fields=a.fields, full=a.full, collections={"rules": RULE_FIELDS},
+                    defaults={"rules": ("id", "tag", "value", "active")},
+                    context="for this twitterapi.io account",
+                    help_lines=("Run `realtime.py rules <add|activate|deactivate|delete> --help` for mutations",))
+                emit(success("realtime.py rules list", payload))
                 print(active_rule_warning(c), file=sys.stderr)
             elif a.action == "add":
-                if not (a.tag and a.value):
-                    p.error("add needs --tag and --value")
-                print(json.dumps(add_rule(c, a.tag, a.value, a.interval,
-                                          confirm=a.confirm), indent=1))
+                emit(success("realtime.py rules add", {
+                    "rule": add_rule(c, a.tag, a.value, a.interval, confirm=True),
+                    "help": ["Run `realtime.py rules list` to inspect rule state",
+                             "Run `realtime.py rules activate --rule-id <id> --tag <tag> --value \"<query>\" --confirm` to activate"]}))
             elif a.action in ("activate", "deactivate"):
                 # add_rule creates a rule INACTIVE (is_effect=0); it only bills
                 # and streams once activated. Without this the CLI could create
                 # a rule it could never turn on, so a user's stream stayed empty.
-                if not (a.rule_id and a.tag and a.value):
-                    p.error(f"{a.action} needs --rule-id, --tag and --value "
-                            f"(update_rule replaces the whole rule)")
-                print(json.dumps(update_rule(
+                emit(success(f"realtime.py rules {a.action}", {"rule": update_rule(
                     c, a.rule_id, a.tag, a.value, a.interval,
                     is_effect=1 if a.action == "activate" else 0,
-                    confirm=a.confirm), indent=1))
+                    confirm=True), "help": ["Run `realtime.py rules list` to verify current state"]}))
             else:
-                if not a.rule_id:
-                    p.error("delete needs --rule-id")
-                print(json.dumps(delete_rule(c, a.rule_id, confirm=a.confirm),
-                                 indent=1))
+                emit(success("realtime.py rules delete", {
+                    "rule": delete_rule(c, a.rule_id, confirm=True),
+                    "help": ["Run `realtime.py rules list` to verify current state"]}))
         except PermissionError as e:
-            print(f"REFUSED: {e}", file=sys.stderr)
+            emit(error("refusal", str(e), f"realtime.py rules {a.action}",
+                       f"Run `realtime.py rules {a.action} --help` for required confirmation"))
             return 2
-        except APIError as e:
-            print(f"API ERROR: {e}", file=sys.stderr)
-            return 1
+        except (APIError, ValueError) as e:
+            emit(error("api" if isinstance(e, APIError) else "usage", str(e),
+                       f"realtime.py rules {a.action}",
+                       f"Run `realtime.py rules {a.action} --help` for valid inputs"))
+            return 1 if isinstance(e, APIError) else 2
         return 0
 
     if a.cmd == "stream":
+        state = {"records": 0, "truncated": False}
+        interrupted = False
         try:
-            for _ in stream(c, seconds=a.seconds):
+            callback = lambda evt: _print_event(
+                evt, fields=a.fields, full=a.full, state=state)
+            for _ in stream(c, seconds=a.seconds, on_event=callback):
                 pass
         except KeyboardInterrupt:
-            pass
+            interrupted = True
         except TimeoutError:
             # A quiet stream is normal (no rule matched anything yet); it must
             # not surface as a traceback.
             print(f"[realtime] no events for {c.timeout}s — the stream is idle. "
                   f"Check `rules list`: a rule must exist AND be activated "
                   f"(is_effect=1) before anything is delivered.", file=sys.stderr)
+            summary = success("realtime.py stream", {
+                "events_count": "0 of 0 total",
+                "events_state": "0 matching posts received before the stream became idle",
+                "help": ["Run `realtime.py rules list` to confirm an active rule exists"]},
+                records_returned=state["records"])
+            print(json.dumps(summary, ensure_ascii=False))
             return 0
         except ConnectionError as e:
             print(f"[realtime] {e}", file=sys.stderr)
             print(f"[realtime] reconnect guidance: wait >={RECONNECT_MIN_SECONDS}s "
                   f"(>=60s on close code {CAPACITY_CLOSE_CODE})", file=sys.stderr)
+            emit(error("runtime", str(e), "realtime.py stream",
+                       f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
             return 1
+        summary = success("realtime.py stream", {
+            "events_count": (f"{state['records']} of "
+                             f"{'unknown' if interrupted else state['records']} total"),
+            "events_state": (None if state["records"] else
+                             "0 matching posts received during the requested stream window"),
+            "help": (["Run `realtime.py stream --full` for complete text"]
+                     if state["truncated"] else [])}, complete=not interrupted,
+            reason=("stream stopped by the user" if interrupted else None),
+            resume=("Rerun `realtime.py stream` to continue" if interrupted else None),
+            records_returned=state["records"])
+        print(json.dumps(summary, ensure_ascii=False))
     return 0
+
+
+def main(argv=None):
+    return run_cli("realtime.py", _main, argv)
 
 
 if __name__ == "__main__":

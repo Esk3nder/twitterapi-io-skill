@@ -14,3 +14,9 @@ secrets*
 __pycache__/
 *.pyc
 .DS_Store
+
+# Agent tooling installed into this directory by `npx skills add`.
+# Unrelated to the skill itself; landed here because it was the cwd.
+.agents/
+.claude/
+skills-lock.json

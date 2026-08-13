@@ -5,9 +5,9 @@
     id overlap. The upstream search index can omit a small number of ordinary
     mid-window tweets nondeterministically, so exact set equality is not an API
     contract (documented here and in TRIAGE.md).
-  - Truncation honesty: a $0.005 ceiling over a 6-month window must exit 3
-    (partial != success) while every emitted tweet is still unique and inside
-    the window.
+  - Truncation honesty: a $0.005 ceiling over a 6-month window must exit 0 with
+    an unmistakable partial payload while every emitted tweet remains unique
+    and inside the window.
 
 Both exercise the sliding-time-window walk that replaces cursor pagination
 (cursors infinite-loop on historical ranges — the documented trap).
@@ -85,17 +85,22 @@ class TestHistoryWindow(E2ETest):
 
 
 class TestTruncationHonesty(E2ETest):
-    def test_ceiling_truncation_exits_3_and_stays_honest(self):
+    def test_ceiling_truncation_exits_0_with_explicit_partial_payload(self):
         require_key()
         p = self.run_cli(["workflows.py", "--max-usd", "0.005", "history",
                           "openai", "--since", "2026-02-01",
                           "--until", "2026-08-01"])
-        self.assertEqual(p.returncode, 3,
-                         f"a ceiling-truncated dataset must exit 3 (partial != "
-                         f"success), got {p.returncode}; stderr: {p.stderr[-400:]}")
+        self.assertEqual(p.returncode, 0,
+                         f"valid partial data must exit 0, got {p.returncode}; "
+                         f"stderr: {p.stderr[-400:]}")
         self.assertIn("STOPPED", p.stderr)
 
-        tweets = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+        lines = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
+        tweets, summary = lines[:-1], lines[-1]
+        self.assertFalse(summary["complete"])
+        self.assertEqual(summary["completeness"]["status"], "partial")
+        self.assertEqual(summary["completeness"]["records_returned"], len(tweets))
+        self.assertIn("--max-usd", summary["completeness"]["resume"])
         ids = [t["id"] for t in tweets]
         self.log(f"emitted {len(ids)} tweets before the $0.005 ceiling")
         self.assertGreater(len(ids), 0,
@@ -105,9 +110,9 @@ class TestTruncationHonesty(E2ETest):
         since_ts, until_ts = ts_of("2026-02-01"), ts_of("2026-08-01")
         bad = []
         for t in tweets:
-            ts = int(datetime.strptime(t["createdAt"], TW_FMT).timestamp())
+            ts = int(datetime.strptime(t["created_at"], TW_FMT).timestamp())
             if not (since_ts <= ts < until_ts):
-                bad.append((t["id"], t["createdAt"]))
+                bad.append((t["id"], t["created_at"]))
         self.assertEqual(bad, [], f"partial output must stay inside the window: {bad[:5]}")
 
         spend = self.parse_cli_spend(p.stderr)
@@ -116,7 +121,7 @@ class TestTruncationHonesty(E2ETest):
             self.log(f"subprocess spend: {requests} requests, {credits} credits")
             # A hard ceiling must never be CROSSED. The walk refuses the page
             # that would exceed it, so a truncated run stops at or under the
-            # limit and signals partial data via exit 3. Asserting overspend
+            # limit and signals partial data in the JSON summary. Asserting overspend
             # here would lock in the weaker "spend past it, then notice"
             # behaviour this guard exists to prevent.
             self.assertLessEqual(credits / 100_000, 0.005,

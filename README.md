@@ -10,7 +10,7 @@ advertises its own triggers, so an agent loads it on its own when you write
 tweet history, or how a post spread. The slash command is there for when you
 want to force it or read what it says.
 
-**Read-only. Standard library only — nothing to `pip install`.** 31 endpoints,
+**Read-only. Standard library only — nothing to `pip install`.** 32 endpoints,
 with every path, parameter spelling, response shape and price confirmed by live
 API calls and re-checkable in 15 seconds.
 
@@ -79,6 +79,22 @@ problem (bad key, no credits, rate limited) with the cause named, **exit 1**
 means the API itself has drifted from the recorded facts. See
 [`tests/TRIAGE.md`](tests/TRIAGE.md).
 
+The skill is the on-demand discovery path. For ambient, directory-scoped state
+at the beginning of Claude Code, Codex, or OpenCode sessions, explicitly opt in:
+
+```bash
+python3 scripts/jobs.py setup                         # project scope, all three
+python3 scripts/jobs.py setup --agent codex --scope user
+```
+
+Setup is idempotent and repairs moved executable paths. Ordinary commands never
+install hooks. Project setup writes managed entries under `.claude/`, `.codex/`,
+and `.opencode/`; user setup uses the corresponding home configuration (with
+OpenCode under `~/.config/opencode/plugins/`). Remove the entries/files marked
+as managed by `twitterapi-io` to uninstall the hooks. The installed SessionStart
+hook injects compact context; SessionEnd records only timestamps, working
+directory, and changed file paths under the configured scope.
+
 **Platform:** developed and tested on macOS and Linux. The Python is portable,
 but `run_e2e.sh` is a bash script and the setup lines above assume a POSIX
 shell — on Windows use WSL, or set the environment variable your own way and
@@ -123,7 +139,7 @@ python3 scripts/workflows.py --max-usd 1 audience jack --limit 5000
 python3 scripts/workflows.py audience jack --profiles      # full profiles, 2.2x
 python3 scripts/workflows.py audience jack --verified-only # verified subset
 
-# history over a date range, streamed to JSONL
+# history over a date range, streamed to JSONL; stdout ends with a summary row
 python3 scripts/workflows.py history openai --since 2026-06-01 --until 2026-07-01 \
   --exclude-replies --out tweets.jsonl
 # `from:` omits native retweets; opt into the second, deduplicated search pass
@@ -149,17 +165,28 @@ python3 scripts/jobs.py overlap stripe vercel --max-usd 1   # scales with both
                                                             # follower counts
 ```
 
-`--max-usd` (default $5) caps every command. **Exit codes:** `0` complete for
-the stated scope · `2` refused before spending · `3` partial because a spend,
-pagination, timestamp, page-cap, or search-index boundary prevented a complete
-result.
+`--max-usd` (default $5) caps every command. **Exit codes:** `0` for valid
+complete or valid partial results · `2` for usage, refusal, or setup failures ·
+`1` for runtime, API, or internal failures. Because partial results now exit 0,
+the final JSON payload always makes the distinction explicit with both
+`"complete": false` and `"completeness": {"status": "partial", "reason": ...,
+"records_returned": ..., "resume": ...}`. Never infer completeness from exit 0
+or from the presence of records alone.
+
+List commands default to a brief schema. Use `--fields <a,b,c>` to request
+additional supported fields, `--full` to disable the 800-character text preview,
+and `<command> --help` to see the valid field/flag set. A truncated value ends
+with `... (truncated, N chars total)`, and deliberately bounded lists report
+`N of M total`. Errors are JSON on stdout with an actionable `help` array;
+progress, spend, warnings, and diagnostics remain on stderr.
 
 `--sample` is intentionally scoped: for `authority` it limits the seed cohort;
 for `authenticity` it limits sampled tweets. Supplying it to another job is an
 error rather than a silently ignored flag. `authority` writes flushed progress
 to stderr while preserving JSON-only stdout.
 
-Add `--out FILE` to stream JSONL instead of stdout, and `--max-pages N` to
+Add `--out FILE` to stream records as JSONL while stdout receives the final JSON
+summary, and `--max-pages N` to
 bound an open-ended history walk. The page cap applies separately to each
 search pass. Even when the first pass hits its cap and makes the overall result
 partial, the native-retweet pass receives its own cap. Thus
@@ -280,7 +307,7 @@ at the default page size. Same data.
 `overlap` and `authority` estimate first and refuse rather than start a crawl
 they cannot afford. `authority` conservatively budgets 2,000 followings per
 member, reports per-member progress to stderr, and returns `complete: false`
-plus exit code `3` if a ceiling cuts its walk short.
+plus `completeness.status: partial` (exit 0) if a ceiling cuts its walk short.
 
 ## Rate limits
 
@@ -340,10 +367,11 @@ Four layers keep a stale fact from passing as true:
 |---|---|---|
 | `verify.py` | contract or price drift | on demand, ~$0.002 |
 | Runtime warning | facts older than 90 days | at first API call |
-| `run_e2e.sh` (80 tests) | behavioural regressions | before release, ~$0.12 |
+| `run_e2e.sh` | behavioural regressions and spend cap | before release, <$0.25 |
 | Weekly CI | drift nobody looked for | Mondays, automatic |
 
-Without a key, all of these skip with a notice rather than failing.
+Without a key, `run_e2e.sh` skips with a notice; `verify.py` emits a structured
+setup error and exits 2.
 See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next step.
 
 ## Known limitations
@@ -355,8 +383,9 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
 - **Search-index depth is not account age.** An open-ended history may stop
   years after the account was created even when the profile states more posts.
   `history` compares the oldest reached date with profile `createdAt`, prints
-  `INDEX COVERAGE: PARTIAL`, and exits `3` when lifetime coverage cannot be
-  established. `statusesCount`-based prices are therefore upper bounds.
+  `INDEX COVERAGE: PARTIAL`, then emits `complete: false` with a partial
+  completeness object (exit 0) when lifetime coverage cannot be established.
+  `statusesCount`-based prices are therefore upper bounds.
 - **Cached thread reconstruction is scoped, not omniscient.** `jobs.py threads`
   groups that handle's cached posts by `conversationId`; external participants
   and deleted posts may be absent, and the output says so. History pages are
@@ -402,7 +431,8 @@ while active; `realtime.py` prints the active-rule count on every command.
 SKILL.md                      agent-facing entry point
 references/facts.json         machine-checkable evidence, dated
 references/verified-facts.md  prose evidence and rationale
-scripts/twitterapi.py         31 endpoints: casing, envelopes, cost, QPS, cache
+scripts/twitterapi.py         32 endpoints: casing, envelopes, cost, QPS, cache
+scripts/axi.py                shared JSON command boundary and session setup
 scripts/store.py              sqlite cache, normalisers, versioned cohorts
 scripts/cohort.py             resolvers, set algebra, authority ranking
 scripts/jobs.py               analytical jobs, including $0 catalogue/threads
