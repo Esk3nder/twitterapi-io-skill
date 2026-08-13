@@ -34,7 +34,8 @@ from statistics import median
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import (APIError, Client, CostLimitExceeded,
-                        IncompleteDataError, enrich_tweet_media)  # noqa: E402
+                        IncompleteDataError, enrich_tweet_media,
+                        filter_search_tweets, prepare_search_query)  # noqa: E402
 from store import Store  # noqa: E402
 from cohort import Cohort  # noqa: E402
 from axi import (ACCOUNT_FIELDS, MEDIA_FIELDS, TWEET_FIELDS, ArgumentParser,
@@ -461,6 +462,13 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
     smaller value only when a deliberate cap is wanted. A low fixed cap here
     silently truncates a busy window — the bug that biased narrative_tracker."""
     from store import parse_ts
+    # Same wire discipline as Client.paginate("search") and history_search:
+    # bare since:/until: tokens resolve outside UTC on the index, and
+    # min_faves filters on a stale like-count snapshot, so the operator is
+    # stripped here and enforced locally against each tweet's live likeCount.
+    # Sending the query raw resurrected both documented traps for any
+    # user-supplied `narrative` query that carried them.
+    query, local_min_faves = prepare_search_query(query)
     out, seen = [], set()
     ut = until_ts
     for _ in range(max_pages):
@@ -473,12 +481,17 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
         c._charge("search", len(batch), 20)
         if c.store:
             c.store.put_tweets(batch)
+        # Stamps come from the WHOLE page (resume boundary must not depend
+        # on which tweets qualify); the local min_faves predicate gates only
+        # what the caller receives. The full page is already persisted above —
+        # paid data is kept even when filtered from this result.
+        qualifying = {t.get("id") for t in filter_search_tweets(batch, local_min_faves)}
         stamps = []
         for t in batch:
             ts = parse_ts(t.get("createdAt") or "")
             if ts:
                 stamps.append(ts)
-            if t.get("id") not in seen:
+            if t.get("id") not in seen and t.get("id") in qualifying:
                 seen.add(t.get("id")); out.append(t)
         if len(batch) < 20:
             break                       # short page = range genuinely exhausted

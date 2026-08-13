@@ -163,10 +163,14 @@ def prepare_output(payload: dict, *, command: str, fields: str | None = None,
 
 
 def _record_count(payload: dict) -> int:
-    for key, value in payload.items():
-        if isinstance(value, list) and not key.startswith("help"):
-            return len(value)
-    return 0
+    """Records across ALL top-level lists, not the first one found.
+
+    Returning only the first list's length made completeness.records_returned
+    report 0 for a drift payload whose `joined` was empty while `left` held
+    departures — an agent keying on records_returned as the did-anything-come-
+    back signal would read a members-only-left diff as an empty result."""
+    return sum(len(value) for key, value in payload.items()
+               if isinstance(value, list) and not key.startswith("help"))
 
 
 def success(command: str, payload: dict | None = None, *, complete: bool = True,
@@ -278,7 +282,15 @@ def dashboard(script: str, description: str, *, store_path=None,
              "credits_cached": 0, "usd_saved_on_rerun": 0.0}
     cohorts = []
     if os.path.exists(path):
-        db = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        # mode=ro, NOT immutable=1. Read-only is what the migration-safety
+        # comment below needs; immutable additionally promises SQLite the file
+        # cannot change, which skips locking AND never consults the -wal.
+        # Every writer in this repo runs WAL mode, so with a crawl in flight
+        # the immutable dashboard read the pre-WAL file and reported committed
+        # rows as absent — measured: a store holding 25 committed tweets
+        # dashboarded as tweets=0. Stale-as-definite is this project's core
+        # bug class; a plain ro connection sees the WAL and honours locks.
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         try:
             tables = {row[0] for row in db.execute(

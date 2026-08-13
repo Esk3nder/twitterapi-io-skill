@@ -434,8 +434,20 @@ def _axi_main(argv=None):
                    "verify.py", "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
         return 2
     progress = io.StringIO()
-    with contextlib.redirect_stdout(progress):
-        rc = _legacy_main(argv)
+    try:
+        with contextlib.redirect_stdout(progress):
+            rc = _legacy_main(argv)
+    except SystemExit:
+        # argparse --help and ArgumentParser.error write their output to the
+        # redirected stdout and then raise SystemExit, which skipped every
+        # line below — measured: `--help` answered with exit 0 and 0 bytes on
+        # both streams, and a typo'd flag exited 2 with its structured usage
+        # JSON silently discarded. Flush the captured text to the REAL stdout
+        # (it is agent-facing content, not progress) and let the exit code
+        # pass through run_cli untouched.
+        sys.stdout.write(progress.getvalue())
+        sys.stdout.flush()
+        raise
     rendered = progress.getvalue()
     if rendered:
         print(rendered, file=sys.stderr, end="")

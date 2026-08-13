@@ -201,3 +201,24 @@ class TestVerifyFailures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestArgparseExitsAreNotSilent(unittest.TestCase):
+    """argparse --help and usage errors raised SystemExit inside the stdout
+    redirect, skipping the flush — measured: --help answered with exit 0 and
+    0 bytes on BOTH streams, and a typo'd flag discarded its usage JSON."""
+
+    def _run(self, *argv):
+        return subprocess.run([sys.executable, os.path.join(SCRIPTS, "verify.py"),
+                               *argv], capture_output=True, text=True, timeout=60)
+
+    def test_help_prints_and_exits_zero(self):
+        p = self._run("--help")
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue(p.stdout.strip(), "--help must answer, not exit silently")
+
+    def test_unknown_flag_prints_structured_usage_error(self):
+        p = self._run("--bogus-flag")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("unknown", p.stdout.lower(),
+                      "the structured usage JSON must reach stdout")
+

@@ -254,3 +254,32 @@ class TestJobsPresentation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestRecordCountAndDashboardHonesty(unittest.TestCase):
+    def test_records_returned_sums_all_record_lists(self):
+        """A drift payload whose joined is empty but left holds departures must
+        not report records_returned=0 — counting only the FIRST list made a
+        members-only-left diff read as an empty result."""
+        from axi import _record_count
+        self.assertEqual(_record_count({"joined": [], "left": ["a", "b", "c"]}), 3)
+        self.assertEqual(_record_count({"tweets": ["x", "y"]}), 2)
+        self.assertEqual(_record_count({"help": ["h"], "left": ["a"]}), 1,
+                         "help lists stay excluded from the record count")
+
+    def test_dashboard_sees_rows_committed_to_the_wal(self):
+        """The dashboard's read-only connection must consult the -wal.
+        immutable=1 skipped it: a store holding 25 committed tweets (writer
+        open, WAL uncheckpointed) dashboarded as tweets=0 — stale data
+        presented as definite, this project's core bug class."""
+        from axi import dashboard
+        from store import Store
+        path = os.path.join(tempfile.mkdtemp(prefix="axi-wal-"), "s.db")
+        s = Store(path)          # writer stays open -> nothing checkpointed
+        s.put_tweets([{"id": str(i),
+                       "createdAt": "Mon Aug 10 17:16:53 +0000 2026",
+                       "author": {"id": "1", "userName": "a"}}
+                      for i in range(25)])
+        d = dashboard("x.py", "d", store_path=path)
+        self.assertEqual(d["store_state"]["tweets"], 25)
+        s.close()
+
