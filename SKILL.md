@@ -1,6 +1,6 @@
 ---
 name: twitterapi-io
-description: Use when reading X/Twitter data — followers or an audience graph, a user's tweet history over a date range, searching tweets with X operators, monitoring accounts for new posts, or streaming matched tweets — and whenever a request names an X/Twitter @handle, an x.com or twitter.com link, or a tweet ID and asks what was posted, who follows whom, or how something spread. Also for twitterapi.io, api.twitterapi.io, or x-api-key REST calls without the official X developer portal.
+description: Use when reading X/Twitter data — followers or an audience graph, a user's tweet history over a date range, searching tweets with X operators, monitoring accounts for new posts, or streaming matched tweets — and whenever a request names an X/Twitter @handle, an x.com or twitter.com link, or a tweet ID — whether it asks what was posted, who follows whom, and how something spread, or just drops the handle or link with no question attached. Also for twitterapi.io, api.twitterapi.io, or x-api-key REST calls without the official X developer portal.
 ---
 
 # twitterapi.io
@@ -14,6 +14,17 @@ Use the workflows and jobs for their documented end-to-end tasks. Use the
 and endpoints without a dedicated workflow. Do not hand-roll HTTP requests:
 parameter casing, response envelopes, pagination, and pricing differ per
 endpoint, and `Client` encodes the measured contract.
+
+## When this fires
+
+A bare `@handle`, an x.com link, or a tweet ID dropped with no question attached
+is a lookup request. Default to `jobs.py brief USER --days 30` and report what
+it returns.
+
+Confirm the platform first when the handle is ambiguous. `@name` also addresses
+people on GitHub, Slack, and Linear, and the same string is often the same
+person on several of them. If the surrounding message does not settle which
+network is meant, ask before buying an X lookup for the wrong one.
 
 ## Which command
 
