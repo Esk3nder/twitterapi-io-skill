@@ -274,6 +274,7 @@ def dashboard(script: str, description: str, *, store_path=None,
     from store import DEFAULT_DB
     path = os.path.abspath(os.path.expanduser(store_path or DEFAULT_DB))
     stats = {"pages": 0, "accounts": 0, "tweets": 0, "cohorts": 0,
+             "cohort_members": 0, "db_bytes": 0,
              "credits_cached": 0, "usd_saved_on_rerun": 0.0}
     cohorts = []
     if os.path.exists(path):
@@ -282,12 +283,19 @@ def dashboard(script: str, description: str, *, store_path=None,
         try:
             tables = {row[0] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
+            # "cohorts" counts saved VERSIONS; "cohort_members" counts the rows
+            # that actually make a store big. A real store reported cohorts=2
+            # while holding 421,578 member rows, so growth was invisible in
+            # this dashboard — the one place a user looks. db_bytes answers
+            # the underlying question directly.
             mapping = {"pages": "pages", "accounts": "accounts", "tweets": "tweets",
-                       "cohorts": "cohort_meta"}
+                       "cohorts": "cohort_meta", "cohort_members": "cohorts"}
             for key, table in mapping.items():
                 if table in tables:
                     stats[key] = db.execute(
                         f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            stats["db_bytes"] = (db.execute("PRAGMA page_count").fetchone()[0]
+                                 * db.execute("PRAGMA page_size").fetchone()[0])
             if "pages" in tables:
                 stats["credits_cached"] = db.execute(
                     "SELECT COALESCE(SUM(credits),0) FROM pages").fetchone()[0]

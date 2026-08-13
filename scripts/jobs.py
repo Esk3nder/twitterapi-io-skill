@@ -689,8 +689,18 @@ def cohort_drift(name, v_old=None, v_new=None, *, client=None):
         raise ValueError(
             f"cohort '{name}' has versions {versions or '[]'} — drift needs at "
             f"least 2 resolutions of the same name. Re-resolve and save it again.")
-    v_old = v_old if v_old is not None else versions[0]
+    # Default = the LAST STEP, not the whole history. versions[0] here made a
+    # 30-day-old daily watch report a month of churn as if it were today's:
+    # invisible with two versions (first == previous) and worse every day
+    # after, which is why the original two-version test never caught it.
+    v_old = v_old if v_old is not None else versions[-2]
     v_new = v_new if v_new is not None else versions[-1]
+    missing = [v for v in (v_old, v_new) if v not in versions]
+    if missing:
+        # Cohort.load returns an EMPTY cohort for an absent version, so
+        # without this check a typo'd version reports every member as joined.
+        raise ValueError(f"version(s) {missing} not saved for '{name}'; "
+                         f"available: {versions}")
     if v_old == v_new:
         raise ValueError(f"v_old and v_new are both {v_old}; pick two different "
                          f"versions from {versions}.")

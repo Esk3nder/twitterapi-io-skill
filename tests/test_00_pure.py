@@ -8,6 +8,7 @@ key in the environment but performs no HTTP here.
 """
 import concurrent.futures
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -453,6 +454,72 @@ class TestCohortVersioningAndDrift(E2ETest):
         # load() round-trips
         got = Cohort.load("scene", client=c, store=s)
         self.assertEqual(len(got), 2)
+
+    def test_drift_default_is_previous_step_not_whole_history(self):
+        """Three versions, because with only two, first-ever and previous
+        coincide — which is exactly how the versions[0] default survived the
+        original two-version test while a 30-day watch would have reported a
+        month of churn as one day's."""
+        from twitterapi import Client
+        from jobs import cohort_drift
+        s = self.fresh_store("drift3")
+        c = Client(verbose=False, store=s)
+        s.save_cohort("w", [("1", "a", 1.0, "t")])
+        s.save_cohort("w", [("1", "a", 1.0, "t"), ("2", "b", 1.0, "t")])
+        s.save_cohort("w", [("2", "b", 1.0, "t"), ("3", "x", 1.0, "t")])
+        out = cohort_drift("w", client=c)
+        self.assertEqual((out["from_version"], out["to_version"]), (2, 3),
+                         "default drift must diff the previous version, "
+                         "not the first ever saved")
+        self.assertEqual(out["joined"], ["x"],
+                         "v1->v3 leakage: 'b' joined two versions ago and "
+                         "must not appear in the default (v2->v3) diff")
+        with self.assertRaises(ValueError, msg="an absent version loads as an "
+                               "EMPTY cohort, so without validation a typo "
+                               "reports every member as newly joined"):
+            cohort_drift("w", v_old=1, v_new=99, client=c)
+
+
+class TestFollowerIdsCrawlGenerations(E2ETest):
+    PATH = "/twitter/user/followers_ids"
+
+    def test_replacing_a_version_with_fewer_members_leaves_no_ghosts(self):
+        s = self.fresh_store("ghosts")
+        s.save_cohort("g", [("1", "a", 1.0, "t"), ("2", "b", 1.0, "t")])
+        s.save_cohort("g", [("9", "z", 1.0, "t")], version=1)   # shrink 2 -> 1
+        rows = s.load_cohort("g", version=1)
+        self.assertEqual([m["user_name"] for m in rows], ["z"],
+                         "INSERT OR REPLACE only touches supplied keys; the "
+                         "omitted member must be deleted, not left as a ghost "
+                         "that metadata denies but every load returns")
+        self.assertEqual(s.stats()["cohort_members"], 1)
+
+    def test_recrawl_replaces_rather_than_blends(self):
+        """A crawl starts at a cursorless page; a re-crawl REPLACES that page
+        (same cache key) but its continuation cursors differ, so the old
+        crawl's cursor pages survive. Merging every page then reports people
+        who unfollowed between crawls as current followers — observed on a
+        real store as 39 pages spanning two crawls 3 hours apart."""
+        s = self.fresh_store("gens")
+        s.put_page(self.PATH, {"userName": "esk"}, {"ids": ["111", "222"]})
+        s.put_page(self.PATH, {"userName": "esk", "cursor": "c1"},
+                   {"ids": ["333", "555"]})          # 555 unfollows next
+        time.sleep(0.02)                             # distinct fetched_at
+        s.put_page(self.PATH, {"userName": "esk"}, {"ids": ["222", "444"]})
+        s.put_page(self.PATH, {"userName": "esk", "cursor": "c9"},
+                   {"ids": ["333"]})
+        self.assertEqual(sorted(s.follower_ids_for("esk")),
+                         ["222", "333", "444"],
+                         "555 left before the second crawl and must not be "
+                         "reported; 111 was replaced out of the start page")
+
+    def test_cursor_only_cache_falls_back_to_all_pages(self):
+        """No cursorless start page cached: cannot segment generations, so
+        return everything rather than invent an empty answer for paid data."""
+        s = self.fresh_store("gens2")
+        s.put_page(self.PATH, {"userName": "esk", "cursor": "c1"},
+                   {"ids": ["1"]})
+        self.assertEqual(s.follower_ids_for("esk"), ["1"])
 
 
 class TestStoreConcurrency(E2ETest):

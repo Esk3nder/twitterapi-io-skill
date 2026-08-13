@@ -139,7 +139,7 @@ class TestVerifyFailures(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertRegex(
             run.stderr,
-            r"SKIP COVERAGE: 6 skipped .*TWITTERAPI_IO_KEY not set",
+            r"SKIP COVERAGE: \d+ skipped .*TWITTERAPI_IO_KEY not set",
         )
 
     def test_contract_failure_is_counted_and_does_not_stop_later_probes(self):

@@ -360,21 +360,31 @@ class Store:
             self.db.commit()
 
     def follower_ids_for(self, user_name=None, *, user_id=None):
-        """Return follower IDs already present in paid cached pages.
+        """Return follower IDs from the LATEST cached crawl of this account.
 
         This is a local read: it never constructs a Client or calls the API.
-        It intentionally ignores cursor and count so callers do not need to
-        reproduce an earlier crawl's exact cache keys. When several cached
-        crawls exist, IDs are returned once in first-fetched order.
+
+        A crawl starts at a cursorless page; its continuation pages carry
+        cursors. Because page rows are keyed by (path, params), a re-crawl
+        REPLACES the cursorless start page but its continuation cursors
+        differ, so the old crawl's cursor pages survive alongside the new
+        ones. An earlier version of this method merged every cached page and
+        therefore returned a union of crawl generations — measured on a real
+        store, an account re-crawled 3 hours apart kept 39 pages spanning
+        both crawls, and anyone who unfollowed between them was still
+        reported as a follower. Only pages fetched at or after the newest
+        crawl start are read now; a re-crawl replaces rather than blends.
+        Staleness of that crawl is a separate question — see page_age().
         """
         if not (user_name or user_id):
             raise ValueError("pass user_name or user_id")
         wanted_id = str(user_id) if user_id is not None else None
         wanted_name = ((user_name or "").lstrip("@").casefold()
                        if user_name is not None else None)
-        seen, out = set(), []
+        pages = []
         rows = self.db.execute(
-            "SELECT params, body FROM pages WHERE path=? ORDER BY fetched_at, key",
+            "SELECT params, body, fetched_at FROM pages WHERE path=? "
+            "ORDER BY fetched_at, key",
             ("/twitter/user/followers_ids",))
         for row in rows:
             try:
@@ -388,7 +398,16 @@ class Store:
                        == wanted_name)
             if not matches or not isinstance(body.get("ids"), list):
                 continue
-            for account_id in body["ids"]:
+            pages.append((not params.get("cursor"), body["ids"]))
+        # Newest crawl = everything from the last cursorless start onward.
+        # No start marker cached at all -> fall back to every page rather
+        # than invent an empty answer for data the caller paid for.
+        starts = [i for i, (is_start, _) in enumerate(pages) if is_start]
+        if starts:
+            pages = pages[starts[-1]:]
+        seen, out = set(), []
+        for _, ids in pages:
+            for account_id in ids:
                 account_id = str(account_id)
                 if account_id not in seen:
                     seen.add(account_id)
@@ -510,6 +529,14 @@ class Store:
                 keys.add(mk)
                 rows.append((name, version, mk, str(aid or ""), un or "",
                              float(w or 1.0), prov or "", time.time()))
+            # Clear the version before writing it. INSERT OR REPLACE only
+            # touches supplied keys, so replacing a version with FEWER members
+            # left the omitted ones behind as ghosts — metadata said 1 member,
+            # the table held 2, and every later load/diff of that version read
+            # the ghost as real. No-op for auto-incremented (new) versions;
+            # the delete+insert+meta share one transaction, committed below.
+            self.db.execute("DELETE FROM cohorts WHERE name=? AND version=?",
+                            (name, version))
             self.db.executemany(
                 "INSERT OR REPLACE INTO cohorts VALUES (?,?,?,?,?,?,?,?)", rows)
             self.db.execute("INSERT OR REPLACE INTO cohort_meta VALUES (?,?,?,?,?)",
@@ -607,8 +634,16 @@ class Store:
     def stats(self):
         n = lambda t: self.db.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
         cached = self.db.execute("SELECT COALESCE(SUM(credits),0) s FROM pages").fetchone()["s"]
+        # "cohorts" counts SAVED VERSIONS (cohort_meta). The rows that make a
+        # store big live in the members table: a real store reported
+        # cohorts=2 while holding 421,578 member rows, so growth was
+        # invisible to the only diagnostic a user has. Report both, plus the
+        # file size, which is what "is my store getting big" actually asks.
+        db_bytes = (self.db.execute("PRAGMA page_count").fetchone()[0]
+                    * self.db.execute("PRAGMA page_size").fetchone()[0])
         return {"pages": n("pages"), "accounts": n("accounts"), "tweets": n("tweets"),
-                "cohorts": n("cohort_meta"), "credits_cached": cached,
+                "cohorts": n("cohort_meta"), "cohort_members": n("cohorts"),
+                "db_bytes": db_bytes, "credits_cached": cached,
                 "usd_saved_on_rerun": round(cached / 100_000, 4)}
 
 
