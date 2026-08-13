@@ -550,9 +550,12 @@ def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
         "frontier": [{"handle": m["user_name"], "in_degree": m["weight"]}
                      for m in ranked[:30]],
         "frontier_total": len(ranked),
-        "_warning": None if complete else
-        "PARTIAL: spend ceiling hit mid-crawl; later members' follows were not "
-        "counted. Raise max_usd for a complete frontier.",
+        # The reason comes from the crawl itself: a ceiling stop and an API
+        # failure mid-walk are different problems with different fixes, and
+        # hardcoding the ceiling text here misdiagnosed the latter.
+        "_warning": None if complete else "PARTIAL: " + (
+            getattr(co, "authority_incomplete_reason", None)
+            or "the follow-graph walk ended before completeness was proven"),
         "spend": c.spend_report(),
     }
 

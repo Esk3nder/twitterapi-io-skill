@@ -20,10 +20,29 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, CostLimitExceeded, credits_to_usd  # noqa: E402
+from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
+                        credits_to_usd)  # noqa: E402
 from store import Store  # noqa: E402
 
 AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
+
+
+def _drain_complete(stream, what):
+    """Consume a PaginationStream and refuse to build on a silent partial.
+
+    A later page can fail AFTER earlier records were retrieved and billed;
+    the stream then ends with complete=False rather than raising, and only
+    callers that check notice. jobs.py grew this guard in 727f17a; the
+    cohort resolvers did not — so a 500-storm mid-crawl yielded a partial
+    cohort that every downstream set operation treated as the full
+    population. Same contract as jobs._materialize_complete.
+    """
+    rows = list(stream)
+    if getattr(stream, "complete", True) is False:
+        raise IncompleteDataError(
+            getattr(stream, "_warning", None) or
+            f"{what} ended before completeness was proven; rows are partial")
+    return rows
 
 
 class Cohort:
@@ -113,7 +132,8 @@ class Cohort:
         """Authors of tweets matching a query — the people talking about X."""
         co = cls(label=f"search:{query}", **kw)
         batch = []
-        for t in co.c.paginate("search", query, limit=limit):
+        for t in _drain_complete(co.c.paginate("search", query, limit=limit),
+                                 f"search {query!r}"):
             a = t.get("author") or {}
             co._add(a.get("id"), a.get("userName"), 1.0, "search_author")
             batch.append(t)
@@ -130,11 +150,16 @@ class Cohort:
                 ("quote", "quotes", lambda t: t.get("author") or {}),
                 ("retweet", "retweeters", lambda u: u)):
             try:
-                for rec in co.c.paginate(ep, str(tweet_id), limit=limit):
+                for rec in _drain_complete(
+                        co.c.paginate(ep, str(tweet_id), limit=limit),
+                        f"{kind} fetch for {tweet_id}"):
                     a = extract(rec)
                     co._add(a.get("id"), a.get("userName") or a.get("screen_name"),
                             1.0, f"engager_{kind}")
-            except CostLimitExceeded:
+            except (CostLimitExceeded, IncompleteDataError):
+                # A partial leg must not be downgraded to the warning below —
+                # an event cohort missing half its retweeters is not "fewer
+                # engagers", it is a different population.
                 raise
             except Exception as e:
                 # An empty result does NOT raise, so an exception here is a real
@@ -148,7 +173,8 @@ class Cohort:
     def from_community(cls, community_id, role="members", limit=1000, **kw):
         ep = {"members": "community_members", "moderators": "community_moderators"}[role]
         co = cls(label=f"community:{community_id}:{role}", **kw)
-        for u in co.c.paginate(ep, str(community_id), limit=limit):
+        for u in _drain_complete(co.c.paginate(ep, str(community_id), limit=limit),
+                                 f"community {community_id} {role}"):
             co._add(u.get("id"), u.get("userName") or u.get("screen_name"),
                     1.0, f"community_{role}")
         return co
@@ -156,7 +182,8 @@ class Cohort:
     @classmethod
     def from_list(cls, list_id, limit=1000, **kw):
         co = cls(label=f"list:{list_id}", **kw)
-        for u in co.c.paginate("list_members", str(list_id), limit=limit):
+        for u in _drain_complete(co.c.paginate("list_members", str(list_id), limit=limit),
+                                 f"list {list_id}"):
             co._add(u.get("id"), u.get("userName") or u.get("screen_name"),
                     1.0, "list_member")
         return co
@@ -360,7 +387,8 @@ class Cohort:
                     print(f"[authority] {position}/{total} @{handle}: starting | "
                           f"{self.c.spend_report()}", file=sys.stderr, flush=True)
                 try:
-                    for follows in self.c.paginate("followings", handle):
+                    walk = self.c.paginate("followings", handle)
+                    for follows in walk:
                         fid = str(follows.get("id") or "")
                         fname = (follows.get("userName") or follows.get("screen_name") or "").lower()
                         if fid in member_ids:
@@ -370,6 +398,16 @@ class Cohort:
                             mm = member_by_name[fname]
                             tgt = self._key(mm["account_id"], mm["user_name"])
                             indeg[tgt] = indeg.get(tgt, 0) + 1
+                    if getattr(walk, "complete", True) is False:
+                        # The member's out-edges were cut short by an API
+                        # failure, not the ceiling. Edges already paid for
+                        # stay counted, but this member is NOT fully crawled
+                        # and the ranking as a whole is no longer provable.
+                        self.authority_complete = False
+                        self.authority_incomplete_reason = (
+                            getattr(walk, "_warning", None) or
+                            f"followings walk for @{handle} ended partial")
+                        continue
                     crawled += 1
                     if progress:
                         print(f"[authority] {position}/{total} @{handle}: complete | "
@@ -379,6 +417,10 @@ class Cohort:
                     # Ceiling hit mid-crawl: later members never contributed
                     # their out-edges, so the ranking is PARTIAL. Mark it.
                     self.authority_complete = False
+                    self.authority_incomplete_reason = (
+                        "spend ceiling hit mid-crawl; later members' follows "
+                        "were not counted. Raise max_usd for a complete "
+                        "frontier.")
                     break
         finally:
             self.c.max_usd = prior      # never leave the ceiling tightened

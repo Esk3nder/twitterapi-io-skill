@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
@@ -253,6 +254,17 @@ def normalize_tweet(t: dict) -> dict:
     }
 
 
+class _FollowerIds(list):
+    """A follower-id list that carries its crawl's completeness.
+
+    Subclassing list keeps the documented Cohort.from_ids(...) pattern
+    working unchanged while letting an honest caller check `.complete` and
+    `.reason` — the bit an interrupted crawl leaves in its final cached page
+    and this reader previously never consulted."""
+    complete = True
+    reason = None
+
+
 class Store:
     def __init__(self, path=DEFAULT_DB):
         self.path = os.path.abspath(os.path.expanduser(path))
@@ -398,21 +410,42 @@ class Store:
                        == wanted_name)
             if not matches or not isinstance(body.get("ids"), list):
                 continue
-            pages.append((not params.get("cursor"), body["ids"]))
+            pages.append((not params.get("cursor"), body["ids"],
+                          bool(body.get("has_next_page"))))
         # Newest crawl = everything from the last cursorless start onward.
         # No start marker cached at all -> fall back to every page rather
-        # than invent an empty answer for data the caller paid for.
-        starts = [i for i, (is_start, _) in enumerate(pages) if is_start]
+        # than invent an empty answer for data the caller paid for — but that
+        # union spans unknown generations, so it is never provably complete.
+        starts = [i for i, (is_start, _, _) in enumerate(pages) if is_start]
         if starts:
             pages = pages[starts[-1]:]
+            # The crawl's own completeness bit sits in the cached body: the
+            # FINAL page of an interrupted crawl (ceiling hit, SIGKILL, API
+            # failure) still asserts has_next_page. Reading only body["ids"]
+            # presented a 3-of-40-page crawl as the definite follower set.
+            complete = not pages[-1][2]
+            reason = (None if complete else
+                      "the newest cached crawl was interrupted — its final "
+                      "page still asserts has_next_page; re-crawl to complete")
+        else:
+            complete = False
+            reason = ("no crawl-start page is cached, so generations cannot "
+                      "be distinguished; the union below is not provably "
+                      "a single snapshot")
         seen, out = set(), []
-        for _, ids in pages:
+        for _, ids, _ in pages:
             for account_id in ids:
                 account_id = str(account_id)
                 if account_id not in seen:
                     seen.add(account_id)
                     out.append(account_id)
-        return out
+        if not complete:
+            print(f"[store] PARTIAL: follower_ids_for returned {len(out):,} "
+                  f"ids but {reason}.", file=sys.stderr)
+        result = _FollowerIds(out)
+        result.complete = complete
+        result.reason = reason
+        return result
 
     # -- records ----------------------------------------------------------
     def put_accounts(self, users):

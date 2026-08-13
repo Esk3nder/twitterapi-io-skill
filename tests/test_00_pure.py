@@ -513,6 +513,33 @@ class TestFollowerIdsCrawlGenerations(E2ETest):
                          "555 left before the second crawl and must not be "
                          "reported; 111 was replaced out of the start page")
 
+    def test_interrupted_crawl_reads_back_flagged_not_definite(self):
+        """The final page of an interrupted crawl still asserts has_next_page
+        in its cached body. Reading only body["ids"] presented a 3-of-40-page
+        crawl as the definite follower set — the documented reuse pattern then
+        built cohorts on it silently."""
+        s = self.fresh_store("gens3")
+        s.put_page(self.PATH, {"userName": "esk"},
+                   {"ids": ["1", "2"], "has_next_page": True, "next_cursor": "c1"})
+        s.put_page(self.PATH, {"userName": "esk", "cursor": "c1"},
+                   {"ids": ["3"], "has_next_page": True, "next_cursor": "c2"})
+        ids = s.follower_ids_for("esk")
+        self.assertEqual(sorted(ids), ["1", "2", "3"],
+                         "paid rows must be returned, never destroyed")
+        self.assertIs(ids.complete, False)
+        self.assertIn("interrupted", ids.reason)
+
+    def test_complete_crawl_reads_back_complete(self):
+        s = self.fresh_store("gens4")
+        s.put_page(self.PATH, {"userName": "esk"},
+                   {"ids": ["1"], "has_next_page": True, "next_cursor": "c1"})
+        s.put_page(self.PATH, {"userName": "esk", "cursor": "c1"},
+                   {"ids": ["2"], "has_next_page": False})
+        ids = s.follower_ids_for("esk")
+        self.assertIs(ids.complete, True)
+        self.assertIsNone(ids.reason)
+
+
     def test_cursor_only_cache_falls_back_to_all_pages(self):
         """No cursorless start page cached: cannot segment generations, so
         return everything rather than invent an empty answer for paid data."""
@@ -556,3 +583,60 @@ class TestStoreConcurrency(E2ETest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PartialStream(list):
+    complete = False
+    _warning = "PARTIAL: 'search' stopped after 1 usable, paid records: HTTP 500"
+
+
+class _CleanStream(list):
+    complete = True
+
+
+class _StubClient:
+    max_usd = 5.0
+    spent_usd = 0.0
+
+    def __init__(self, plan):
+        self.plan = plan
+
+    def paginate(self, name, key, **kw):
+        return self.plan.get((name, str(key)), _CleanStream())
+
+    def spend_report(self):
+        return "stub"
+
+
+class TestCohortHonoursStreamCompleteness(E2ETest):
+    """A later page can fail after earlier records were billed; the stream
+    ends complete=False without raising. jobs.py grew this guard in 727f17a;
+    the cohort resolvers did not — a 500-storm mid-crawl yielded a partial
+    cohort that downstream set algebra treated as the full population, and
+    authority ranked on missing edges while reporting complete: true."""
+
+    def test_from_search_refuses_a_silent_partial(self):
+        from cohort import Cohort
+        from twitterapi import IncompleteDataError
+        c = _StubClient({("search", "ai"): _PartialStream(
+            [{"author": {"id": "1", "userName": "a"}}])})
+        with self.assertRaises(IncompleteDataError):
+            Cohort.from_search("ai", client=c, store=self.fresh_store("cs1"))
+
+    def test_authority_marks_partial_member_walks_and_keeps_paid_edges(self):
+        from cohort import Cohort
+        c = _StubClient({
+            ("followings", "alice"): _CleanStream([{"id": "2", "userName": "bob"}]),
+            ("followings", "bob"): _PartialStream([{"id": "1", "userName": "alice"}]),
+        })
+        co = Cohort(client=c, store=self.fresh_store("cs2"))
+        co._add("1", "alice")
+        co._add("2", "bob")
+        co.authority(max_usd=5.0, confirm=False)
+        self.assertIs(co.authority_complete, False)
+        self.assertEqual(co.authority_crawled, 1,
+                         "a partially-walked member is not fully crawled")
+        self.assertIn("500", co.authority_incomplete_reason,
+                      "the reason must name the actual cause, not the ceiling")
+        self.assertEqual(co.members[co._key("1", "alice")]["weight"], 1,
+                         "edges already paid for stay counted")
