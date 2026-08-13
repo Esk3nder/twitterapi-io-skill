@@ -135,14 +135,16 @@ python3 scripts/workflows.py monitor openai,elonmusk --interval 60 --state s.jso
 # analytical jobs, JSON to stdout — cents unless marked
 python3 scripts/jobs.py brief openai --days 7            # ~$0.01
 python3 scripts/jobs.py authenticity someaccount --sample 500   # ~$0.01
+python3 scripts/jobs.py authority "crypto AI" --sample 30 --max-usd 1
 python3 scripts/jobs.py diffusion 2084352161404920316    # ~$0.02
 python3 scripts/jobs.py benchmark anthropicai,openai --days 30  # ~$0.02
 python3 scripts/jobs.py drift my_cohort                  # $0, reads the store
 python3 scripts/jobs.py catalogue openai                 # $0, cached summary
 python3 scripts/jobs.py threads openai                   # $0, cached threads
+python3 scripts/jobs.py media openai                     # $0, cached media URLs
 
 # these two crawl graphs — DOLLARS, not cents. Start with a low ceiling.
-python3 scripts/jobs.py authority "crypto AI" --max-usd 1   # ~$1.50 uncapped
+python3 scripts/jobs.py authority "crypto AI" --max-usd 1   # ~$3.00 at 150 members
 python3 scripts/jobs.py overlap stripe vercel --max-usd 1   # scales with both
                                                             # follower counts
 ```
@@ -152,10 +154,18 @@ the stated scope · `2` refused before spending · `3` partial because a spend,
 pagination, timestamp, page-cap, or search-index boundary prevented a complete
 result.
 
+`--sample` is intentionally scoped: for `authority` it limits the seed cohort;
+for `authenticity` it limits sampled tweets. Supplying it to another job is an
+error rather than a silently ignored flag. `authority` writes flushed progress
+to stderr while preserving JSON-only stdout.
+
 Add `--out FILE` to stream JSONL instead of stdout, and `--max-pages N` to
 bound an open-ended history walk. The page cap applies separately to each
-search pass; `--include-retweets --max-pages N` can therefore fetch up to
-`2N` pages total.
+search pass. Even when the first pass hits its cap and makes the overall result
+partial, the native-retweet pass receives its own cap. Thus
+`--include-retweets --max-pages N` can fetch up to `2N` pages total.
+Every fetched history page is also persisted for the `$0` `catalogue` and
+`threads` jobs; pass `--store FILE` to select that SQLite store explicitly.
 
 ## 5. Python API
 
@@ -168,18 +178,44 @@ from store import Store
 from cohort import Cohort
 
 s = Store()
-c = Client(store=s, max_usd=10)            # caching on, hard ceiling
+c = Client(store=s, max_usd=10)            # Store object: caching on
+c2 = Client(store="/tmp/twitter.db", max_usd=10)  # paths are coerced before HTTP
 
 c.estimate("follower_ids", 200_000_000)    # -> 900.0 dollars, before spending
 c.bulk_search(["from:openai", "from:anthropicai", "from:google"])  # 3 queries, 1 request
 c.paginate("community_members", "1493446837214187523", limit=500)  # one of the 27 paginated endpoints
+c.paginate("community_tweets_all", "market structure")  # tweets, not communities
 ```
+
+Tweet results include a normalized top-level `media` list, and SQLite stores it
+as a first-class column rather than only inside `raw`. Each item includes
+`type`, `url`, `alt_text` when supplied, and `full_resolution_url`. The live
+wire path is `extendedEntities.media[*].media_url_https`. For a photo URL such
+as `https://pbs.twimg.com/media/ID.jpg`, request full resolution with
+`?format=jpg&name=4096x4096` (use the source extension as `format`). Direct
+`pbs.twimg.com` downloads require a browser `User-Agent`; a bare urllib request
+returned 403 in observed use. The client deliberately does not download media
+bytes. `brief`, `catalogue`, and `threads` therefore report exact undisplayed
+artifact counts, and `jobs.py media USER` lists the cached URLs for retrieval.
+
+For advanced search, bare `since:YYYY-MM-DD` / `until:YYYY-MM-DD` tokens are
+normalized to exact UTC midnight. `min_faves:N` is removed from the API query
+and enforced locally against each response's current `likeCount`, because the
+search index's engagement snapshot can lag. Exactness can require fetching
+more rows. For a positive threshold, `limit` bounds qualifying rows rather
+than paid rows scanned, so `paginate()` requires an explicit `max_usd` ceiling
+and warns about the scan on stderr.
 
 Pagination and history calls raise `IncompleteDataError` when the API claims
 more data exists but omits a required field/cursor, a time window cannot split
 a busy second, a page cap stops the walk, or another safe completion boundary
 is unavailable. Treat records already yielded as valid but partial; do not turn
 the exception into a zero count.
+
+Identical advanced-search queries can vary slightly between runs because the
+upstream index is not deterministic. Filters and time-boundary handling remain
+exactly enforced by the client, but a returned count is an index observation,
+not a stable guarantee that every matching tweet was surfaced.
 
 **Cohorts** are named, versioned account sets — the reusable asset. Build one,
 save it, and every later question over it is free:
@@ -242,8 +278,9 @@ at the default page size. Same data.
   and finite search-index depth can make the reachable corpus smaller.
 
 `overlap` and `authority` estimate first and refuse rather than start a crawl
-they cannot afford. `authority` returns `complete: false` if a ceiling cut its
-walk short.
+they cannot afford. `authority` conservatively budgets 2,000 followings per
+member, reports per-member progress to stderr, and returns `complete: false`
+plus exit code `3` if a ceiling cuts its walk short.
 
 ## Rate limits
 
@@ -322,10 +359,25 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
   established. `statusesCount`-based prices are therefore upper bounds.
 - **Cached thread reconstruction is scoped, not omniscient.** `jobs.py threads`
   groups that handle's cached posts by `conversationId`; external participants
-  and uncached or deleted posts may be absent, and the output says so.
+  and deleted posts may be absent, and the output says so. History pages are
+  cached as they are acquired, including valid pages from a partial crawl.
+- **Media bytes are not downloaded or interpreted.** Tweet rows retain a
+  first-class media inventory; `brief`, `catalogue`, and `threads` disclose the
+  number left undisplayed. Use `jobs.py media USER` to list URLs, then fetch
+  `full_resolution_url` with a browser `User-Agent` when image inspection is
+  part of the research task.
 - **Community IDs are not discoverable** — the all-community search returns
-  `communityInfo: null`. `community/info` and `community/members` need an ID
-  from a community URL.
+  tweets and commonly has `communityInfo: null`. Use `community_tweets_all`
+  for that tweet search; the legacy `community_search` alias warns. Community
+  endpoints need an ID from `x.com/i/communities/<id>`, and a null identity
+  raises instead of becoming zero-valued facts.
+- **List IDs must come from `x.com/i/lists/<id>`.** The list family has no
+  verified discovery/info endpoint. An empty response raises
+  `IncompleteDataError` because empty, private, and nonexistent lists cannot be
+  distinguished; the four list endpoints remain unverified without a known-good ID.
+- **`last_tweets` is originals-oriented while `search from:` includes replies.**
+  Equal limits therefore cover different compositions and depths; low ID
+  overlap between those calls is not evidence of loss.
 - **`authority()` needs a cohort with internal follow edges.** A handful of
   accounts returns an empty ranking, correctly but uselessly.
 - **Busy-topic narrative tracking costs dollars, not cents.** Bound it with a

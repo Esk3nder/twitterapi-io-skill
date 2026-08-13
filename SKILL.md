@@ -33,6 +33,7 @@ endpoint, and `Client` encodes the measured contract.
 | Who joined/left a saved cohort | `jobs.py drift COHORT_NAME` |
 | Summarise a cached account corpus ($0) | `jobs.py catalogue USER` |
 | Reconstruct cached conversations ($0) | `jobs.py threads USER` |
+| List cached media URLs ($0) | `jobs.py media USER` |
 | Replies, quotes, lists, trends, bulk fan-out | `import twitterapi.Client` |
 
 ```bash
@@ -72,8 +73,12 @@ prediction. Deleted/filtered posts and finite search-index depth can make a
 history cost less. Confirm with the user before any crawl over a few dollars.
 
 `overlap` and `authority` estimate up front and refuse rather than start an
-unaffordable crawl. `authority` returns `complete: false` when the ceiling
-truncated its follow-graph walk — do not present a partial frontier as whole.
+unaffordable crawl. `authority` uses a conservative 2,000-followings/member
+estimate and prints member progress plus running spend to stderr. It returns
+`complete: false` and the CLI exits `3` when the ceiling truncated its
+follow-graph walk — do not present a partial frontier as whole. `--sample`
+limits the authority cohort (or the authenticity tweet sample) and is rejected
+for other jobs.
 
 ## Rate limits
 
@@ -92,11 +97,36 @@ Requests, not credits, bound large jobs. Two levers:
 **`last_tweets` and `tweet_timeline`** nest tweets at `data.tweets` but keep
 `has_next_page`/`next_cursor` at the top level. Reading pagination from inside
 `data` stops after 20 records and looks successful.
+`last_tweets` is originals-oriented; `advanced_search from:USER` includes
+replies, so equal-sized results can have little overlap without data loss.
+
+**Advanced-search date and engagement operators need correction.** Bare
+`since:YYYY-MM-DD` and `until:YYYY-MM-DD` are normalized to exact UTC midnight.
+The API's `min_faves` index snapshot can lag its own returned `likeCount`, so
+the client removes that operator and filters locally. This is exact but may
+fetch more rows. For a positive threshold, `limit` bounds qualifying rows, not
+paid rows scanned: pass an explicit `max_usd` ceiling or the client refuses
+before transport, and expect a scan warning on stderr.
+
+**Tweet media is evidence, not decoration.** Every tweet returned by the
+client has a first-class `media` list with `type`, `url`, `alt_text`, and a
+`full_resolution_url`; the store persists that list separately from opaque
+`raw` JSON. The wire source is `extendedEntities.media`, with the CDN URL at
+`media_url_https`. For photos, full resolution is
+`?format=jpg&name=4096x4096` (the format follows the source extension).
+`pbs.twimg.com` returns 403 to observed bare urllib downloads, so send a
+browser `User-Agent` header when fetching directly. The skill inventories
+media URLs but does not download or interpret bytes: `brief`, `catalogue`, and
+`threads` report the exact undisplayed-media count, while `jobs.py media USER`
+lists the cached artifacts.
 
 **Historical search must not use cursors.** `advanced_search` caps at 20 per
 call and cursors loop on old ranges. Walk the window: take the oldest
 `createdAt`, set `until_time` to it, dedupe by id. `history_search()` does
 this; getting the boundary wrong drops ~10% of results.
+Identical searches are not guaranteed to return identical ID sets: the
+upstream index has intermittently omitted ordinary mid-window tweets. Treat
+counts as index observations, not deterministic ground truth.
 
 **A single second can hold more than 20 tweets**, and no time window pages
 inside one second. `history_search` reports `INCOMPLETE` with the affected
@@ -105,9 +135,13 @@ timestamps rather than dropping them silently.
 **`from:USER` excludes native retweets.** Default `history` is originals +
 replies + quote tweets and prints that scope. Pass `--include-retweets` for a
 second `filter:nativeretweets` pass under the same ceiling. The two passes are
-deduplicated by id. `--exclude-retweets` is retained only as an explicit no-op.
-`--max-pages N` applies separately to each search pass, so including native
-retweets can fetch up to `2N` pages total.
+deduplicated by id. For the USER shorthand, `--exclude-retweets` is retained
+only as an explicit no-op.
+`--max-pages N` applies separately to each search pass even if the first pass
+hits its cap, so including native retweets can fetch up to `2N` pages total.
+With a raw `--query`,
+`--exclude-retweets` is refused before spending because the query itself may
+explicitly select native retweets.
 
 **Search-index depth is not account age.** For an open-ended handle history,
 the workflow compares the oldest reached tweet with the author's profile
@@ -118,6 +152,13 @@ the workflow compares the oldest reached tweet with the author's profile
 cannot prove the requested result complete (contract drift, cursor failure,
 unsplittable timestamp, page cap, or equivalent). Propagate it or label the
 result partial; never convert it to an empty list or confident count.
+
+**Communities and lists do not provide general ID discovery.**
+`community_tweets_all` returns tweets across communities, not communities;
+`community_search` is a warning compatibility alias. Obtain IDs from
+`x.com/i/communities/<id>` or `x.com/i/lists/<id>`. A null community identity
+raises. Empty list pages also raise because this API cannot distinguish empty,
+private, and nonexistent lists.
 
 **Failures can arrive as HTTP 200** with `{"status": "error", ...}` in the
 body. Check the body, not just the status code; `Client` does.
@@ -143,7 +184,11 @@ endpoints cache indefinitely; content endpoints always refetch.
 `$0.00` spent plus saved credits is a successful cached rerun, not a billing bug.
 `jobs.py catalogue USER` and `jobs.py threads USER` are pure local computations
 over cached tweet rows and make no API calls. Thread output covers only cached
-posts by that handle; external and uncached posts may be absent.
+posts by that handle; external and uncached posts may be absent. Both state how
+many referenced media artifacts remain undownloaded and uninterpreted;
+`jobs.py media USER` exposes their URLs from the same local store.
+`workflows.py history` persists each paid page into that cache before yielding
+it; use `history ... --store FILE` when the store path must be explicit.
 
 ```python
 from cohort import Cohort
@@ -151,6 +196,8 @@ from twitterapi import Client
 from store import Store
 s = Store()
 c = Client(store=s, max_usd=10)
+# A filesystem path is also accepted and converted before any paid request:
+c2 = Client(store="/tmp/twitter.db", max_usd=10)
 Cohort.from_search("polymarket", client=c, store=s).save("pm_talkers")
 both = Cohort.load("pm_talkers", client=c, store=s).intersect(
     Cohort.load("crypto_ai", client=c, store=s))

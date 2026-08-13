@@ -23,7 +23,9 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
-                        credits_to_usd)  # noqa: E402
+                        credits_to_usd, enrich_tweet_media, filter_search_tweets,
+                        prepare_search_query)  # noqa: E402
+from store import Store  # noqa: E402
 
 TW_FMT = "%a %b %d %H:%M:%S %z %Y"      # verified: "Mon Aug 10 17:16:53 +0000 2026"
 
@@ -129,6 +131,7 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
     Yields tweet dicts newest-first. Deduplicates by tweet id.
     """
     c = client or Client(max_usd=max_usd)
+    query, local_min_faves = prepare_search_query(query)
     c.max_usd = _strictest(c.max_usd, max_usd)
     since_ts = _since_ts if _since_ts is not None else (
         int(datetime.strptime(since, "%Y-%m-%d")
@@ -146,13 +149,22 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         resp = c._raw("GET", "/twitter/tweet/advanced_search",
                       {"query": q, "queryType": "Latest"},
                       max_credits=Client.page_credits("search", 20, 20))
-        batch = resp.get("tweets") or []
+        batch = [enrich_tweet_media(tweet)
+                 for tweet in (resp.get("tweets") or [])]
         c._charge("search", len(batch), 20)
         pages += 1
+
+        # A fetched page is already paid for. Persist it before yielding so a
+        # caller that stops consuming later still retains every acquired row,
+        # and the documented $0 catalogue/threads jobs see the same corpus.
+        if c.store is not None and batch:
+            c.store.put_tweets(batch)
 
         # Timestamps come from the WHOLE page, not just fresh tweets. Using only
         # fresh ones leaves oldest=None on an all-duplicate page and terminates
         # the crawl early with data still unretrieved.
+        qualifying = filter_search_tweets(batch, local_min_faves)
+        qualifying_ids = {t.get("id") for t in qualifying}
         fresh, stamps = 0, []
         for t in batch:
             try:
@@ -162,6 +174,8 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
             if t.get("id") in seen:
                 continue
             seen.add(t.get("id"))
+            if t.get("id") not in qualifying_ids:
+                continue
             fresh += 1
             yield t
 
@@ -214,7 +228,16 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         if since_ts and until_ts <= since_ts:
             break
 def _history_cli(a):
+    if a.exclude_retweets and not a.user:
+        print("REFUSED: --exclude-retweets cannot be combined with --query; "
+              "a raw query may explicitly select native retweets, so dropping "
+              "them after retrieval would silently under-return paid results.",
+              file=sys.stderr)
+        return 2
     c = Client(max_usd=a.max_usd)
+    if c.store is None:
+        store_path = getattr(a, "store", None)
+        c.store = Store(store_path) if store_path else Store()
     q = f"from:{a.user}" if a.user else a.query
     if a.exclude_replies:
         q += " -filter:replies"
@@ -256,14 +279,35 @@ def _history_cli(a):
     composition = {"originals": 0, "replies": 0, "quotes": 0,
                    "native retweets": 0}
     truncated = False
+    stop_all_passes = False
     try:
         for search_query in queries:
             if len(queries) > 1:
                 label = ("native-retweet pass" if "filter:nativeretweets" in search_query
                          else "original/reply/quote pass")
                 print(f"[history] {label}: {search_query!r}", file=sys.stderr)
-            for t in history_search(search_query, a.since, a.until, client=c,
-                                    max_pages=a.max_pages):
+            records = iter(history_search(
+                search_query, a.since, a.until, client=c,
+                max_pages=a.max_pages))
+            while True:
+                try:
+                    t = next(records)
+                except StopIteration:
+                    break
+                except IncompleteDataError as e:
+                    # Page/timestamp/contract completeness is scoped to this
+                    # search pass. Preserve the partial status, but still run
+                    # the independent native-retweet pass with its own cap.
+                    truncated = True
+                    print(f"\nSTOPPED: {e}", file=sys.stderr)
+                    break
+                except CostLimitExceeded as e:
+                    # The spend ceiling is shared across passes, so another
+                    # pass cannot make useful progress once it is exhausted.
+                    truncated = True
+                    stop_all_passes = True
+                    print(f"\nSTOPPED: {e}", file=sys.stderr)
+                    break
                 # isRetweet is not 100% reliable per the vendor guide; corroborate
                 # it with retweeted_tweet, and dedupe across the two searches.
                 is_retweet = bool(t.get("isRetweet") or t.get("retweeted_tweet"))
@@ -305,9 +349,8 @@ def _history_cli(a):
 
                 fh.write(json.dumps(t, ensure_ascii=False) + "\n")
                 n += 1
-    except (CostLimitExceeded, IncompleteDataError) as e:
-        truncated = True
-        print(f"\nSTOPPED: {e}", file=sys.stderr)
+            if stop_all_passes:
+                break
     finally:
         if a.out:
             fh.close()
@@ -331,8 +374,11 @@ def _history_cli(a):
         index_limited = True
         oldest_day = datetime.fromtimestamp(oldest_ts, timezone.utc).date()
         created_day = datetime.fromtimestamp(account_created_ts, timezone.utc).date()
-        print(f"[history] INDEX COVERAGE: PARTIAL — the search ended at "
-              f"{oldest_day}, before @{a.user}'s {created_day} account creation. "
+        gap_days = (oldest_day - created_day).days
+        day_word = "day" if gap_days == 1 else "days"
+        print(f"[history] INDEX COVERAGE: PARTIAL — the search reached back to "
+              f"{oldest_day}, {gap_days:,} {day_word} after @{a.user}'s "
+              f"{created_day} account creation. "
               f"The emitted data is valid, but full-lifetime coverage cannot be "
               f"established: search-index depth, filters, deletions, and quiet "
               f"periods can all separate these dates.",
@@ -449,11 +495,13 @@ def main(argv=None):
     h.add_argument("--exclude-replies", action="store_true")
     retweets = h.add_mutually_exclusive_group()
     retweets.add_argument("--exclude-retweets", action="store_true",
-                          help="no-op: `from:` search never returns native retweets")
+                          help="explicit no-op for USER shorthand; refused with "
+                               "--query because raw queries may select retweets")
     retweets.add_argument("--include-retweets", action="store_true",
                           help="second pass with filter:nativeretweets to capture "
                                "retweets, which `from:` alone omits entirely")
     h.add_argument("--max-pages", type=int)
+    h.add_argument("--store", help="sqlite path for the persisted history corpus")
     h.add_argument("--out")
     h.set_defaults(func=_history_cli)
 

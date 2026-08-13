@@ -124,6 +124,41 @@ class TestNormalisers(E2ETest):
                          "retweeted_tweet presence must corroborate isRetweet")
         self.assertGreater(t["created_ts"], 0)
 
+    def test_tweet_media_is_first_class_and_round_trips_store(self):
+        """Paid media metadata must survive without excavating opaque raw JSON."""
+        from store import Store, normalize_tweet
+
+        raw = {
+            "id": "media-tweet",
+            "createdAt": "Mon Aug 10 17:16:53 +0000 2026",
+            "author": {"id": "1", "userName": "alice"},
+            "extendedEntities": {"media": [{
+                "type": "photo",
+                "media_url_https": "https://pbs.twimg.com/media/example.jpg",
+                "ext_alt_text": "Terminal configuration screenshot",
+            }]},
+        }
+        expected = [{
+            "type": "photo",
+            "url": "https://pbs.twimg.com/media/example.jpg",
+            "alt_text": "Terminal configuration screenshot",
+            "full_resolution_url": (
+                "https://pbs.twimg.com/media/example.jpg?"
+                "format=jpg&name=4096x4096"),
+        }]
+
+        self.assertEqual(normalize_tweet(raw)["media"], expected)
+        store = self.fresh_store("tweet-media-roundtrip")
+        self.addCleanup(store.close)
+        store.put_tweets([raw])
+
+        self.assertIn(
+            "media",
+            [row["name"] for row in store.db.execute("PRAGMA table_info(tweets)")],
+        )
+        self.assertEqual(store.tweets_for(user_names=["alice"])[0]["media"],
+                         expected)
+
     def test_parse_ts_malformed_returns_none(self):
         from store import parse_ts
         self.assertIsNone(parse_ts("not a date"))
@@ -250,6 +285,15 @@ class TestDocumentationContracts(E2ETest):
         readme = self._read("README.md")
         self.assertIn("cached posts authored by these accounts", readme)
         self.assertRegex(readme, r"applies separately to each\s+search pass")
+
+    def test_media_recovery_requirements_are_documented(self):
+        """Users must be able to retrieve media bytes the skill leaves remote."""
+        combined = self._read("README.md") + self._read("SKILL.md")
+        self.assertIn("extendedEntities.media", combined)
+        self.assertIn("media_url_https", combined)
+        self.assertIn("format=jpg&name=4096x4096", combined)
+        self.assertIn("User-Agent", combined)
+        self.assertIn("pbs.twimg.com", combined)
 
 
 @unittest.skipUnless(HAVE_KEY, "Cohort construction requires the API key "

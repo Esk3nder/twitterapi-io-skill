@@ -26,10 +26,12 @@ Notes that prevent false diagnoses:
 - **Billing settles 20–60 s late server-side.** All cost assertions here use
   client-side accounting (`spent_credits` / `page_credits`). Never "verify" a
   test by reading the balance right after a call.
-- **Order determinism:** `test_40` asserts id **set** equality across two runs
-  of the same window; sequence order is logged but not asserted, because the
-  API may reorder within a page. If sets differ, that is real nondeterminism
-  (or a tweet was deleted mid-run — check the logged only-in-run-X ids).
+- **Search-index variance:** `test_40` requires at least 95% Jaccard overlap
+  across two walks of the same fixed window, not exact ID-set equality. Live
+  measurements found identical queries intermittently omit ordinary
+  mid-window tweets, while a filtered query in the same session returns them.
+  Below 95% indicates a likely client regression or larger vendor incident;
+  inspect the logged only-in-run-X IDs before changing the threshold.
 - **`user_info` on a missing account raises `APIError(200, 'user not found')`**
   since the body-error fix. Code that expected `{}` for missing users must
   catch it — "no such user" no longer reads as "zero followers".

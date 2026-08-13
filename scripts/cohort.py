@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import Client, CostLimitExceeded, credits_to_usd  # noqa: E402
 from store import Store  # noqa: E402
 
+AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
+
 
 class Cohort:
     """A set of accounts, each with a weight and provenance string.
@@ -250,29 +252,51 @@ class Cohort:
 
     def filter(self, bio_matches=None, min_followers=None, verified=None):
         """Keep members whose STORED profile matches. Call hydrate() first, or
-        this only sees members already in the accounts table."""
+        this only sees members already in the accounts table. The returned
+        cohort exposes skipped_unhydrated and skipped_unknown_verification."""
         import re
         pat = re.compile(bio_matches, re.I) if bio_matches else None
         out = Cohort(client=self.c, store=self.s, label=f"filter({self.label})")
+        skipped_unhydrated = 0
+        skipped_unknown_verification = 0
         rows = {r["id"]: r for r in (dict(x) for x in self.s.db.execute(
             "SELECT * FROM accounts"))}
         by_name = {r["user_name"].lower(): r for r in rows.values() if r["user_name"]}
         for m in self.members.values():
             prof = rows.get(m["account_id"]) or by_name.get(m["user_name"].lower())
             if not prof:
+                skipped_unhydrated += 1
                 continue
             if pat and not (pat.search(prof["description"] or "")
                             or pat.search(prof["name"] or "")):
                 continue
             if min_followers and (prof["followers"] or 0) < min_followers:
                 continue
-            if verified is not None and bool(prof["is_blue"] or prof["is_verified"]) != verified:
-                continue
+            if verified is not None:
+                verification = [prof["is_blue"], prof["is_verified"]]
+                known = [value for value in verification if value is not None]
+                if not known:
+                    skipped_unknown_verification += 1
+                    continue
+                if bool(any(known)) != verified:
+                    continue
             out._add(prof["id"], prof["user_name"], m["weight"], m["provenance"])
+        out.skipped_unhydrated = skipped_unhydrated
+        out.skipped_unknown_verification = skipped_unknown_verification
+        if skipped_unhydrated:
+            print(f"[cohort] WARNING: filter skipped {skipped_unhydrated:,} "
+                  f"of {len(self):,} members absent from stored profiles; "
+                  f"call hydrate() before filtering profile fields.",
+                  file=sys.stderr)
+        if skipped_unknown_verification:
+            print(f"[cohort] WARNING: filter skipped "
+                  f"{skipped_unknown_verification:,} members whose stored "
+                  f"profiles omit verification fields; hydrate() before "
+                  f"treating the result as complete.", file=sys.stderr)
         return out
 
     # -- ranking ----------------------------------------------------------
-    def authority(self, max_usd=5.0, confirm=True):
+    def authority(self, max_usd=5.0, confirm=True, progress=False):
         """Rank members by IN-degree within the cohort's own follow graph:
         how many OTHER members follow each member. "Who does this scene itself
         follow" — a computed frontier, not a guessed one.
@@ -284,13 +308,18 @@ class Cohort:
         that can quietly cost real money.
         """
         members = [m for m in self.members.values() if m["account_id"] or m["user_name"]]
-        # Rough estimate: assume ~1000 followings each at 1 credit/record.
-        est = credits_to_usd(len(members) * 1000 * 1.0)
+        # A 127-member measured crawl cost $0.0188/member, nearly 1.9x the old
+        # 1,000-following assumption. Round that observation up to a simple,
+        # conservative 2,000-following guard rather than advising a budget
+        # known to stop around halfway through the crawl.
+        est = credits_to_usd(
+            len(members) * AUTHORITY_ESTIMATED_FOLLOWINGS * 1.0)
         if confirm and est > max_usd:
             raise CostLimitExceeded(
                 f"authority() over {len(members)} members ~= ${est:,.2f}, "
                 f"over ${max_usd:,.2f}. Shrink the cohort (filter/top) or raise "
-                f"max_usd. Estimate assumes ~1000 followings/account.")
+                f"max_usd. Conservative estimate assumes ~"
+                f"{AUTHORITY_ESTIMATED_FOLLOWINGS:,} followings/account.")
         # Actually enforce the ceiling: without this a single member with 500k
         # followings could blow past max_usd, since the estimate is only a gate.
         # EVERYTHING between the tighten and the restore lives in one
@@ -322,10 +351,14 @@ class Cohort:
             member_ids = {m["account_id"] for m in members if m["account_id"]}
             member_by_name = {m["user_name"].lower(): m for m in members if m["user_name"]}
             indeg = {self._key(m["account_id"], m["user_name"]): 0.0 for m in members}
-            for m in members:
+            total = len(members)
+            for position, m in enumerate(members, 1):
                 handle = m["user_name"] or None
                 if not handle:
                     continue
+                if progress:
+                    print(f"[authority] {position}/{total} @{handle}: starting | "
+                          f"{self.c.spend_report()}", file=sys.stderr, flush=True)
                 try:
                     for follows in self.c.paginate("followings", handle):
                         fid = str(follows.get("id") or "")
@@ -338,6 +371,10 @@ class Cohort:
                             tgt = self._key(mm["account_id"], mm["user_name"])
                             indeg[tgt] = indeg.get(tgt, 0) + 1
                     crawled += 1
+                    if progress:
+                        print(f"[authority] {position}/{total} @{handle}: complete | "
+                              f"{self.c.spend_report()}", file=sys.stderr,
+                              flush=True)
                 except CostLimitExceeded:
                     # Ceiling hit mid-crawl: later members never contributed
                     # their out-edges, so the ranking is PARTIAL. Mark it.

@@ -88,6 +88,71 @@ def scripted_client(*, raw=(), raw_json=(), max_usd=1.0, store=None):
     return c
 
 
+class TestVerifiedFollowerSemantics(E2ETest):
+    def test_endpoint_membership_is_preserved_through_store_and_filter(self):
+        """verifiedFollowers membership is ground truth even without flags."""
+        from cohort import Cohort
+
+        store = self.fresh_store("verified-follower-semantics")
+        self.addCleanup(store.close)
+        client = scripted_client(raw=[{
+            "followers": [
+                {"id": "1", "userName": "alice"},
+                {"id": "2", "userName": "bob"},
+            ],
+            "has_next_page": False,
+            "next_cursor": "",
+        }], store=store)
+
+        followers = list(client.verified_followers("seed-id"))
+        cohort = Cohort.from_ids(
+            [u["id"] for u in followers], client=client, store=store)
+
+        self.assertEqual(
+            (len(cohort.filter(verified=True)),
+             len(cohort.filter(verified=False))),
+            (2, 0),
+            "endpoint membership must not become false when verification "
+            "fields are absent",
+        )
+
+    def test_absent_verification_fields_remain_unknown_not_false(self):
+        """A thin profile must not create a false-unverified ground truth."""
+        from cohort import Cohort
+        from store import normalize_account
+
+        store = self.fresh_store("unknown-verification")
+        self.addCleanup(store.close)
+        store.put_accounts([{"id": "1", "userName": "alice"}])
+        cohort = Cohort.from_ids(["1"], client=object(), store=store)
+
+        normalized = normalize_account({"id": "1", "userName": "alice"})
+        self.assertIsNone(normalized["is_blue"])
+        self.assertIsNone(normalized["is_verified"])
+        self.assertEqual(len(cohort.filter(verified=False)), 0)
+
+
+class TestCohortFilterHonesty(E2ETest):
+    def test_filter_warns_with_count_of_unhydrated_members_skipped(self):
+        """A large unhydrated cohort must not collapse silently."""
+        from cohort import Cohort
+
+        store = self.fresh_store("filter-unhydrated-warning")
+        self.addCleanup(store.close)
+        store.put_accounts([{
+            "id": "1", "userName": "alice", "followers": 1_000,
+        }])
+        cohort = Cohort.from_ids(["1", "2", "3"], client=object(), store=store)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = cohort.filter(min_followers=500)
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("skipped 2", err.getvalue().lower())
+        self.assertIn("hydrate", err.getvalue().lower())
+
+
 class TestCohortHydrationMoney(E2ETest):
     @staticmethod
     def _members(count):
@@ -204,6 +269,128 @@ class TestBulkSearchInvariants(E2ETest):
 
 
 class TestPaginationInvariants(E2ETest):
+    def test_store_path_is_coerced_before_nonempty_page_write_through(self):
+        """A path-valued store must not crash only after a paid response."""
+        path = self.store_path("client-path-store")
+        page = {
+            "tweets": [tweet("paid", 1_700_000_000)],
+            "has_next_page": False,
+            "next_cursor": "",
+        }
+        c = scripted_client(raw=[page], store=path)
+        self.addCleanup(lambda: getattr(c.store, "close", lambda: None)())
+
+        got = list(c.paginate("search", "from:alpha"))
+
+        self.assertEqual([t["id"] for t in got], ["paid"])
+        self.assertNotIsInstance(c.store, str)
+        self.assertEqual(c.store.tweets_for(user_names=["alpha"])[0]["id"],
+                         "paid")
+
+    def test_search_min_faves_uses_response_counts_not_stale_index_filter(self):
+        """A fresh likeCount must be the ground truth for engagement filters."""
+        qualifying = dict(tweet("target", 1_700_000_002), likeCount=109)
+        below = dict(tweet("below", 1_700_000_001), likeCount=99)
+        store = MemoryStore()
+        c = scripted_client(raw=[{
+            "tweets": [qualifying, below],
+            "has_next_page": False,
+            "next_cursor": "",
+        }], store=store)
+
+        got = list(c.paginate(
+            "search", "from:alpha min_faves:100", limit=20))
+
+        self.assertEqual([t["id"] for t in got], ["target"])
+        self.assertNotIn("min_faves:", c.raw_calls[0][2]["query"])
+        self.assertEqual({t["id"] for t in store.tweets},
+                         {"target", "below"},
+                         "all paid rows should remain available to the cache")
+
+    def test_paginate_surfaces_normalized_media_on_tweets(self):
+        """Callers must not need to know the extendedEntities wire shape."""
+        record = tweet("with-media", 1_700_000_002)
+        record["extendedEntities"] = {"media": [{
+            "type": "photo",
+            "media_url_https": "https://pbs.twimg.com/media/example.png",
+            "ext_alt_text": "Architecture diagram",
+        }]}
+        c = scripted_client(raw=[{
+            "tweets": [record], "has_next_page": False, "next_cursor": "",
+        }])
+
+        got = list(c.paginate("search", "from:alpha"))
+
+        self.assertEqual(got[0]["media"][0]["type"], "photo")
+        self.assertEqual(got[0]["media"][0]["alt_text"],
+                         "Architecture diagram")
+        self.assertIn("name=4096x4096",
+                      got[0]["media"][0]["full_resolution_url"])
+
+    def test_search_min_faves_requires_an_explicit_full_scan_budget(self):
+        """A returned-row limit must not masquerade as a paid-scan bound."""
+        c = scripted_client(raw=[{
+            "tweets": [], "has_next_page": False, "next_cursor": "",
+        }], max_usd=None)
+
+        with self.assertRaises(ValueError) as cm:
+            list(c.paginate(
+                "search", "from:alpha min_faves:1000", limit=10))
+
+        self.assertEqual(c.raw_calls, [], "refusal must precede paid transport")
+        message = str(cm.exception).lower()
+        self.assertIn("limit", message)
+        self.assertIn("max_usd", message)
+        self.assertIn("full", message)
+
+    def test_search_min_faves_warns_that_limit_does_not_bound_scan(self):
+        """A budgeted local predicate must disclose its scan-cost contract."""
+        c = scripted_client(raw=[{
+            "tweets": [], "has_next_page": False, "next_cursor": "",
+        }], max_usd=0.05)
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            list(c.paginate(
+                "search", "from:alpha min_faves:1000", limit=10))
+
+        warning = err.getvalue().lower()
+        self.assertIn("limit=10", warning)
+        self.assertIn("returned", warning)
+        self.assertIn("max_usd", warning)
+        self.assertIn("scan", warning)
+
+    def test_zero_min_faves_keeps_the_normal_limit_cost_contract(self):
+        """A no-op engagement floor must not force full-scan budgeting."""
+        c = scripted_client(raw=[{
+            "tweets": [tweet("one", 1_700_000_000)],
+            "has_next_page": False,
+            "next_cursor": "",
+        }], max_usd=None)
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            got = list(c.paginate(
+                "search", "from:alpha min_faves:0", limit=10))
+
+        self.assertEqual([item["id"] for item in got], ["one"])
+        self.assertNotIn("scan", err.getvalue().lower())
+
+    def test_search_bare_dates_are_normalized_to_utc_day_boundaries(self):
+        """Bare search dates must not inherit the index's shifted timezone."""
+        c = scripted_client(raw=[{
+            "tweets": [], "has_next_page": False, "next_cursor": "",
+        }])
+
+        list(c.paginate(
+            "search",
+            "from:alpha since:2026-07-01 until:2026-08-01"))
+
+        sent = c.raw_calls[0][2]["query"]
+        self.assertIn("since:2026-07-01_00:00:00_UTC", sent)
+        self.assertIn("until:2026-08-01_00:00:00_UTC", sent)
+        self.assertNotIn("since:2026-07-01 ", sent)
+
     def test_missing_required_items_field_is_incomplete_not_empty(self):
         """Contract drift must not turn an omitted array into a confident zero."""
         from twitterapi import Client, ENDPOINTS
@@ -368,6 +555,28 @@ class TestWindowCompleteness(E2ETest):
 
 
 class TestJobAndWorkflowOrchestration(E2ETest):
+    def test_network_job_store_path_is_injected_into_shared_client(self):
+        """--store must not be ignored by jobs that make network requests."""
+        import jobs
+
+        path = self.store_path("network-job-store")
+        store = object()
+        client = object()
+        output = io.StringIO()
+        with mock.patch.object(jobs, "Store", return_value=store) as store_type, \
+             mock.patch.object(jobs, "Client", return_value=client) as client_type, \
+             mock.patch.dict(jobs.JOBS, {
+                 "brief": lambda args, shared: {"shared": shared is client},
+             }), \
+             contextlib.redirect_stdout(output):
+            rc = jobs.main(["brief", "alpha", "--store", path])
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(output.getvalue())["shared"])
+        store_type.assert_called_once_with(path)
+        client_type.assert_called_once_with(
+            verbose=False, store=store, max_usd=5.0)
+
     def test_diffusion_transport_failure_is_not_reported_as_zero_engagement(self):
         """Failed engagement crawls must not become a confident all-zero trace."""
         import urllib.error
@@ -448,10 +657,65 @@ class TestHistoryHonesty(E2ETest):
             "user": "alpha", "query": None, "since": None, "until": None,
             "exclude_replies": False, "exclude_retweets": False,
             "include_retweets": False, "max_pages": None, "max_usd": 1.0,
-            "out": None,
+            "out": None, "store": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
+
+    def test_history_acquisition_populates_catalogue_store(self):
+        """Every paid history row must reach the documented $0 consumer."""
+        import workflows
+        from jobs import catalogue
+
+        records = [
+            tweet("one", 1_700_000_003, "alpha"),
+            tweet("two", 1_700_000_002, "alpha"),
+            tweet("three", 1_700_000_001, "alpha"),
+        ]
+        store = self.fresh_store("history-to-catalogue")
+        self.addCleanup(store.close)
+        client = scripted_client(raw=[{
+            "tweets": records,
+            "has_next_page": False,
+            "next_cursor": "",
+        }], store=store)
+
+        acquired = list(workflows.history_search(
+            "from:alpha", client=client, progress=False))
+        summary = catalogue("alpha", store=store)
+
+        self.assertEqual([row["id"] for row in acquired],
+                         ["one", "two", "three"])
+        self.assertEqual(
+            summary["counts"]["total"], len(acquired),
+            "catalogue must summarize the history corpus already paid for",
+        )
+
+    def test_history_cli_attaches_selected_store_for_local_consumers(self):
+        """The documented CLI must not leave history persistence disabled."""
+        import workflows
+        from jobs import catalogue
+
+        store = self.fresh_store("history-cli-store")
+        self.addCleanup(store.close)
+        client = scripted_client(raw=[{
+            "tweets": [tweet("paid", 1_700_000_001, "alpha")],
+            "has_next_page": False,
+            "next_cursor": "",
+        }], store=None)
+        output = tempfile.NamedTemporaryFile()
+        self.addCleanup(output.close)
+        store_path = self.store_path("history-cli-store")
+
+        with mock.patch.object(workflows, "Client", return_value=client), \
+             mock.patch.object(workflows, "Store", return_value=store,
+                               create=True) as store_type:
+            rc = workflows._history_cli(
+                self._args(out=output.name, store=store_path))
+
+        self.assertEqual(rc, 0)
+        store_type.assert_called_once_with(store_path)
+        self.assertEqual(catalogue("alpha", store=store)["counts"]["total"], 1)
 
     def test_history_declares_scope_and_include_retweets_runs_second_pass(self):
         """A parsed flag cannot silently do nothing or leave omissions unstated."""
@@ -473,6 +737,7 @@ class TestHistoryHonesty(E2ETest):
             yield from records[query]
 
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
                                  spend_report=lambda: "0 requests, ~$0.0000")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(workflows, "Client", return_value=client), \
@@ -493,6 +758,71 @@ class TestHistoryHonesty(E2ETest):
         self.assertIn("scope", banner)
         self.assertIn("native retweets included", banner)
 
+    def test_page_cap_in_first_pass_does_not_skip_native_retweet_pass(self):
+        """Each search pass must receive its cap even when pass one hits it."""
+        import workflows
+        from twitterapi import IncompleteDataError
+
+        calls = []
+
+        def capped_history(query, *args, **kwargs):
+            calls.append((query, kwargs.get("max_pages")))
+            if "filter:nativeretweets" not in query:
+                yield tweet("original", 1_700_000_003, "alpha")
+                raise IncompleteDataError("stopped at --max-pages 1")
+            yield dict(tweet("retweet", 1_700_000_001, "alpha"),
+                       retweeted_tweet={"id": "source"})
+
+        client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
+                                 spend_report=lambda: "2 requests, ~$0.0060")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(workflows, "Client", return_value=client), \
+             mock.patch.object(workflows, "history_search", capped_history), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = workflows._history_cli(
+                self._args(include_retweets=True, max_pages=1))
+
+        self.assertEqual(rc, 3, "one capped pass still makes the result partial")
+        self.assertEqual(calls, [
+            ("from:alpha", 1),
+            ("from:alpha filter:nativeretweets", 1),
+        ])
+        self.assertEqual(
+            [json.loads(line)["id"] for line in out.getvalue().splitlines()],
+            ["original", "retweet"],
+        )
+        self.assertIn("native retweets 1", err.getvalue().lower())
+
+    def test_raw_query_with_exclude_retweets_is_refused_before_search(self):
+        """A flag must not discard paid raw-query results and still exit 0."""
+        import workflows
+
+        calls = []
+
+        def fake_history(query, *args, **kwargs):
+            calls.append(query)
+            yield dict(tweet("retweet", 1_700_000_001, "alpha"),
+                       retweeted_tweet={"id": "source"})
+
+        client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
+                                 spend_report=lambda: "1 request, ~$0.0030")
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(workflows, "Client", return_value=client), \
+             mock.patch.object(workflows, "history_search", fake_history), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = workflows._history_cli(self._args(
+                user=None,
+                query="from:alpha filter:nativeretweets",
+                exclude_retweets=True,
+            ))
+
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [], "refusal must happen before a paid search")
+        self.assertIn("refused", err.getvalue().lower())
+        self.assertNotIn("redundant", err.getvalue().lower())
+
     def test_default_history_explicitly_declares_native_retweets_excluded(self):
         """A default history cannot make no-retweets look like user behavior."""
         import workflows
@@ -504,6 +834,7 @@ class TestHistoryHonesty(E2ETest):
             return iter(())
 
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
                                  spend_report=lambda: "0 requests, ~$0.0000")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(workflows, "Client", return_value=client), \
@@ -517,6 +848,39 @@ class TestHistoryHonesty(E2ETest):
         self.assertIn("scope", scope)
         self.assertIn("native retweets excluded", scope)
 
+    def test_index_coverage_message_states_date_direction_and_distance(self):
+        """Coverage diagnostics must not call a later crawl date 'before'."""
+        import workflows
+
+        created = datetime(2021, 5, 12, tzinfo=timezone.utc)
+        oldest = datetime(2021, 5, 14, tzinfo=timezone.utc)
+        rec = tweet("oldest-indexed", int(oldest.timestamp()), "alpha")
+        rec["author"].update({
+            "createdAt": created.strftime("%a %b %d %H:%M:%S %z %Y"),
+            "statusesCount": 2,
+        })
+
+        def fake_history(*args, **kwargs):
+            yield rec
+
+        client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
+                                 spend_report=lambda: "1 request, ~$0.0030")
+        err = io.StringIO()
+        with tempfile.NamedTemporaryFile() as output, \
+             mock.patch.object(workflows, "Client", return_value=client), \
+             mock.patch.object(workflows, "history_search", fake_history), \
+             contextlib.redirect_stderr(err):
+            rc = workflows._history_cli(self._args(out=output.name))
+
+        report = err.getvalue().lower()
+        self.assertEqual(rc, 3)
+        self.assertIn(
+            "reached back to 2021-05-14, 2 days after @alpha's "
+            "2021-05-12 account creation",
+            report,
+        )
+        self.assertNotIn("before @alpha", report)
     def test_history_index_gap_is_reported_partial_with_cost_ceiling_wording(self):
         """Index depth before account creation must not exit 0 as a full archive."""
         import workflows
@@ -531,6 +895,7 @@ class TestHistoryHonesty(E2ETest):
             yield rec
 
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
+                                 store=MemoryStore(),
                                  spend_report=lambda: "1 request, ~$0.0030")
         err = io.StringIO()
         with tempfile.NamedTemporaryFile() as output, \
@@ -549,6 +914,189 @@ class TestHistoryHonesty(E2ETest):
         self.assertIn("$3.14", report)
 
 
+class TestJobsCliContracts(E2ETest):
+    def test_sample_limits_authority_cohort(self):
+        """The authority refusal advice must expose a working shrink knob."""
+        import jobs
+
+        client = SimpleNamespace()
+        result = {"complete": True, "frontier": []}
+        with mock.patch.object(jobs, "_client", return_value=client), \
+             mock.patch.object(jobs, "authority_map", return_value=result) as run, \
+             contextlib.redirect_stdout(io.StringIO()):
+            rc = jobs.main(["authority", "seed", "--sample", "30",
+                            "--max-usd", "0.45"])
+
+        self.assertEqual(rc, 0)
+        run.assert_called_once_with("seed", cohort_limit=30, max_usd=0.45,
+                                    client=client, progress=True)
+
+    def test_sample_is_rejected_before_client_for_inapplicable_job(self):
+        """A parsed global option must never be silently ignored."""
+        import jobs
+
+        with mock.patch.object(
+                jobs, "_client", side_effect=AssertionError("client constructed")):
+            with self.assertRaises(SystemExit) as cm, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                jobs.main(["brief", "alpha", "--sample", "30"])
+
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_partial_authority_json_exits_three_without_losing_payload(self):
+        """Shell callers must distinguish a usable partial frontier from success."""
+        import jobs
+
+        client = SimpleNamespace()
+        result = {
+            "complete": False, "members_crawled": 85,
+            "frontier": [{"handle": "alice", "in_degree": 4}],
+            "_warning": "PARTIAL: spend ceiling hit mid-crawl",
+        }
+        out = io.StringIO()
+        with mock.patch.object(jobs, "_client", return_value=client), \
+             mock.patch.object(jobs, "authority_map", return_value=result), \
+             contextlib.redirect_stdout(out):
+            rc = jobs.main(["authority", "seed", "--max-usd", "1.60"])
+
+        self.assertEqual(rc, 3)
+        self.assertEqual(json.loads(out.getvalue()), result)
+
+
+class TestAuthorityContracts(E2ETest):
+    def test_authority_reports_member_progress_and_running_spend(self):
+        """A paid multi-member crawl must never look hung for minutes."""
+        from cohort import Cohort
+
+        class Client:
+            max_usd = 5.0
+            spent_usd = 0.0
+            requests_made = 0
+
+            def paginate(inner, name, handle):
+                inner.requests_made += 1
+                inner.spent_usd += 0.01
+                return iter(())
+
+            def spend_report(inner):
+                return (f"{inner.requests_made} requests, "
+                        f"~${inner.spent_usd:.4f}")
+
+        c = Client()
+        co = Cohort(client=c, store=MemoryStore())
+        co._add("1", "alice", 1.0, "test")
+        co._add("2", "bob", 1.0, "test")
+        out, err = io.StringIO(), io.StringIO()
+
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            co.authority(max_usd=1.0, progress=True)
+
+        self.assertEqual(out.getvalue(), "", "progress must not corrupt JSON stdout")
+        report = err.getvalue()
+        self.assertIn("1/2", report)
+        self.assertIn("2/2", report)
+        self.assertIn("requests", report)
+        self.assertIn("$0.0200", report)
+
+    def test_authority_estimate_is_calibrated_above_observed_cost(self):
+        """The guard's stated budget must cover the measured 1.88x crawl cost."""
+        from cohort import Cohort
+        from twitterapi import CostLimitExceeded
+
+        class Client:
+            max_usd = 5.0
+            spent_usd = 0.0
+
+            def paginate(inner, *args, **kwargs):
+                raise AssertionError("paid crawl started below the safe estimate")
+
+        co = Cohort(client=Client(), store=MemoryStore())
+        for i in range(127):
+            co._add(str(i + 1), f"member{i + 1}", 1.0, "test")
+
+        with self.assertRaises(CostLimitExceeded) as cm:
+            co.authority(max_usd=1.60, confirm=True)
+
+        message = str(cm.exception)
+        self.assertIn("$2.54", message)
+        self.assertIn("2,000 followings/account", message)
+
+
+class TestAbsentResourceSemantics(E2ETest):
+    def test_null_community_identity_raises_instead_of_returning_zero_facts(self):
+        """A missing community cannot truthfully have zero members or NSFW false."""
+        from twitterapi import APIError
+
+        c = scripted_client(raw=[{
+            "community_info": {
+                "id": None, "member_count": 0, "moderator_count": 0,
+                "is_nsfw": False,
+            },
+        }])
+
+        with self.assertRaises(APIError) as cm:
+            c.community_info("999999999999999999")
+
+        self.assertIn("not found", str(cm.exception).lower())
+
+    def test_empty_community_collection_validates_resource_identity(self):
+        """An empty page for a nonexistent community is not an empty community."""
+        from twitterapi import APIError
+
+        c = scripted_client(raw=[
+            {"members": [], "has_next_page": False, "next_cursor": ""},
+            {"community_info": {"id": None, "member_count": 0}},
+        ])
+
+        with self.assertRaises(APIError):
+            list(c.paginate("community_members", "999999999999999999"))
+
+        self.assertEqual([call[1] for call in c.raw_calls], [
+            "/twitter/community/members", "/twitter/community/info",
+        ])
+
+    def test_empty_list_page_is_incomplete_not_confident_zero(self):
+        """Empty, private, and nonexistent lists must remain distinguishable."""
+        from twitterapi import IncompleteDataError
+
+        c = scripted_client(raw=[{
+            "members": [], "has_next_page": False, "next_cursor": "",
+        }])
+
+        with self.assertRaises(IncompleteDataError) as cm:
+            list(c.paginate("list_members", "1493809298814746624"))
+
+        message = str(cm.exception).lower()
+        self.assertIn("empty", message)
+        self.assertIn("private", message)
+        self.assertIn("not exist", message)
+
+
+class TestEndpointNamingContracts(E2ETest):
+    def test_community_search_alias_warns_that_records_are_tweets(self):
+        """A community-named search must not masquerade as ID discovery."""
+        from twitterapi import ENDPOINTS
+
+        c = scripted_client(raw=[{
+            "tweets": [], "has_next_page": False, "next_cursor": "",
+        }])
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            got = list(c.paginate("community_search", "markets"))
+
+        self.assertEqual(got, [])
+        self.assertIn("community_tweets_all", ENDPOINTS)
+        self.assertIs(
+            ENDPOINTS["community_search"], ENDPOINTS["community_tweets_all"],
+            "the compatibility name must alias the canonical endpoint spec",
+        )
+        warning = err.getvalue().lower()
+        self.assertIn("returns tweets", warning)
+        self.assertIn("not communities", warning)
+        self.assertIn("community_tweets_all", warning)
+
+
 class TestLocalCorpusCapabilities(E2ETest):
     def _cached_corpus(self):
         s = self.fresh_store("catalogue")
@@ -557,7 +1105,13 @@ class TestLocalCorpusCapabilities(E2ETest):
         records = [
             dict(tweet("root", jan, "alpha"), text="root", likeCount=2,
                  retweetCount=1, replyCount=2, quoteCount=3, viewCount=10,
-                 bookmarkCount=4, conversationId="root"),
+                 bookmarkCount=4, conversationId="root",
+                 extendedEntities={"media": [{
+                     "type": "photo",
+                     "media_url_https":
+                         "https://pbs.twimg.com/media/catalogue.jpg",
+                     "ext_alt_text": "Configuration screenshot",
+                 }]}),
             dict(tweet("self-reply", jan + 1, "alpha"), text="continued",
                  likeCount=8, retweetCount=2, replyCount=0, quoteCount=0,
                  viewCount=20, bookmarkCount=6, isReply=True,
@@ -594,6 +1148,11 @@ class TestLocalCorpusCapabilities(E2ETest):
             {"month": "2024-02", "volume": 2, "median_likes": 2.0},
         ])
         self.assertEqual(result["spend"], "$0.00 (local cache only)")
+        self.assertEqual(result["media"]["tweets_with_media"], 1)
+        self.assertEqual(result["media"]["artifact_count"], 1)
+        self.assertEqual(result["media"]["retrieved_count"], 0)
+        self.assertEqual(result["media"]["undisplayed_count"], 1)
+        self.assertIn("not downloaded", result["media"]["_warning"].lower())
 
     def test_threads_reconstruct_cached_conversations_and_state_limits(self):
         """conversationId must become usable structure without claiming missing context."""
@@ -608,7 +1167,62 @@ class TestLocalCorpusCapabilities(E2ETest):
         self.assertTrue(thread["cached_root_present"])
         self.assertIn("cached", result["_scope"].lower())
         self.assertIn("may be absent", result["_scope"].lower())
+        self.assertEqual(thread["tweets"][0]["media"][0]["type"], "photo")
+        self.assertEqual(result["media"]["undisplayed_count"], 1)
+        self.assertIn("not downloaded", result["media"]["_warning"].lower())
         self.assertEqual(result["spend"], "$0.00 (local cache only)")
+
+    def test_media_local_job_lists_cached_artifacts_without_a_client(self):
+        """The CLI must expose cached media URLs without a paid API client."""
+        import jobs
+        from store import Store
+
+        path = self.store_path("media-cli")
+        with Store(path) as store:
+            with self._cached_corpus() as source_store:
+                source = source_store.tweets_for(user_names=["alpha"])
+            store.put_tweets([json.loads(row["raw"]) for row in source])
+        output = io.StringIO()
+        with mock.patch.object(jobs, "_client",
+                               side_effect=AssertionError("paid client created")), \
+             contextlib.redirect_stdout(output):
+            rc = jobs.main(["media", "alpha", "--store", path])
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(rc, 0)
+        self.assertEqual(result["artifact_count"], 1)
+        self.assertEqual(result["artifacts"][0]["type"], "photo")
+        self.assertIn("pbs.twimg.com", result["artifacts"][0]["url"])
+
+    def test_brief_exposes_media_and_discloses_unretrieved_bytes(self):
+        """A text brief must state when image evidence was not interpreted."""
+        import jobs
+
+        record = dict(tweet("image", 1_700_000_000, "alpha"),
+                      text="configuration is in the screenshot", likeCount=10,
+                      media=[{
+                          "type": "photo",
+                          "url": "https://pbs.twimg.com/media/brief.jpg",
+                          "alt_text": None,
+                          "full_resolution_url": (
+                              "https://pbs.twimg.com/media/brief.jpg?"
+                              "format=jpg&name=4096x4096"),
+                      }])
+
+        class Client:
+            def user_info(self, handle):
+                return {"name": handle, "followers": 1,
+                        "description": "", "isBlueVerified": False}
+
+            def spend_report(self):
+                return "0 requests"
+
+        with mock.patch.object(jobs, "corpus", return_value=[record]):
+            result = jobs.entity_brief("alpha", client=Client())
+
+        self.assertEqual(result["top_tweets"][0]["media"], record["media"])
+        self.assertEqual(result["media"]["undisplayed_count"], 1)
+        self.assertIn("not downloaded", result["media"]["_warning"].lower())
 
     def test_catalogue_cli_never_constructs_a_paid_client(self):
         """A $0 local job must remain usable without API initialization."""

@@ -32,13 +32,14 @@ from statistics import median
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import (APIError, Client, CostLimitExceeded,
-                        IncompleteDataError)  # noqa: E402
+                        IncompleteDataError, enrich_tweet_media)  # noqa: E402
 from store import Store  # noqa: E402
 from cohort import Cohort  # noqa: E402
 
 
-def _client(max_usd=5.0):
-    return Client(verbose=False, store=Store(), max_usd=max_usd)
+def _client(max_usd=5.0, store_path=None):
+    store = Store(store_path) if store_path else Store()
+    return Client(verbose=False, store=store, max_usd=max_usd)
 
 
 def _days_ago(days):
@@ -170,6 +171,57 @@ def _raw_tweet(row):
     return raw if isinstance(raw, dict) else {}
 
 
+def _row_media(row):
+    """First-class media list, with raw fallback for pre-migration rows."""
+    media = row.get("media") or []
+    if isinstance(media, str):
+        try:
+            media = json.loads(media)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            media = []
+    if isinstance(media, list) and media:
+        return media
+    from store import extract_tweet_media
+    return extract_tweet_media(_raw_tweet(row))
+
+
+def _media_summary(rows, *, include_artifacts=False):
+    artifacts, tweets_with_media = [], 0
+    for row in rows:
+        items = _row_media(row)
+        if not items:
+            continue
+        tweets_with_media += 1
+        for item in items:
+            artifact = {"tweet_id": str(row.get("id") or ""), **item}
+            artifacts.append(artifact)
+    count = len(artifacts)
+    result = {
+        "tweets_with_media": tweets_with_media,
+        "artifact_count": count,
+        # This skill inventories URLs but deliberately does not fetch bytes.
+        "retrieved_count": 0,
+        "undisplayed_count": count,
+        "_warning": (
+            f"{count} media artifact{'s are' if count != 1 else ' is'} referenced "
+            "by URL only; media bytes were not downloaded, displayed, or "
+            "interpreted by this result."
+        ),
+    }
+    if include_artifacts:
+        result["artifacts"] = artifacts
+    return result
+
+
+def media_inventory(handle, *, store=None):
+    """List first-class media metadata from an already-paid local corpus."""
+    result = {"handle": handle.lstrip("@")}
+    result.update(_media_summary(
+        _cached_rows(handle, store), include_artifacts=True))
+    result["spend"] = "$0.00 (local cache only)"
+    return result
+
+
 def catalogue(handle, *, store=None):
     """Summarise a cached account corpus. Pure local computation; $0 API spend.
 
@@ -257,6 +309,7 @@ def catalogue(handle, *, store=None):
         },
         "engagement": engagement,
         "monthly": month_series,
+        "media": _media_summary(rows),
         "_composition_note": ("replies, self_thread_replies, and quotes can "
                               "overlap; originals is the exclusive remainder"),
         "spend": "$0.00 (local cache only)",
@@ -289,6 +342,7 @@ def reconstruct_threads(handle, *, store=None, min_posts=2):
                     if r.get("created_ts") else None),
                 "in_reply_to": r.get("in_reply_to") or None,
                 "text": r.get("text") or "",
+                "media": _row_media(r),
             } for r in posts],
         })
     threads.sort(key=lambda t: (-t["tweet_count"], t["conversation_id"]))
@@ -296,6 +350,7 @@ def reconstruct_threads(handle, *, store=None, min_posts=2):
         "handle": handle.lstrip("@"),
         "thread_count": len(threads),
         "threads": threads,
+        "media": _media_summary(rows),
         "_scope": ("Reconstructed from this handle's cached posts only; external "
                    "participants and uncached or deleted posts may be absent."),
         "spend": "$0.00 (local cache only)",
@@ -319,7 +374,9 @@ def entity_brief(handle, *, days=30, client=None):
         "tweet_count": len(tweets),
         "top_tweets": [{"text": t.get("text"), "likes": t.get("likeCount"),
                         "retweets": t.get("retweetCount"),
-                        "createdAt": t.get("createdAt")} for t in tweets[:15]],
+                        "createdAt": t.get("createdAt"),
+                        "media": _row_media(t)} for t in tweets[:15]],
+        "media": _media_summary(tweets),
         "_note": "Interpretation (themes, posture) is the caller's job, not this function's.",
         "spend": c.spend_report(),
     }
@@ -379,7 +436,8 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
         resp = c._raw("GET", "/twitter/tweet/advanced_search",
                       {"query": q, "queryType": "Latest"},
                       max_credits=Client.page_credits("search", 20, 20))
-        batch = resp.get("tweets") or []
+        batch = [enrich_tweet_media(tweet)
+                 for tweet in (resp.get("tweets") or [])]
         c._charge("search", len(batch), 20)
         if c.store:
             c.store.put_tweets(batch)
@@ -431,12 +489,13 @@ def _search_window(c, query, since_ts, until_ts, max_pages=1000):
 
 
 # --------------------------------------------------------- authority map ----
-def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None):
+def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
+                  progress=False):
     """Who a scene itself follows (frontier), from a topic seed. Expensive —
     the follow-graph crawl — so it estimates and refuses past max_usd."""
     c = client or _client(max_usd)
     co = Cohort.from_search(seed_query, limit=cohort_limit, client=c, store=c.store)
-    co.authority(max_usd=max_usd, confirm=True)
+    co.authority(max_usd=max_usd, confirm=True, progress=progress)
     ranked = co.top(30)
     complete = getattr(co, "authority_complete", True)
     return {
@@ -631,9 +690,12 @@ def competitive_benchmark(handles, *, days=30, client=None):
 JOBS = {
     "brief": lambda a, c: entity_brief(a.target, days=a.days, client=c),
     "narrative": lambda a, c: narrative_tracker(a.target, days=a.days, client=c),
-    "authority": lambda a, c: authority_map(a.target, max_usd=a.max_usd, client=c),
+    "authority": lambda a, c: authority_map(
+        a.target, cohort_limit=a.sample if a.sample is not None else 150,
+        max_usd=a.max_usd, client=c, progress=True),
     "overlap": lambda a, c: overlap(a.target, a.target2, max_usd=a.max_usd, client=c),
-    "authenticity": lambda a, c: authenticity_audit(a.target, sample=a.sample, client=c),
+    "authenticity": lambda a, c: authenticity_audit(
+        a.target, sample=a.sample if a.sample is not None else 1000, client=c),
     "diffusion": lambda a, c: diffusion_trace(a.target, client=c),
     "drift": lambda a, c: cohort_drift(a.target, a.v_old, a.v_new, client=c),
     "benchmark": lambda a, c: competitive_benchmark(a.target.split(","),
@@ -642,6 +704,7 @@ JOBS = {
 
 LOCAL_JOBS = {
     "catalogue": lambda a, s: catalogue(a.target, store=s),
+    "media": lambda a, s: media_inventory(a.target, store=s),
     "threads": lambda a, s: reconstruct_threads(a.target, store=s),
 }
 
@@ -653,12 +716,15 @@ def main(argv=None):
     p.add_argument("target", help="handle / query / tweet_id / cohort name / csv")
     p.add_argument("target2", nargs="?", help="second handle for overlap")
     p.add_argument("--days", type=int, default=30)
-    p.add_argument("--sample", type=int, default=1000)
+    p.add_argument("--sample", type=int, default=None,
+                   help="cohort limit for authority; tweet sample for authenticity")
     p.add_argument("--max-usd", type=float, default=5.0)
     p.add_argument("--v-old", type=int)
     p.add_argument("--v-new", type=int)
-    p.add_argument("--store", help="sqlite store path (catalogue/threads only)")
+    p.add_argument("--store", help="sqlite store path for local and network jobs")
     a = p.parse_args(argv)
+    if a.sample is not None and a.job not in {"authority", "authenticity"}:
+        p.error("--sample applies only to authority and authenticity")
     if a.job == "overlap" and not a.target2:
         p.error("overlap needs two handles: jobs.py overlap A B")
     if a.job in LOCAL_JOBS:
@@ -670,9 +736,10 @@ def main(argv=None):
             s.close()
         return 0
 
-    c = _client(a.max_usd)          # one client, one ceiling, shared cache
+    c = _client(a.max_usd, store_path=a.store)  # one ceiling + chosen cache
     try:
-        print(json.dumps(JOBS[a.job](a, c), indent=1, ensure_ascii=False))
+        result = JOBS[a.job](a, c)
+        print(json.dumps(result, indent=1, ensure_ascii=False))
     except IncompleteDataError as e:
         print(f"INCOMPLETE: {e}", file=sys.stderr)
         return 3
@@ -683,6 +750,8 @@ def main(argv=None):
         print(f"API error: {e}\nCheck the handle/id exists and that "
               f"TWITTERAPI_IO_KEY is valid.", file=sys.stderr)
         return 1
+    if a.job == "authority" and result.get("complete") is False:
+        return 3
     return 0
 
 

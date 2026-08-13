@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Re-verify this skill's recorded facts against the live API.
 
-    python3 scripts/verify.py              # contracts only, ~$0.002, ~15s
+    python3 scripts/verify.py              # full read-surface sweep
+    python3 scripts/verify.py --quick      # legacy 9-endpoint sample
     python3 scripts/verify.py --pricing    # + balance-delta price check, ~3 min
     python3 scripts/verify.py --update     # re-stamp facts.json from observation
 
@@ -34,20 +35,137 @@ from twitterapi import Client, ENDPOINTS, APIError  # noqa: E402
 FACTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "references", "facts.json")
 
-# Small, stable targets. kaitoinfra has ~10 followers so contract probes stay
-# in the 15-credit minimum rather than paying for a real crawl.
-PROBES = {
-    "user_info":      {"userName": "kaitoinfra"},
-    "follower_ids":   {"userName": "kaitoinfra", "count": 5000},
-    "followers":      {"userName": "kaitoinfra", "pageSize": 200},
-    "followings":     {"userName": "jack", "pageSize": 200},
-    "last_tweets":    {"userName": "jack"},
-    "search":         {"query": "from:openai", "queryType": "Latest"},
-    "replies_v2":     {"tweetId": "2084352161404920316", "queryType": "Latest"},
-    "retweeters":     {"tweetId": "2084352161404920316"},
-    "trends":         {"woeid": 1, "count": 5},
-    "community_info": {"community_id": "1493446837214187523"},
+# Stable, read-only fixtures already used by the suite or the old verifier.
+HANDLE = "kaitoinfra"
+TIMELINE_HANDLE = "jack"
+ARTICLE_HANDLE = "elonmusk"
+TWEET_ID = "2084352161404920316"
+COMMUNITY_ID = "1493446837214187523"
+
+# The compatibility sample is intentionally frozen. It is useful for a cheap
+# smoke check, but its output must say that 23 endpoint names were not probed.
+QUICK_ENDPOINTS = (
+    "user_info", "follower_ids", "followers", "followings", "last_tweets",
+    "search", "retweeters", "trends", "community_info",
+)
+
+# Exclusion is opt-in. Every ENDPOINTS entry not named here is probed by
+# default, so adding an endpoint to the table cannot silently leave it unseen.
+UNPROBEABLE = {
+    "community_members": (
+        "needs a Community id; /twitter/user/communities returns a user-profile "
+        "payload instead of community data, so there is no discovery route"),
+    "community_moderators": (
+        "needs a Community id; /twitter/user/communities returns a user-profile "
+        "payload instead of community data, so there is no discovery route"),
+    "community_search": (
+        "community discovery is unavailable; /twitter/user/communities returns "
+        "a user-profile payload instead of community data"),
+    "community_tweets": (
+        "needs a Community id; /twitter/user/communities returns a user-profile "
+        "payload instead of community data, so there is no discovery route"),
+    "community_tweets_all": (
+        "community discovery is unavailable; /twitter/user/communities returns "
+        "a user-profile payload instead of community data"),
+    "list_followers": (
+        "needs a List id; every /twitter/user/lists parameter variant returns "
+        "'user not found' for a known existing user, so there is no discovery "
+        "route"),
+    "list_members": (
+        "needs a List id; every /twitter/user/lists parameter variant returns "
+        "'user not found' for a known existing user, so there is no discovery "
+        "route"),
+    "list_tweets": (
+        "needs a List id; every /twitter/user/lists parameter variant returns "
+        "'user not found' for a known existing user, so there is no discovery "
+        "route"),
+    "list_tweets_filtered": (
+        "needs a List id; every /twitter/user/lists parameter variant returns "
+        "'user not found' for a known existing user, so there is no discovery "
+        "route"),
+    "space_detail": "needs a Space id; none is available to the suite",
 }
+
+
+def probe_endpoint_names(*, quick=False):
+    """Return the sweep in ENDPOINTS order; full coverage is the default."""
+    if quick:
+        return list(QUICK_ENDPOINTS)
+    return [name for name in ENDPOINTS if name not in UNPROBEABLE]
+
+
+def check_coverage(endpoint_names):
+    """Fail closed if the default sweep ever loses an ENDPOINTS entry."""
+    probed = set(endpoint_names)
+    excluded = set(UNPROBEABLE)
+    overlap = probed & excluded
+    missing = set(ENDPOINTS) - probed - excluded
+    unknown = (probed | excluded) - set(ENDPOINTS)
+    if overlap or missing or unknown:
+        raise AssertionError(
+            "endpoint coverage partition is invalid: "
+            f"missing={sorted(missing)} overlap={sorted(overlap)} "
+            f"unknown={sorted(unknown)}")
+
+
+def probe_params(name, fixtures):
+    """Derive one minimum-cost read-only request from the endpoint contract."""
+    spec = ENDPOINTS[name]
+    key = spec["key_param"]
+
+    if name == "community_info":
+        value = COMMUNITY_ID
+    elif name == "articles":
+        value = ARTICLE_HANDLE
+    elif name in ("followings", "last_tweets", "mentions"):
+        value = TIMELINE_HANDLE
+    elif name == "tweet_timeline":
+        # F25: this handle-based probe must currently fail because the endpoint
+        # accepts only a numeric userId. Do not hide that client-surface break.
+        value = TIMELINE_HANDLE
+    elif key in ("tweetId", "tweet_ids"):
+        value = TWEET_ID
+    elif key in ("userId", "userIds", "user_id"):
+        value = fixtures.get("user_id")
+        if not value:
+            raise ValueError("numeric user id was not discoverable from user_info")
+    elif key in ("userName", "username"):
+        value = HANDLE
+    elif key == "query":
+        value = "from:kaitoinfra" if name == "search" else HANDLE
+    elif key == "woeid":
+        value = 1
+    else:
+        raise ValueError(
+            f"no safe read-only fixture rule for key parameter {key!r}")
+
+    params = {key: value}
+    if name in ("search", "replies_v1", "replies_v2"):
+        params["queryType"] = "Latest"
+    if spec["page_param"]:
+        # followers/followings clamp at 20; the other tunable endpoints accept 1.
+        params[spec["page_param"]] = (
+            20 if name in ("followers", "followings") else 1)
+    return params
+
+
+def _page_size(name, params):
+    spec = ENDPOINTS[name]
+    return int(params.get(spec["page_param"], spec["page_max"])) \
+        if spec["page_param"] else spec["page_max"]
+
+
+def _record_count(resp, spec):
+    """Count billable records, conservatively, even for a malformed envelope."""
+    if spec["items"] is None:
+        return 1
+    container = resp.get("data") if spec["items_in"] == "data" else resp
+    if (isinstance(container, dict)
+            and isinstance(container.get(spec["items"]), list)):
+        return len(container[spec["items"]])
+    if isinstance(container, list):
+        return len(container)
+    return spec["page_max"]
 
 
 def load_facts(path=FACTS):
@@ -97,15 +215,20 @@ def check_internal_consistency(facts):
     return drift
 
 
-def check_contracts(c, facts, observed_out=None):
+def check_contracts(c, facts, endpoint_names, observed_out=None):
     """Compare live response shapes against the recorded contracts."""
-    drift = []
+    failures = []
     contracts = facts["response_contracts"]
-    for name, params in PROBES.items():
+    fixtures = {}
+    for name in endpoint_names:
         want = contracts.get(name)
-        if not want:
-            continue
         spec = ENDPOINTS[name]
+        try:
+            params = probe_params(name, fixtures)
+        except Exception as e:
+            failures.append((name, "probe configuration failed", str(e)[:90]))
+            print(f"  FAIL   {name:22s} probe configuration: {str(e)[:60]}")
+            continue
         try:
             resp = c._raw("GET", spec["path"], params)
         except APIError as e:
@@ -122,35 +245,47 @@ def check_contracts(c, facts, observed_out=None):
                      }.get(e.status, f"twitterapi.io returned {e.status} — "
                                      f"likely a transient outage, retry later.")
                     + f"  (on {name} -> {spec['path']})") from None
-            drift.append((name, "request failed", str(e)[:90]))
-            print(f"  DRIFT  {name:16s} request failed: {str(e)[:60]}")
+            failures.append((name, "request failed", str(e)[:90]))
+            print(f"  FAIL   {name:22s} request failed: {str(e)[:60]}")
             continue
+
+        c._charge(name, _record_count(resp, spec), _page_size(name, params))
+        if name == "user_info":
+            profile = resp.get("data") or {}
+            if isinstance(profile, dict) and profile.get("id") not in (None, ""):
+                fixtures["user_id"] = str(profile["id"])
 
         got_keys = sorted(resp.keys())
         if observed_out is not None:
             observed_out[name] = {"top_level_keys": got_keys}
 
-        if got_keys != sorted(want["top_level_keys"]):
+        if want and got_keys != sorted(want["top_level_keys"]):
             missing = set(want["top_level_keys"]) - set(got_keys)
             extra = set(got_keys) - set(want["top_level_keys"])
-            drift.append((name, "key set changed",
-                          f"missing={sorted(missing)} new={sorted(extra)}"))
-            print(f"  DRIFT  {name:16s} keys {got_keys}")
+            failures.append((name, "key set changed",
+                             f"missing={sorted(missing)} new={sorted(extra)}"))
+            print(f"  FAIL   {name:22s} keys {got_keys}")
             print(f"         expected {sorted(want['top_level_keys'])}"
                   f"  missing={sorted(missing)} new={sorted(extra)}")
             continue
 
         # The parser must still find records where the contract says they are.
-        items, has_next, cursor = Client._unpack(resp, spec)
-        if want.get("items_key") and not isinstance(items, list):
-            drift.append((name, "items not a list", type(items).__name__))
-            print(f"  DRIFT  {name:16s} items_key '{want['items_key']}' "
-                  f"did not yield a list")
+        try:
+            items, has_next, cursor = Client._unpack(resp, spec)
+        except Exception as e:
+            failures.append((name, "response contract failed", str(e)[:90]))
+            print(f"  FAIL   {name:22s} response contract: {str(e)[:60]}")
+            continue
+        if spec["items"] is not None and not isinstance(items, list):
+            failures.append((name, "items not a list", type(items).__name__))
+            print(f"  FAIL   {name:22s} items_key '{spec['items']}' did not "
+                  "yield a list")
             continue
         n = len(items) if isinstance(items, list) else "-"
-        print(f"  ok     {name:16s} keys ok, {n} records via "
-              f"{want['items_in']}.{want.get('items_key')}")
-    return drift
+        contract = "exact keys + envelope" if want else "ENDPOINTS envelope"
+        print(f"  ok     {name:22s} {contract}, {n} records via "
+              f"{spec['items_in']}.{spec.get('items')}")
+    return failures
 
 
 def check_pricing(c, facts):
@@ -197,6 +332,8 @@ def main(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pricing", action="store_true",
                    help="also re-measure prices by balance delta (~3 min)")
+    p.add_argument("--quick", action="store_true",
+                   help="probe only the legacy 9-endpoint smoke sample")
     p.add_argument("--update", action="store_true",
                    help="rewrite facts.json from what was just observed")
     a = p.parse_args(argv)
@@ -209,13 +346,22 @@ def main(argv=None):
     age = days_since(facts.get("verified_at", ""))
     print(f"facts.json verified_at {facts.get('verified_at')} "
           f"({age} days ago)" if age is not None else "facts.json undated")
-    print(f"re-probing {len(PROBES)} endpoints against {facts['verified_against']}\n")
+    endpoint_names = probe_endpoint_names(quick=a.quick)
+    if not a.quick:
+        check_coverage(endpoint_names)
+    print(f"re-probing {len(endpoint_names)} of {len(ENDPOINTS)} endpoints "
+          f"against {facts['verified_against']}"
+          + (" (--quick: partial sweep)" if a.quick else "") + "\n")
+    if not a.quick:
+        for name, reason in UNPROBEABLE.items():
+            print(f"  UNPROBEABLE  {name:22s} {reason}")
+        print()
 
     drift = check_internal_consistency(facts)   # offline, free, runs first
     c = Client(verbose=False)
     observed = {}
     try:
-        drift += check_contracts(c, facts, observed)
+        probe_failures = check_contracts(c, facts, endpoint_names, observed)
         if a.pricing:
             drift += check_pricing(c, facts)
     except EnvironmentError as e:
@@ -226,19 +372,33 @@ def main(argv=None):
               f"Fix the above and re-run.", file=sys.stderr)
         return 2
 
-    print(f"\n  spent ${c.spent_usd:.4f} on verification")
+    skipped_quick = len(ENDPOINTS) - len(endpoint_names) if a.quick else 0
+    coverage = f"probed {len(endpoint_names)}/{len(ENDPOINTS)}"
+    if a.quick:
+        coverage += f" · {skipped_quick} skipped by --quick"
+    else:
+        coverage += (f" · {len(UNPROBEABLE)} unprobeable "
+                     "(no discovery route)")
+    coverage += f" · {len(probe_failures)} FAILING · spent ${c.spent_usd:.5f}"
+    print(f"\nCOVERAGE  {coverage}")
+
+    drift += probe_failures
 
     if drift:
-        print(f"\nDRIFT DETECTED — {len(drift)} fact(s) no longer hold:\n")
+        print(f"\nVERIFY FAILED — {len(drift)} check(s) failed:\n")
         for name, kind, detail in drift:
             print(f"  {name}: {kind} — {detail}")
-        print("\nThe skill now asserts things the API no longer does. Re-probe the\n"
-              "affected endpoints, update references/facts.json (or run --update),\n"
-              "and fix any prose in references/verified-facts.md that repeats the\n"
-              "changed value. Do not trust downstream results until you do.")
+        print("\nThe probeable read surface is not fully healthy. Investigate each\n"
+              "failure before trusting downstream results; update recorded facts\n"
+              "only when the live contract, rather than the client, actually moved.")
         return 1
 
-    print("\nAll recorded facts still hold.")
+    if a.quick:
+        print(f"\nQuick sweep passed for {len(endpoint_names)}/{len(ENDPOINTS)} "
+              "endpoints; run without --quick for the full probeable surface.")
+    else:
+        print("\nAll probed endpoint contracts passed; endpoints marked "
+              "UNPROBEABLE were not tested.")
     if a.update:
         facts["verified_at"] = time.strftime("%Y-%m-%d")
         for name, obs in observed.items():

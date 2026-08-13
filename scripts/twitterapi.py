@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -106,7 +107,7 @@ ENDPOINTS = {
         path="/twitter/trends", key_param="woeid",
         items="trends", items_in="root", page_param="count", page_max=50),
     # Verified live. Note `query` is REQUIRED on this one.
-    "community_search": dict(
+    "community_tweets_all": dict(
         path="/twitter/community/get_tweets_from_all_community", key_param="query",
         items="tweets", items_in="root", page_param=None, page_max=20),
     # --- read surface completed 2026-08-10, all live-probed ---
@@ -141,6 +142,9 @@ ENDPOINTS = {
         path="/twitter/spaces/detail", key_param="space_id",
         items=None, items_in="root", page_param=None, page_max=1),
 }
+# Backward-compatible misleading name: alias the canonical spec object so the
+# endpoint cannot drift through two independently edited table entries.
+ENDPOINTS["community_search"] = ENDPOINTS["community_tweets_all"]
 
 # Endpoints whose results are stable enough to cache indefinitely (a follow
 # graph or profile doesn't change between two questions in a session). Content
@@ -149,6 +153,12 @@ ENDPOINTS = {
 CACHEABLE = {"follower_ids", "followers", "followings", "verified_followers",
              "batch_users", "user_info", "user_about", "community_members",
              "community_moderators", "list_members", "list_followers"}
+COMMUNITY_COLLECTIONS = {
+    "community_members", "community_moderators", "community_tweets",
+}
+LIST_COLLECTIONS = {
+    "list_members", "list_followers", "list_tweets", "list_tweets_filtered",
+}
 
 # Tiered pricing, measured. (min_page_size, credits_per_record) descending.
 PRICE_TIERS = {
@@ -164,6 +174,42 @@ MIN_REQUEST_CREDITS = 15.0   # $0.00015 floor, charged PER REQUEST, even if empt
 
 # QPS ladder, from twitterapi.io/qps-limits. Keyed by credit balance.
 QPS_LADDER = [(50_000, 20), (10_000, 10), (5_000, 6), (1_000, 3), (0, 0.2)]
+
+_BARE_SEARCH_DATE = re.compile(
+    r"(?<!\S)(since|until):(\d{4}-\d{2}-\d{2})(?=\s|$)")
+_MIN_FAVES = re.compile(r"(?<!\S)min_faves:(\d+)(?=\s|$)")
+
+
+def prepare_search_query(query):
+    """Return an honest wire query and any predicate enforced from results.
+
+    The search index resolves bare dates outside UTC and uses a stale likes
+    snapshot for ``min_faves``. Exact UTC tokens go to the API; engagement is
+    checked against each returned tweet's current ``likeCount`` instead.
+    """
+    query = str(query or "")
+    thresholds = [int(value) for value in _MIN_FAVES.findall(query)]
+    query = _MIN_FAVES.sub("", query)
+    query = _BARE_SEARCH_DATE.sub(
+        lambda m: f"{m.group(1)}:{m.group(2)}_00:00:00_UTC", query)
+    return query.strip(), (max(thresholds) if thresholds else None)
+
+
+def filter_search_tweets(tweets, min_faves):
+    if min_faves is None:
+        return tweets
+    return [tweet for tweet in tweets
+            if int(tweet.get("likeCount") or 0) >= min_faves]
+
+
+def enrich_tweet_media(tweet):
+    """Attach the public normalized media shape to a raw API tweet."""
+    if not isinstance(tweet, dict):
+        return tweet
+    from store import extract_tweet_media
+    enriched = dict(tweet)
+    enriched["media"] = extract_tweet_media(tweet)
+    return enriched
 
 
 class APIError(RuntimeError):
@@ -227,6 +273,12 @@ def _warn_if_facts_stale():
 class Client:
     def __init__(self, api_key=None, timeout=45, max_usd=None, verbose=True,
                  store=None, cache_max_age=None):
+        if isinstance(store, (str, os.PathLike)):
+            # Accept the same path-oriented store contract as the CLIs, but
+            # resolve it before any request can be sent and later fail during
+            # paid write-through.
+            from store import Store
+            store = Store(os.fspath(store))
         self.key = api_key or os.environ.get("TWITTERAPI_IO_KEY")
         if not self.key:
             raise RuntimeError(
@@ -492,7 +544,24 @@ class Client:
                 f"${self.max_usd:,.5f} ceiling (${self.spent_usd:,.5f} "
                 f"already spent); refusing before the paid request.")
 
-    def _preflight(self, name, n_records, page_size=None):
+    def _preflight(self, name, n_records, page_size=None, *, full_scan=False):
+        if full_scan:
+            # A local predicate can reject every paid row, so no returned-row
+            # limit can estimate the number of pages. Make max_usd the explicit
+            # scan bound instead of presenting a limit-derived underestimate.
+            if self.max_usd is None:
+                raise ValueError(
+                    f"{name} uses a local predicate that may require a full "
+                    f"result scan; limit={n_records!r} bounds returned matches, "
+                    "not fetched rows. Pass max_usd= to bound paid scan cost.")
+            print(
+                f"[twitterapi] WARNING: {name} uses a local predicate; "
+                f"limit={n_records!r} bounds returned matches, not fetched "
+                f"rows. The query may scan to exhaustion, bounded by the "
+                f"cumulative max_usd=${self.max_usd:,.5f} ceiling.",
+                file=sys.stderr,
+            )
+            return
         if self.max_usd is None or not n_records:
             return
         projected = self.spent_usd + self.estimate(name, n_records, page_size)
@@ -509,6 +578,11 @@ class Client:
 
         Handles both envelope shapes, charges each page against the cumulative
         ceiling, and refuses to loop when the cursor stops advancing."""
+        if name == "community_search":
+            print("[twitterapi] WARNING: 'community_search' returns tweets, "
+                  "not communities or community IDs; use the explicit "
+                  "'community_tweets_all' name.", file=sys.stderr)
+            name = "community_tweets_all"
         if name not in ENDPOINTS:
             from difflib import get_close_matches
             valid = sorted(n for n, endpoint in ENDPOINTS.items()
@@ -523,7 +597,13 @@ class Client:
             raise ValueError(
                 f"'{name}' returns a single object, not a list — "
                 f"call the dedicated method instead of paginate().")
-        self._preflight(name, limit, page_size)
+        local_min_faves = None
+        if name == "search":
+            key, local_min_faves = prepare_search_query(key)
+        self._preflight(
+            name, limit, page_size,
+            full_scan=(local_min_faves is not None and local_min_faves > 0),
+        )
         ps = min(page_size or spec["page_max"], spec["page_max"])
         params = {key_param or spec["key_param"]: key}
         if spec["page_param"]:
@@ -568,15 +648,31 @@ class Client:
                 if cacheable:
                     self.store.put_page(spec["path"], params, resp,
                                         credits=self.page_credits(name, len(items), ps))
+            if name == "verified_followers":
+                # This endpoint's membership is itself the verification fact,
+                # but its user objects omit both verification fields. Attach
+                # the independently known semantic before yielding/persisting;
+                # the cached wire response remains untouched above.
+                items = [dict(item, isBlueVerified=True)
+                         if isinstance(item, dict) else item for item in items]
+            if spec["items"] == "tweets":
+                # Preserve the wire payload while adding a stable public field;
+                # callers should not have to know extendedEntities.media.
+                items = [enrich_tweet_media(item) for item in items]
+            acquired_items = items
             # Persist records so a corpus can be read back for free later.
-            if self.store is not None and items and isinstance(items[0], dict):
+            if (self.store is not None and acquired_items
+                    and isinstance(acquired_items[0], dict)):
                 if spec["items"] == "tweets":
-                    self.store.put_tweets(items)
+                    self.store.put_tweets(acquired_items)
                 elif spec["items"] in ("followers", "followings", "members",
                                        "moderators", "users"):
-                    self.store.put_accounts(items)
+                    self.store.put_accounts(acquired_items)
 
-            if not items:
+            items = (filter_search_tweets(acquired_items, local_min_faves)
+                     if name == "search" else acquired_items)
+
+            if not acquired_items:
                 empty_pages += 1
             else:
                 empty_pages = 0
@@ -590,6 +686,19 @@ class Client:
                 seen += 1
                 if limit and seen >= limit:
                     return
+            if not acquired_items and not has_next and seen == 0:
+                if name in COMMUNITY_COLLECTIONS:
+                    # Empty is legitimate for a real community, so resolve
+                    # the identity only at the otherwise ambiguous boundary.
+                    # NOTE: community_info is an additional paid request for
+                    # every genuinely empty community; this check is not free.
+                    self.community_info(key)
+                elif name in LIST_COLLECTIONS:
+                    raise IncompleteDataError(
+                        f"'{name}' returned no rows for list {key!r}, but this "
+                        "API cannot distinguish an empty list from a private "
+                        "list or one that does not exist. Results are "
+                        "INCOMPLETE, not a confirmed zero.")
             if not has_next:
                 return
             if not next_cursor:
@@ -675,9 +784,14 @@ class Client:
         Use it whenever you have several independent searches."""
         if not queries:
             return []
-        body = {"queries": [
-            q if isinstance(q, dict) else {"query": q, "queryType": query_type}
-            for q in queries]}
+        prepared, local_min_faves = [], []
+        for query in queries:
+            item = (dict(query) if isinstance(query, dict)
+                    else {"query": query, "queryType": query_type})
+            item["query"], threshold = prepare_search_query(item.get("query"))
+            prepared.append(item)
+            local_min_faves.append(threshold)
+        body = {"queries": prepared}
         full_page = self.page_credits("search", 20, 20)
         self._require_budget(len(body["queries"]) * full_page,
                              f"bulk_search batch of {len(body['queries'])} queries")
@@ -702,6 +816,8 @@ class Client:
                 charges.append(full_page)
                 continue
             charges.append(self.page_credits("search", len(tweets), 20))
+            tweets = [enrich_tweet_media(tweet) for tweet in tweets]
+            tweets = filter_search_tweets(tweets, local_min_faves[i])
             # has_next_page is authoritative for "more exists"; a short page is
             # NOT proof of completeness (results can be filtered). Callers that
             # infer from length alone silently lose data.
@@ -726,7 +842,12 @@ class Client:
                          {"community_id": community_id},
                          max_credits=self.page_credits("community_info", 1, 1)) or {}
         self._charge("community_info", 1, 1)   # single record, profile-priced
-        return resp.get("community_info", {})
+        info = resp.get("community_info") or {}
+        if info.get("id") in (None, ""):
+            raise APIError(
+                200, f"community {community_id!r} not found (response id is null)",
+                ENDPOINTS["community_info"]["path"])
+        return info
 
     def check_follow(self, source_user_name, target_user_name) -> dict:
         """Returns {following, followed_by}. NOTE: this endpoint uniquely uses
