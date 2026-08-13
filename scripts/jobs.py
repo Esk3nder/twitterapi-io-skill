@@ -38,6 +38,11 @@ from cohort import Cohort  # noqa: E402
 
 
 def _client(max_usd=5.0, store_path=None):
+    # Validate configuration before opening sqlite, so a missing key cannot
+    # leak a connection while the first-run error crosses the CLI boundary.
+    if not os.environ.get("TWITTERAPI_IO_KEY"):
+        raise RuntimeError(
+            "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it.")
     store = Store(store_path) if store_path else Store()
     return Client(verbose=False, store=store, max_usd=max_usd)
 
@@ -736,8 +741,8 @@ def main(argv=None):
             s.close()
         return 0
 
-    c = _client(a.max_usd, store_path=a.store)  # one ceiling + chosen cache
     try:
+        c = _client(a.max_usd, store_path=a.store)  # one ceiling + chosen cache
         result = JOBS[a.job](a, c)
         print(json.dumps(result, indent=1, ensure_ascii=False))
     except IncompleteDataError as e:
@@ -749,6 +754,9 @@ def main(argv=None):
     except APIError as e:
         print(f"API error: {e}\nCheck the handle/id exists and that "
               f"TWITTERAPI_IO_KEY is valid.", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
         return 1
     if a.job == "authority" and result.get("complete") is False:
         return 3

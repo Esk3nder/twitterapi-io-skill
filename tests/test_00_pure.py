@@ -6,6 +6,7 @@ store normalisers, member identity, cohort set algebra, cohort versioning +
 drift, and store write concurrency. Cohort/Client construction needs the API
 key in the environment but performs no HTTP here.
 """
+import concurrent.futures
 import threading
 import unittest
 from pathlib import Path
@@ -48,6 +49,15 @@ class TestCostTable(E2ETest):
                          "default page size is the 3x tier")
         self.assertEqual(C.page_credits("search", 20, 20), 300.0,
                          "tweets bill flat 15cr/record")
+
+    def test_fixed_qps_never_reads_delayed_account_balance(self):
+        """Release runs can throttle safely using client-side accounting only."""
+        from twitterapi import Client
+
+        c = Client(api_key="test", verbose=False, qps=5)
+        with mock.patch.object(
+                c, "balance", side_effect=AssertionError("balance read")):
+            self.assertEqual(c.qps, 5)
 
     def test_estimate_conversion(self):
         from twitterapi import Client as C, credits_to_usd
@@ -164,6 +174,13 @@ class TestNormalisers(E2ETest):
         self.assertIsNone(parse_ts("not a date"))
         self.assertIsNone(parse_ts(""))
 
+    def test_parse_ts_iso_z_is_stable_on_python_311(self):
+        from store import parse_ts
+        self.assertEqual(
+            parse_ts("2017-06-27T13:41:42.000000Z"),
+            1_498_570_902,
+        )
+
     def test_member_key_identity(self):
         from store import Store
         self.assertEqual(Store.member_key("123", "alice"), "123",
@@ -218,6 +235,42 @@ class TestPaidGraphReadback(E2ETest):
                     "next_cursor": ""}, credits=2250)
 
         self.assertEqual(s.follower_ids_for("@ALICE"), ["1", "2", "3", "4"])
+
+
+class TestConcurrentStoreReads(E2ETest):
+    def test_cached_reads_are_safe_at_8_16_and_24_workers(self):
+        """Regression: one shared sqlite connection must serialize every read."""
+        s = self.fresh_store("concurrent-reads")
+        self.addCleanup(s.close)
+        path = "/twitter/user/followers_ids"
+        params = {"userName": "alice", "count": 5000, "cursor": ""}
+        page = {"ids": ["1", "2"], "has_next_page": False,
+                "next_cursor": ""}
+        s.put_page(path, params, page, credits=15)
+        s.save_cohort("team", [("1", "alice", 1.0, "test")])
+
+        def read_cached_state(_):
+            for _ in range(50):
+                self.assertEqual(s.get_page(path, params), page)
+                self.assertIsNotNone(s.page_age(path, params))
+                self.assertEqual(len(s.load_cohort("team")), 1)
+                self.assertEqual(len(s.list_cohorts()), 1)
+                self.assertEqual(s.cohort_versions("team"), [1])
+
+        for workers in (8, 16, 24):
+            with self.subTest(workers=workers):
+                errors = []
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=workers) as pool:
+                    futures = [pool.submit(read_cached_state, i)
+                               for i in range(48)]
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                self.assertEqual(errors, [],
+                                 f"{workers} workers raised {errors!r}")
 
 
 class TestPublicCohortConstruction(E2ETest):

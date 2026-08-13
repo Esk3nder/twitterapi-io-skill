@@ -28,6 +28,27 @@ import tempfile
 import time
 import unittest
 
+
+class HonestSkipResult(unittest.TextTestResult):
+    """Add the reasons hidden by unittest's default ``OK (skipped=N)``."""
+
+    def wasSuccessful(self):
+        if self.skipped and not getattr(self, "_skip_summary_emitted", False):
+            self._skip_summary_emitted = True
+            reasons = sorted({reason for _, reason in self.skipped})
+            cause = ("TWITTERAPI_IO_KEY not set — "
+                     if not os.environ.get("TWITTERAPI_IO_KEY") else "")
+            self.stream.writeln(
+                f"SKIP COVERAGE: {len(self.skipped)} skipped — "
+                + cause + " | ".join(reasons))
+        return super().wasSuccessful()
+
+
+# ``python -m unittest tests.test_00_pure`` constructs TextTestRunner before
+# importing this module, but reads resultclass when the run starts. Updating the
+# class default keeps the standard runner/exit semantics and makes skips honest.
+unittest.TextTestRunner.resultclass = HonestSkipResult
+
 SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(SKILL, "scripts")
 if SCRIPTS not in sys.path:

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -17,6 +20,7 @@ class FakeClient:
         self.responses = dict(responses)
         self.spent_credits = 0.0
         self.requests_made = 0
+        self.resolutions = []
 
     @property
     def spent_usd(self):
@@ -38,6 +42,10 @@ class FakeClient:
             Client.page_credits(name, records_in_page, page_size)
             - MIN_REQUEST_CREDITS,
         )
+
+    def _resolve_endpoint_key(self, name, key):
+        self.resolutions.append((name, key))
+        return "879696238953865217"
 
 
 class TestVerifyCoverage(unittest.TestCase):
@@ -76,7 +84,7 @@ class TestVerifyCoverage(unittest.TestCase):
         )
         self.assertEqual(len(verify.QUICK_ENDPOINTS), 9)
 
-    def test_probe_params_use_minimum_pages_and_preserve_known_f25(self):
+    def test_probe_params_use_minimum_pages_and_public_timeline_handle(self):
         fixtures = {"user_id": "123"}
 
         self.assertEqual(
@@ -92,11 +100,47 @@ class TestVerifyCoverage(unittest.TestCase):
         self.assertEqual(
             verify.probe_params("tweet_timeline", fixtures)["userId"],
             verify.TIMELINE_HANDLE,
-            "F23 must expose F25 rather than silently substituting a numeric id",
+            "the verifier must enter through the public handle contract",
+        )
+
+    def test_contract_sweep_uses_the_client_timeline_resolver(self):
+        client = FakeClient({
+            "tweet_timeline": {
+                "data": {"tweets": [{"id": "1"}]},
+                "has_next_page": False,
+                "next_cursor": "",
+            },
+        })
+
+        failures = verify.check_contracts(
+            client, {"response_contracts": {}}, ["tweet_timeline"])
+
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            client.resolutions,
+            [("tweet_timeline", verify.TIMELINE_HANDLE)],
         )
 
 
 class TestVerifyFailures(unittest.TestCase):
+    def test_unittest_summary_names_missing_key_skips(self):
+        env = dict(os.environ)
+        env.pop("TWITTERAPI_IO_KEY", None)
+        run = subprocess.run(
+            [sys.executable, "-m", "unittest", "tests.test_00_pure"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertRegex(
+            run.stderr,
+            r"SKIP COVERAGE: 6 skipped .*TWITTERAPI_IO_KEY not set",
+        )
+
     def test_contract_failure_is_counted_and_does_not_stop_later_probes(self):
         names = ["articles", "tweets_by_ids"]
         client = FakeClient({

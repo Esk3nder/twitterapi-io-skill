@@ -517,7 +517,11 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.cmd == "history" and not (args.user or args.query):
         p.error("history needs a USER or --query")
-    return args.func(args)
+    try:
+        return args.func(args)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

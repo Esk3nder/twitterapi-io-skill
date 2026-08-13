@@ -269,6 +269,89 @@ class TestBulkSearchInvariants(E2ETest):
 
 
 class TestPaginationInvariants(E2ETest):
+    def test_paid_articles_survive_a_later_api_failure_as_flagged_partial(self):
+        """F24: a broken continuation must not destroy already-paid articles."""
+        from twitterapi import APIError
+
+        first = [{"id": str(i)} for i in range(12)]
+        second = [{"id": "12"}]
+        c = scripted_client(raw=[
+            {"data": {"articles": first}, "has_next_page": True,
+             "next_cursor": "page-2"},
+            {"data": {"articles": second}, "has_next_page": True,
+             "next_cursor": "page-3"},
+            APIError(200, "Failed to get user articles", "/twitter/user/articles"),
+        ])
+        err = io.StringIO()
+
+        stream = c.paginate("articles", "trq212")
+        with contextlib.redirect_stderr(err):
+            articles = list(stream)
+
+        self.assertEqual(len(articles), 13)
+        self.assertFalse(stream.complete)
+        self.assertIn("failed to get user articles", stream._warning.lower())
+        self.assertIn("partial", stream._warning.lower())
+        self.assertIn("stopped", err.getvalue().lower())
+
+    def test_paid_articles_survive_repeated_empty_continuations(self):
+        """F24: has_next_page lies after 13 rows end as partial, not an error."""
+        first = [{"id": str(i)} for i in range(12)]
+        pages = [
+            {"data": {"articles": first}, "has_next_page": True,
+             "next_cursor": "page-2"},
+            {"data": {"articles": [{"id": "12"}]}, "has_next_page": True,
+             "next_cursor": "page-3"},
+            {"data": {"articles": []}, "has_next_page": True,
+             "next_cursor": "page-4"},
+            {"data": {"articles": []}, "has_next_page": True,
+             "next_cursor": "page-5"},
+        ]
+        c = scripted_client(raw=pages)
+        stream = c.paginate("articles", "trq212")
+
+        self.assertEqual(len(list(stream)), 13)
+        self.assertFalse(stream.complete)
+        self.assertIn("2 empty pages", stream._warning)
+
+    def test_first_page_api_failure_still_raises(self):
+        """F24: no usable data means the underlying failure remains fatal."""
+        from twitterapi import APIError
+
+        c = scripted_client(raw=[
+            APIError(200, "Failed to get user articles", "/twitter/user/articles"),
+        ])
+        stream = c.paginate("articles", "nobody")
+
+        with self.assertRaises(APIError):
+            list(stream)
+
+    def test_tweet_timeline_resolves_handle_but_preserves_numeric_ids(self):
+        """F25: the public paginator accepts handles like neighbouring endpoints."""
+        timeline = {
+            "data": {"tweets": [tweet("one", 1_700_000_000)]},
+            "has_next_page": False,
+            "next_cursor": "",
+        }
+        by_handle = scripted_client(raw=[
+            {"data": {"id": "879696238953865217"}},
+            timeline,
+        ])
+
+        self.assertEqual(len(list(by_handle.paginate(
+            "tweet_timeline", "lydiahallie", limit=1))), 1)
+        self.assertEqual(by_handle.raw_calls[0][1], "/twitter/user/info")
+        self.assertEqual(by_handle.raw_calls[0][2]["userName"], "lydiahallie")
+        self.assertEqual(
+            by_handle.raw_calls[1][2]["userId"], "879696238953865217")
+
+        by_id = scripted_client(raw=[timeline])
+        self.assertEqual(len(list(by_id.paginate(
+            "tweet_timeline", "879696238953865217", limit=1))), 1)
+        self.assertEqual(len(by_id.raw_calls), 1)
+        self.assertEqual(by_id.raw_calls[0][2]["userId"],
+                         "879696238953865217")
+
     def test_store_path_is_coerced_before_nonempty_page_write_through(self):
         """A path-valued store must not crash only after a paid response."""
         path = self.store_path("client-path-store")
@@ -424,8 +507,8 @@ class TestPaginationInvariants(E2ETest):
         self.assertEqual(len(c.raw_calls), 3,
                          "a duplicate must not satisfy the caller's unique limit")
 
-    def test_nonadvancing_pagination_is_incomplete_not_success(self):
-        """Missing or repeated cursors cannot silently terminate a paid crawl."""
+    def test_nonadvancing_pagination_returns_flagged_paid_frontier(self):
+        """Missing/repeated cursors preserve rows without claiming completeness."""
         cases = {
             "missing": [
                 {"tweets": [tweet("1", 104)], "has_next_page": True,
@@ -441,8 +524,11 @@ class TestPaginationInvariants(E2ETest):
         for label, pages in cases.items():
             with self.subTest(label=label):
                 c = scripted_client(raw=pages)
-                with self.assertRaises(RuntimeError):
-                    list(c.paginate("search", "from:alpha"))
+                stream = c.paginate("search", "from:alpha")
+                got = list(stream)
+                self.assertGreater(len(got), 0)
+                self.assertFalse(stream.complete)
+                self.assertIn("partial", stream._warning.lower())
 
 
 class TestCorpusInvariants(E2ETest):
@@ -563,7 +649,8 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         store = object()
         client = object()
         output = io.StringIO()
-        with mock.patch.object(jobs, "Store", return_value=store) as store_type, \
+        with mock.patch.dict(jobs.os.environ, {"TWITTERAPI_IO_KEY": "test"}), \
+             mock.patch.object(jobs, "Store", return_value=store) as store_type, \
              mock.patch.object(jobs, "Client", return_value=client) as client_type, \
              mock.patch.dict(jobs.JOBS, {
                  "brief": lambda args, shared: {"shared": shared is client},
@@ -915,6 +1002,29 @@ class TestHistoryHonesty(E2ETest):
 
 
 class TestJobsCliContracts(E2ETest):
+    def test_missing_key_is_clean_at_all_cli_boundaries(self):
+        """First-run setup errors must be one message, never a traceback."""
+        import jobs
+        import realtime
+        import workflows
+
+        message = "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it."
+        cases = [
+            (jobs, ["brief", "openai", "--store",
+                    self.store_path("missing-key-cli")]),
+            (workflows, ["audience", "openai", "--limit", "1"]),
+            (realtime, ["rules", "list"]),
+        ]
+        for module, argv in cases:
+            with self.subTest(module=module.__name__), \
+                 mock.patch.object(module, "Client", side_effect=RuntimeError(message)), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = module.main(argv)
+
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(err.getvalue().strip(), message)
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_sample_limits_authority_cohort(self):
         """The authority refusal advice must expose a working shrink knob."""
         import jobs

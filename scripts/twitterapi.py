@@ -72,7 +72,8 @@ ENDPOINTS = {
         items="tweets", items_in="data", page_param=None, page_max=20),
     "tweet_timeline": dict(
         path="/twitter/user/tweet_timeline", key_param="userId",
-        items="tweets", items_in="data", page_param=None, page_max=20),
+        items="tweets", items_in="data", page_param=None, page_max=20,
+        key_resolver="user_id"),
     "mentions": dict(
         path="/twitter/user/mentions", key_param="userName",
         items="tweets", items_in="root", page_param=None, page_max=20),
@@ -226,6 +227,23 @@ class IncompleteDataError(RuntimeError):
     """The API indicated more data exists but the client cannot retrieve it safely."""
 
 
+class PaginationStream:
+    """Single-use iterator with explicit completeness metadata.
+
+    A later page can fail after earlier records have already been retrieved and
+    billed. Iteration then ends with ``complete=False`` and ``_warning`` set,
+    preserving the usable records without presenting them as exhaustive.
+    """
+
+    def __init__(self):
+        self.complete = True
+        self._warning = None
+        self._iterator = None
+
+    def __iter__(self):
+        return self._iterator
+
+
 def credits_to_usd(c: float) -> float:
     return c / CREDITS_PER_USD
 
@@ -272,7 +290,7 @@ def _warn_if_facts_stale():
 
 class Client:
     def __init__(self, api_key=None, timeout=45, max_usd=None, verbose=True,
-                 store=None, cache_max_age=None):
+                 store=None, cache_max_age=None, qps=None):
         if isinstance(store, (str, os.PathLike)):
             # Accept the same path-oriented store contract as the CLIs, but
             # resolve it before any request can be sent and later fail during
@@ -294,7 +312,12 @@ class Client:
         self.spent_credits = 0.0
         self.saved_credits = 0.0          # credits NOT spent thanks to cache hits
         self._last_call = 0.0
-        self._qps = None
+        configured_qps = qps if qps is not None else os.environ.get(
+            "TWITTERAPI_IO_QPS")
+        self._qps = float(configured_qps) if configured_qps is not None else None
+        if self._qps is not None and self._qps <= 0:
+            raise ValueError("qps must be greater than zero")
+        self._fixed_qps = self._qps is not None
         self._qps_checked_at = 0
         self._lock = threading.Lock()
         _warn_if_facts_stale()
@@ -307,9 +330,14 @@ class Client:
 
     @property
     def qps(self) -> float:
-        """Real QPS ceiling, derived from balance. The advertised 200 req/s is
-        marketing copy; measured ceiling is 20. Re-checked periodically because
-        a falling balance drops you down the ladder mid-crawl."""
+        """Real QPS ceiling, fixed explicitly or derived from balance.
+
+        The advertised 200 req/s is marketing copy; measured ceiling is 20.
+        Explicit ``qps=`` (or ``TWITTERAPI_IO_QPS``) avoids balance reads; the
+        derived mode re-checks because a falling balance changes the ladder.
+        """
+        if self._fixed_qps:
+            return self._qps
         if self._qps is None or self.requests_made - self._qps_checked_at >= 500:
             try:
                 bal = self.balance()
@@ -577,7 +605,17 @@ class Client:
         """Yield records from a listing endpoint.
 
         Handles both envelope shapes, charges each page against the cumulative
-        ceiling, and refuses to loop when the cursor stops advancing."""
+        ceiling, and refuses to loop when the cursor stops advancing. The
+        returned stream exposes ``complete`` and ``_warning`` after iteration.
+        """
+        stream = PaginationStream()
+        stream._iterator = self._paginate_records(
+            stream, name, key, limit=limit, extra=extra, page_size=page_size,
+            key_param=key_param)
+        return stream
+
+    def _paginate_records(self, stream, name, key, *, limit=None, extra=None,
+                          page_size=None, key_param=None):
         if name == "community_search":
             print("[twitterapi] WARNING: 'community_search' returns tweets, "
                   "not communities or community IDs; use the explicit "
@@ -600,6 +638,7 @@ class Client:
         local_min_faves = None
         if name == "search":
             key, local_min_faves = prepare_search_query(key)
+        key = self._resolve_endpoint_key(name, key)
         self._preflight(
             name, limit, page_size,
             full_scan=(local_min_faves is not None and local_min_faves > 0),
@@ -622,32 +661,40 @@ class Client:
             params["cursor"] = cursor
             cached = (self.store.get_page(spec["path"], params, self.cache_max_age)
                       if cacheable else None)
-            if cached is not None:
-                resp = cached
-                items, has_next, next_cursor = self._unpack(resp, spec)
-                # Cache hit = no API call: don't charge, record what we avoided.
-                self.cache_hits += 1
-                self.saved_credits += self.page_credits(name, len(items), ps)
-                # Track HOW OLD the served data is. A follow graph cached
-                # indefinitely will answer "who follows X" with last year's
-                # snapshot, free and instantly, and look identical to a fresh
-                # crawl. Age must be visible or the caller cannot tell.
-                age = self.store.page_age(spec["path"], params)
-                if age is not None:
-                    self.oldest_cache_age = max(self.oldest_cache_age or 0, age)
-            else:
-                # The page has a known maximum. Reserve against that bound,
-                # not the hoped-for record count, or a terminal full page can
-                # cross the caller's ceiling and still return as "complete".
-                self._require_budget(self.page_credits(name, ps, ps),
-                                     f"next '{name}' page")
-                resp = self._raw("GET", spec["path"], params,
-                                 max_credits=self.page_credits(name, ps, ps))
-                items, has_next, next_cursor = self._unpack(resp, spec)
-                self._charge(name, len(items), ps)
-                if cacheable:
-                    self.store.put_page(spec["path"], params, resp,
-                                        credits=self.page_credits(name, len(items), ps))
+            try:
+                if cached is not None:
+                    resp = cached
+                    items, has_next, next_cursor = self._unpack(resp, spec)
+                    # Cache hit = no API call: don't charge, record what we avoided.
+                    self.cache_hits += 1
+                    self.saved_credits += self.page_credits(name, len(items), ps)
+                    # Track HOW OLD the served data is. A follow graph cached
+                    # indefinitely will answer "who follows X" with last year's
+                    # snapshot, free and instantly, and look identical to a fresh
+                    # crawl. Age must be visible or the caller cannot tell.
+                    age = self.store.page_age(spec["path"], params)
+                    if age is not None:
+                        self.oldest_cache_age = max(self.oldest_cache_age or 0, age)
+                else:
+                    # The page has a known maximum. Reserve against that bound,
+                    # not the hoped-for record count, or a terminal full page can
+                    # cross the caller's ceiling and still return as "complete".
+                    self._require_budget(self.page_credits(name, ps, ps),
+                                         f"next '{name}' page")
+                    resp = self._raw("GET", spec["path"], params,
+                                     max_credits=self.page_credits(name, ps, ps))
+                    items, has_next, next_cursor = self._unpack(resp, spec)
+                    self._charge(name, len(items), ps)
+                    if cacheable:
+                        self.store.put_page(
+                            spec["path"], params, resp,
+                            credits=self.page_credits(name, len(items), ps))
+            except (APIError, IncompleteDataError, urllib.error.URLError,
+                    TimeoutError) as exc:
+                if not seen:
+                    raise
+                self._mark_partial(stream, name, seen, str(exc))
+                return
             if name == "verified_followers":
                 # This endpoint's membership is itself the verification fact,
                 # but its user objects omit both verification fields. Attach
@@ -702,17 +749,28 @@ class Client:
             if not has_next:
                 return
             if not next_cursor:
-                raise IncompleteDataError(
-                    f"'{name}' asserted has_next_page but returned no cursor "
-                    f"after {seen:,} unique records; results are INCOMPLETE.")
+                message = (f"'{name}' asserted has_next_page but returned no "
+                           f"cursor after {seen:,} unique records; results are "
+                           "INCOMPLETE.")
+                if not seen:
+                    raise IncompleteDataError(message)
+                self._mark_partial(stream, name, seen, message)
+                return
             if empty_pages >= 2:
-                raise IncompleteDataError(
-                    f"'{name}' returned {empty_pages} empty pages while asserting "
-                    f"more data; results are INCOMPLETE.")
+                message = (f"'{name}' returned {empty_pages} empty pages while "
+                           "asserting more data; results are INCOMPLETE.")
+                if not seen:
+                    raise IncompleteDataError(message)
+                self._mark_partial(stream, name, seen, message)
+                return
             if next_cursor in seen_cursors:
-                raise IncompleteDataError(
-                    f"'{name}' repeated cursor {next_cursor!r} after {seen:,} "
-                    f"unique records; refusing a paid loop. Results are INCOMPLETE.")
+                message = (f"'{name}' repeated cursor {next_cursor!r} after "
+                           f"{seen:,} unique records; refusing a paid loop. "
+                           "Results are INCOMPLETE.")
+                if not seen:
+                    raise IncompleteDataError(message)
+                self._mark_partial(stream, name, seen, message)
+                return
             # Ceiling is checked here, after this page has been yielded, so the
             # caller keeps every record they were charged for.
             if self._over_ceiling():
@@ -723,6 +781,30 @@ class Client:
                     f"valid and paid for. Raise max_usd to continue.")
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+
+    def _resolve_endpoint_key(self, name, key):
+        """Translate a public endpoint key into the API's wire-level key."""
+        spec = ENDPOINTS[name]
+        if spec.get("key_resolver") != "user_id":
+            return key
+        value = str(key or "").strip().lstrip("@")
+        if value.isdigit():
+            return value
+        profile = self.user_info(value)
+        user_id = profile.get("id") if isinstance(profile, dict) else None
+        if user_id in (None, ""):
+            raise IncompleteDataError(
+                f"could not resolve handle {key!r} to the numeric userId "
+                f"required by '{name}'")
+        return str(user_id)
+
+    @staticmethod
+    def _mark_partial(stream, name, seen, detail):
+        stream.complete = False
+        stream._warning = (
+            f"PARTIAL: '{name}' stopped after {seen:,} usable, paid records: "
+            f"{detail}")
+        print(f"[twitterapi] STOPPED: {stream._warning}", file=sys.stderr)
 
     @staticmethod
     def _item_identity(item):

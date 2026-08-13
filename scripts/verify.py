@@ -230,6 +230,10 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
             print(f"  FAIL   {name:22s} probe configuration: {str(e)[:60]}")
             continue
         try:
+            if spec.get("key_resolver"):
+                key_param = spec["key_param"]
+                params[key_param] = c._resolve_endpoint_key(
+                    name, params[key_param])
             resp = c._raw("GET", spec["path"], params)
         except APIError as e:
             # A failed request is NOT contract drift. Reporting "the API

@@ -516,13 +516,14 @@ class Store:
         return version
 
     def load_cohort(self, name, version=None):
-        if version is None:
-            r = self.db.execute(
-                "SELECT MAX(version) v FROM cohort_meta WHERE name=?", (name,)).fetchone()
-            version = r["v"]
-            if version is None:
-                return []
         with self._wlock:               # see get_page: reads need it too
+            if version is None:
+                r = self.db.execute(
+                    "SELECT MAX(version) v FROM cohort_meta WHERE name=?",
+                    (name,)).fetchone()
+                version = r["v"]
+                if version is None:
+                    return []
             return [dict(r) for r in self.db.execute(
                 "SELECT * FROM cohorts WHERE name=? AND version=? ORDER BY weight DESC",
                 (name, version))]

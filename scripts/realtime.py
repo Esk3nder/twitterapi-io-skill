@@ -276,7 +276,11 @@ def main(argv=None):
     s.add_argument("--seconds", type=int, help="stop after N seconds")
 
     a = p.parse_args(argv)
-    c = Client(verbose=False)
+    try:
+        c = Client(verbose=False)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
 
     if a.cmd == "rules":
         try:

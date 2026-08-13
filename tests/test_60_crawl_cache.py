@@ -17,6 +17,31 @@ from tests.e2e_base import E2ETest, record_charges, require_key
 
 
 class TestFollowerCrawlAndCache(E2ETest):
+    def test_50_profile_estimate_is_within_five_percent_of_actual(self):
+        """A real tiered-price crawl guards estimate() against flat-rate drift."""
+        require_key()
+        from twitterapi import Client
+
+        page_size = 20
+        limit = 50
+        c = self.track(Client(verbose=False, max_usd=0.01,
+                              store=self.fresh_store("estimate_accuracy")))
+        predicted = c.estimate("followers", limit, page_size=page_size)
+        self.repro(
+            "list(Client().paginate('followers', 'jack', limit=50, page_size=20))")
+
+        profiles = list(c.paginate(
+            "followers", "jack", limit=limit, page_size=page_size))
+        actual = c.spent_usd
+        relative_error = abs(predicted - actual) / actual
+        self.log(f"page_size={page_size} predicted=${predicted:.5f} "
+                 f"actual=${actual:.5f} error={relative_error:.2%}")
+
+        self.assertEqual(len(profiles), limit)
+        self.assertLessEqual(
+            relative_error, 0.05,
+            f"estimate error {relative_error:.2%} exceeds stated 5% tolerance")
+
     def test_10k_ids_two_pages_accounting_then_cache_replay(self):
         require_key()
         from twitterapi import Client, ENDPOINTS
@@ -70,6 +95,50 @@ class TestFollowerCrawlAndCache(E2ETest):
                          "saved_credits must mirror what crawl 1 paid")
         self.assertEqual(ids1, ids2,
                          "cached replay must yield the IDENTICAL id sequence")
+
+
+class TestLiveEndpointRegressions(E2ETest):
+    def test_articles_returns_all_13_paid_rows_with_honest_completeness(self):
+        """F24 live: @trq212 has articles, unlike the old zero-row probe."""
+        require_key()
+        from twitterapi import Client
+
+        c = self.track(Client(verbose=False, max_usd=0.02))
+        self.repro("list(Client().paginate('articles', 'trq212'))")
+        stream = c.paginate("articles", "trq212")
+        articles = list(stream)
+        self.log(f"articles={len(articles)} complete={stream.complete} "
+                 f"warning={stream._warning!r} requests={c.requests_made} "
+                 f"spent={c.spent_credits}")
+
+        self.assertEqual(len(articles), 13)
+        if not stream.complete:
+            self.assertIn("partial", stream._warning.lower())
+
+    def test_tweet_timeline_handle_matches_numeric_id(self):
+        """F25 live: the public handle contract returns the numeric-ID timeline."""
+        require_key()
+        from twitterapi import Client
+
+        handle_client = self.track(Client(verbose=False, max_usd=0.01))
+        id_client = self.track(Client(verbose=False, max_usd=0.01))
+        handle_rows = list(handle_client.paginate(
+            "tweet_timeline", "lydiahallie", limit=20))
+        id_rows = list(id_client.paginate(
+            "tweet_timeline", "879696238953865217", limit=20))
+        handle_ids = [str(tweet.get("id")) for tweet in handle_rows]
+        numeric_ids = [str(tweet.get("id")) for tweet in id_rows]
+        self.log(f"handle={len(handle_ids)} numeric={len(numeric_ids)} "
+                 f"handle_requests={handle_client.requests_made} "
+                 f"numeric_requests={id_client.requests_made}")
+
+        self.assertEqual(len(handle_ids), 20)
+        self.assertEqual(len(numeric_ids), 20)
+        self.assertGreaterEqual(
+            len(set(handle_ids) & set(numeric_ids)), 19,
+            "sequential live calls may straddle one new tweet, but must resolve "
+            "to the same account timeline",
+        )
 
 
 class TestLastTweetsPaginationTrap(E2ETest):
