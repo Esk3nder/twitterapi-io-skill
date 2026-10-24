@@ -12,6 +12,8 @@ import os
 import sys
 from pathlib import Path
 
+from twitterapi import UsageError  # noqa: F401  (re-exported for the CLIs)
+
 VERSION = "1.0.0"
 TEXT_LIMIT = 800
 TEXT_FIELDS = frozenset({"text", "description", "bio", "alt_text"})
@@ -44,8 +46,6 @@ RULE_FIELDS = {
 }
 
 
-class UsageError(ValueError):
-    """Invalid invocation detected before any dependency call."""
 
 
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
@@ -65,23 +65,52 @@ def error(error_type: str, message: str, command: str, *help_lines: str) -> dict
     }
 
 
+def emit_line(value) -> None:
+    """One single-line JSON document. Streaming commands print JSON Lines, so
+    a summary or error that follows records must not span several lines."""
+    print(json.dumps(value, ensure_ascii=False))
+
+
+def classify(exc, command: str):
+    """The exit-code contract, in one place: (error type, exit code, help).
+
+    2 = usage, refusal, or setup; 1 = API, runtime, or internal failure."""
+    from twitterapi import (APIError, CostLimitExceeded, IncompleteDataError,
+                            SetupError)
+    if isinstance(exc, SetupError):
+        return "setup", 2, "Set `TWITTERAPI_IO_KEY` in the environment and rerun"
+    if isinstance(exc, UsageError):
+        return "usage", 2, f"Run `{command} --help` for valid arguments"
+    if isinstance(exc, CostLimitExceeded):
+        return ("refusal", 2,
+                "Raise `--max-usd <amount>` or narrow the request, then rerun")
+    if isinstance(exc, (APIError, IncompleteDataError)):
+        # IncompleteDataError reaching the boundary: the upstream response
+        # could not be proved complete or well-formed, an API contract failure.
+        return "api", 1, "Check the handle or ID and `TWITTERAPI_IO_KEY`, then rerun"
+    if isinstance(exc, (OSError, RuntimeError)):
+        return "runtime", 1, "Check network access and the API status, then rerun"
+    return ("internal", 1,
+            f"Rerun `{command} --help`; if the failure persists, report this error")
+
+
 def run_cli(command: str, function, argv=None) -> int:
-    """Catch unexpected CLI failures at one shared structured-output boundary."""
+    """The one structured-output boundary for every CLI: any exception that
+    escapes a command becomes a single-line JSON error with its contract exit
+    code. A streaming command may already have printed JSON Lines records, so
+    the error is one line. An exception carrying `spend` reports it."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and not args[0].startswith("-"):
+        command = f"{command} {args[0]}"
     try:
         return function(argv)
     except Exception as exc:
-        kind = "runtime" if isinstance(exc, OSError) else "internal"
-        message = str(exc) or repr(exc)
-        help_line = (
-            "Check network access, credentials, and filesystem permissions, then rerun"
-            if kind == "runtime" else
-            f"Rerun `{command} --help`; if the failure persists, report this error"
-        )
-        # One line: a streaming command may already have printed JSON Lines
-        # records, and an indented document would break the stream.
-        print(json.dumps(error(kind, message, command, help_line),
-                         ensure_ascii=False))
-        return 1
+        kind, code, help_line = classify(exc, command)
+        body = error(kind, str(exc) or repr(exc), command, help_line)
+        if getattr(exc, "spend", None):
+            body["spend"] = exc.spend
+        emit_line(body)
+        return code
 
 
 def parse_fields(requested: str | None, schema: dict, command: str,
@@ -264,11 +293,11 @@ def display_path(path) -> str:
 def dashboard(script: str, description: str, *, store_path=None,
               cohort_limit: int = 5) -> dict:
     import sqlite3
-    from store import DEFAULT_DB
+    from store import DEFAULT_DB, table_stats
     path = os.path.abspath(os.path.expanduser(store_path or DEFAULT_DB))
     stats = {"pages": 0, "accounts": 0, "tweets": 0, "cohorts": 0,
              "cohort_members": 0, "db_bytes": 0,
-             "credits_cached": 0, "usd_saved_on_rerun": 0.0}
+             "credits_cached": 0, "usd_saved_on_rerun": 0.0}   # no file yet
     cohorts = []
     if os.path.exists(path):
         # mode=ro, NOT immutable=1. Read-only is what the migration-safety
@@ -282,27 +311,8 @@ def dashboard(script: str, description: str, *, store_path=None,
         db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         try:
-            tables = {row[0] for row in db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-            # "cohorts" counts saved VERSIONS; "cohort_members" counts the rows
-            # that actually make a store big. A real store reported cohorts=2
-            # while holding 421,578 member rows, so growth was invisible in
-            # this dashboard — the one place a user looks. db_bytes answers
-            # the underlying question directly.
-            mapping = {"pages": "pages", "accounts": "accounts", "tweets": "tweets",
-                       "cohorts": "cohort_meta", "cohort_members": "cohorts"}
-            for key, table in mapping.items():
-                if table in tables:
-                    stats[key] = db.execute(
-                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            stats["db_bytes"] = (db.execute("PRAGMA page_count").fetchone()[0]
-                                 * db.execute("PRAGMA page_size").fetchone()[0])
-            if "pages" in tables:
-                stats["credits_cached"] = db.execute(
-                    "SELECT COALESCE(SUM(credits),0) FROM pages").fetchone()[0]
-                stats["usd_saved_on_rerun"] = round(
-                    stats["credits_cached"] / 100_000, 4)
-            if "cohort_meta" in tables:
+            stats = table_stats(db)
+            if stats["cohorts"]:            # 0 when cohort_meta is absent
                 cohorts = [dict(row) for row in db.execute(
                     "SELECT name, version, size, created_at FROM cohort_meta "
                     "ORDER BY created_at DESC")]

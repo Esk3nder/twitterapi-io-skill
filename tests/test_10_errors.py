@@ -12,7 +12,6 @@ Verifies the three documented error surfaces against the live API:
     removal and fails loudly — that would mean a monitoring subscription
     appeared on the account.
 """
-import json
 import unittest
 
 from tests.e2e_base import E2ETest, require_key

@@ -7,7 +7,6 @@ import json
 import os
 import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -58,24 +57,75 @@ class TestJsonBoundary(unittest.TestCase):
         self.assertIn("unknown field secret", str(cm.exception))
         self.assertIn("valid fields", str(cm.exception))
 
-    def test_emit_is_json_on_stdout(self):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            axi.emit({"ok": True})
-        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
 
-    def test_unexpected_runtime_failure_is_structured(self):
-        def fail(_argv):
-            raise OSError("DNS unavailable")
 
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            rc = axi.run_cli("tool.py", fail, [])
-        body = json.loads(output.getvalue())
-        self.assertEqual(rc, 1)
-        self.assertEqual(body["error"]["type"], "runtime")
-        self.assertIn("DNS unavailable", body["error"]["message"])
-        self.assertTrue(body["help"])
+class TestExitContract(unittest.TestCase):
+    """The one CLI boundary: 2 = usage, refusal, or setup; 1 = API, runtime,
+    or internal. Every failure is ONE JSON line on stdout with a help line."""
+
+    def test_every_failure_kind_maps_to_its_type_and_exit_code(self):
+        from twitterapi import (APIError, CostLimitExceeded,
+                                IncompleteDataError, SetupError)
+        cases = [(SetupError("no key"), "setup", 2),
+                 (axi.UsageError("bad flag"), "usage", 2),
+                 (CostLimitExceeded("over ceiling"), "refusal", 2),
+                 (APIError(500, "boom", "/p"), "api", 1),
+                 (IncompleteDataError("drifted"), "api", 1),
+                 (OSError("DNS unavailable"), "runtime", 1),
+                 (KeyError("bug"), "internal", 1)]
+        for exc, kind, code in cases:
+            def fail(_argv, exc=exc):
+                raise exc
+            output = io.StringIO()
+            with self.subTest(kind=kind, exc=type(exc).__name__), \
+                    contextlib.redirect_stdout(output):
+                rc = axi.run_cli("tool.py", fail, ["sub"])
+            self.assertEqual(rc, code)
+            self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
+            body = json.loads(output.getvalue())
+            self.assertEqual(body["error"]["type"], kind)
+            self.assertEqual(body["error"]["command"], "tool.py sub")
+            self.assertTrue(body["help"])
+
+    def test_missing_key_is_setup_exit_2_for_every_paid_command(self):
+        """Run as real scripts: a class raised from a script's own __main__
+        module is not the class axi.classify imports, so only a subprocess
+        catches that (twitterapi.py --balance exited 1 that way)."""
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as home:
+            store = os.path.join(home, "x.db")
+            cases = [["jobs.py", "brief", "alpha", "--store", store],
+                     ["workflows.py", "history", "alpha", "--store", store],
+                     ["workflows.py", "audience", "alpha", "--limit", "1"],
+                     ["workflows.py", "monitor", "alpha", "--once"],
+                     ["realtime.py", "rules", "list"],
+                     ["realtime.py", "stream", "--seconds", "5"],
+                     ["twitterapi.py", "--balance"],
+                     ["verify.py"]]
+            env = {k: v for k, v in os.environ.items() if k != "TWITTERAPI_IO_KEY"}
+            env["HOME"] = home
+            for script, *argv in cases:
+                with self.subTest(argv=[script, *argv]):
+                    run = subprocess.run(
+                        [sys.executable, os.path.join(SCRIPTS, script), *argv],
+                        capture_output=True, text=True, timeout=30, env=env)
+                    self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+                    self.assertEqual(json.loads(run.stdout)["error"]["type"], "setup")
+                    self.assertNotIn("Traceback", run.stderr)
+
+    def test_help_works_without_a_key(self):
+        import subprocess
+        import sys
+        env = {k: v for k, v in os.environ.items() if k != "TWITTERAPI_IO_KEY"}
+        for argv in (["workflows.py", "--help"], ["workflows.py", "history", "--help"],
+                     ["workflows.py", "monitor", "--help"],
+                     ["realtime.py", "rules", "activate", "--help"]):
+            run = subprocess.run([sys.executable, os.path.join(SCRIPTS, argv[0]),
+                                  *argv[1:]], capture_output=True, text=True,
+                                 timeout=20, env=env)
+            self.assertEqual(run.returncode, 0, (argv, run.stdout, run.stderr))
+            self.assertIn("usage:", run.stdout)
 
 
 class TestArgumentParser(unittest.TestCase):

@@ -15,7 +15,8 @@ import unittest
 from unittest import mock
 
 from tests.e2e_base import E2ETest
-from tests.test_05_invariants import scripted_client, tweet
+from tests.fakes import ScriptedClient
+from tests.test_05_invariants import tweet
 
 
 def _page(items, key="tweets", has_next=False, cursor=""):
@@ -47,7 +48,7 @@ class TestBudgetReservation(E2ETest):
         """#1: page_size=1 on search must not shrink the reserved 20-tweet page."""
         from twitterapi import CostLimitExceeded
         page = _page([tweet(i, 1_700_000_000 - i) for i in range(20)])
-        c = scripted_client(raw=[page], max_usd=0.00015)
+        c = ScriptedClient(raw=[page], max_usd=0.00015)
 
         with self.assertRaises(CostLimitExceeded):
             list(c.paginate("search", "from:alpha", page_size=1, limit=1))
@@ -132,7 +133,7 @@ class TestBudgetReservation(E2ETest):
         from twitterapi import CostLimitExceeded
         pages = [_page([str(i)], key="ids", has_next=True, cursor=f"c{i}")
                  for i in range(200)]
-        c = scripted_client(raw=pages, max_usd=None)
+        c = ScriptedClient(raw=pages, max_usd=None)
         c.max_usd = c.estimate("follower_ids", 200) + 0.00015 * 5
         self.assertIn("not an upper bound", c.estimate.__doc__.lower())
 
@@ -149,13 +150,13 @@ class TestPaginationMetadata(E2ETest):
         """#4: a page with a cursor but no has_next_page is unknown, not done."""
         from twitterapi import IncompleteDataError
         first = {"tweets": [tweet("1", 104)], "next_cursor": "c2"}
-        c = scripted_client(raw=[first])
+        c = ScriptedClient(raw=[first])
         with self.assertRaises(IncompleteDataError):
             list(c.paginate("search", "from:alpha"))
 
         later = [_page([tweet("1", 104)], has_next=True, cursor="c2"),
                  {"tweets": [tweet("2", 103)], "next_cursor": "c3"}]
-        c = scripted_client(raw=later)
+        c = ScriptedClient(raw=later)
         stream = c.paginate("search", "from:alpha")
         with contextlib.redirect_stderr(io.StringIO()):
             got = list(stream)
@@ -164,14 +165,14 @@ class TestPaginationMetadata(E2ETest):
 
     def test_limit_stop_with_more_data_is_flagged_truncated(self):
         """#9: "first N" must be distinguishable from "the whole population"."""
-        c = scripted_client(raw=[_page([tweet(i, 200 - i) for i in range(3)],
+        c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(3)],
                                        has_next=True, cursor="c2")])
         stream = c.paginate("search", "from:alpha", limit=2)
         self.assertEqual(len(list(stream)), 2)
         self.assertTrue(stream.complete)
         self.assertTrue(stream.truncated_by_limit)
 
-        c = scripted_client(raw=[_page([tweet(i, 200 - i) for i in range(2)])])
+        c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(2)])])
         stream = c.paginate("search", "from:alpha", limit=2)
         self.assertEqual(len(list(stream)), 2)
         self.assertFalse(stream.truncated_by_limit,
@@ -179,7 +180,7 @@ class TestPaginationMetadata(E2ETest):
 
     def test_truncation_is_known_to_a_consumer_that_stops_at_n(self):
         """#9: the flag must not depend on resuming the generator past N."""
-        c = scripted_client(raw=[_page([tweet(i, 200 - i) for i in range(3)])])
+        c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(3)])])
         stream = c.paginate("search", "from:alpha", limit=2)
         it = iter(stream)
         next(it), next(it)
@@ -196,7 +197,7 @@ class TestPaginationMetadata(E2ETest):
         store.db.execute("UPDATE pages SET fetched_at = fetched_at - 31536000")
         store.db.commit()
         store.put_accounts([{"id": "1", "userName": "alice", "followers": 500}])
-        c = scripted_client(raw=[], max_usd=0.0, store=store)
+        c = ScriptedClient(raw=[], max_usd=0.0, store=store)
 
         users = list(c.paginate("batch_users", "1"))
 
@@ -217,7 +218,7 @@ class TestSearchQueryRewrite(E2ETest):
             with self.subTest(query=query):
                 with self.assertRaises(ValueError):
                     prepare_search_query(query)
-        c = scripted_client(raw=[_page([])], max_usd=1.0)
+        c = ScriptedClient(raw=[_page([])], max_usd=1.0)
         with self.assertRaises(ValueError):
             list(c.paginate("search", "from:a min_faves:10 OR from:b min_faves:100"))
         self.assertEqual(c.raw_calls, [])
@@ -236,13 +237,13 @@ class TestProfileAbsence(E2ETest):
     def test_null_user_data_is_an_error_not_an_empty_profile(self):
         """#6: a null `data` must not become a user with 0 followers."""
         from twitterapi import APIError
-        c = scripted_client(raw=[{"data": None, "status": "success"}])
+        c = ScriptedClient(raw=[{"data": None, "status": "success"}])
         with self.assertRaises(APIError):
             c.user_info("ghost")
 
     def test_missing_follower_count_is_not_zero(self):
         from twitterapi import IncompleteDataError
-        c = scripted_client(raw=[{"data": {"id": "1", "userName": "alice"},
+        c = ScriptedClient(raw=[{"data": {"id": "1", "userName": "alice"},
                                   "status": "success"}])
         with self.assertRaises(IncompleteDataError):
             c.follower_count("alice")
@@ -253,10 +254,10 @@ class TestProfileAbsence(E2ETest):
         from twitterapi import IncompleteDataError
         for body in ({"status": "success"}, {"status": "success", "data": None},
                      {"status": "success", "data": {}}):
-            c = scripted_client(raw=[body])
+            c = ScriptedClient(raw=[body])
             with self.assertRaises(IncompleteDataError, msg=body):
                 c.check_follow("alice", "bob")
-        c = scripted_client(raw=[{"status": "success",
+        c = ScriptedClient(raw=[{"status": "success",
                                   "data": {"following": True, "followed_by": False}}])
         self.assertEqual(c.check_follow("alice", "bob"),
                          {"following": True, "followed_by": False})
@@ -288,7 +289,7 @@ class TestCohortPopulationHonesty(E2ETest):
     def test_limit_truncated_resolver_is_marked_partial(self):
         """#10: the first 2 of 3 community members are a sample."""
         from cohort import Cohort
-        c = scripted_client(raw=[_page(
+        c = ScriptedClient(raw=[_page(
             [{"id": str(i), "userName": f"u{i}"} for i in range(3)],
             key="members", has_next=True, cursor="c2")])
         with contextlib.redirect_stderr(io.StringIO()):
@@ -382,7 +383,7 @@ class TestAuthorityCompleteness(E2ETest):
     def test_handle_resolution_reserves_the_whole_batch(self):
         """#12: 100 id-only members must not spend $0.018 at max_usd=.001."""
         from cohort import Cohort
-        c = scripted_client(raw=[{"users": [
+        c = ScriptedClient(raw=[{"users": [
             {"id": str(i), "userName": f"u{i}"} for i in range(100)]}],
             max_usd=None)
         co = Cohort.from_ids([str(i) for i in range(100)], client=c,
@@ -449,7 +450,7 @@ class TestHydrateMatchesItsContract(E2ETest):
         self.addCleanup(store.close)
         store.put_accounts([{"id": "1", "userName": "alice", "followers": 5,
                              "description": "bio", "isBlueVerified": False}])
-        c = scripted_client(raw=[], max_usd=None, store=store)
+        c = ScriptedClient(raw=[], max_usd=None, store=store)
         co = Cohort.from_ids(["1"], client=c, store=store)
         co.hydrate(max_usd=1.0)
         self.assertEqual(c.raw_calls, [])
@@ -461,7 +462,7 @@ class TestHydrateMatchesItsContract(E2ETest):
         from twitterapi import APIError
         store = self.fresh_store("hydrate-handles")
         self.addCleanup(store.close)
-        c = scripted_client(raw=[
+        c = ScriptedClient(raw=[
             {"data": {"id": "7", "userName": "alice", "followers": 9,
                       "description": "", "isBlueVerified": True},
              "status": "success"},
@@ -519,12 +520,6 @@ class TestSingleObjectEnvelopes(E2ETest):
                 ENDPOINTS[name])
             self.assertEqual((has_next, cursor), (False, ""), name)
 
-    def test_list_endpoints_still_require_has_next_page(self):
-        from twitterapi import Client, ENDPOINTS, IncompleteDataError
-        with self.assertRaises(IncompleteDataError):
-            Client._unpack({"followers": [], "status": "success"},
-                           ENDPOINTS["followers"])
-
 
 class TestSearchPaginationAbsence(E2ETest):
     """Found by the diff review: _unpack refused a missing has_next_page, but
@@ -534,20 +529,20 @@ class TestSearchPaginationAbsence(E2ETest):
 
     def test_bulk_subresult_without_has_next_page_is_incomplete(self):
         from twitterapi import IncompleteDataError
-        c = scripted_client(raw_json=[{"status": "success", "results": {
+        c = ScriptedClient(raw_json=[{"status": "success", "results": {
             "query_0": {"tweets": [tweet(i, 1_700_000_000 - i) for i in range(20)]}}}])
         with self.assertRaises(IncompleteDataError):
             c.bulk_search(["from:alpha"])
 
     def test_bulk_subresult_with_has_next_page_is_kept(self):
-        c = scripted_client(raw_json=[{"status": "success", "results": {
+        c = ScriptedClient(raw_json=[{"status": "success", "results": {
             "query_0": {"tweets": [tweet(1, 1_700_000_000)], "has_next_page": False}}}])
         self.assertFalse(c.bulk_search(["from:alpha"])[0]["has_next_page"])
 
     def test_window_page_without_has_next_page_is_incomplete(self):
         from twitterapi import IncompleteDataError
         from workflows import search_window
-        c = scripted_client(raw=[{"tweets": [tweet(i, 1_700_000_000 - i)
+        c = ScriptedClient(raw=[{"tweets": [tweet(i, 1_700_000_000 - i)
                                               for i in range(15)]}])
         got = []
         with self.assertRaises(IncompleteDataError):

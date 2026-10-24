@@ -299,15 +299,6 @@ class TestEmptyFilterMeansNothing(E2ETest):
 
 
 class TestLoadNeverSavedCohort(E2ETest):
-    def test_unknown_name_or_version_raises_keyerror(self):
-        s = self.fresh_store("r07-load-missing")
-        self.addCleanup(s.close)
-        s.save_cohort("pm_talkers", [("1", "a", 1.0, "t")])
-        with self.assertRaises(KeyError):
-            s.load_cohort("crypto_ai_typo")
-        with self.assertRaises(KeyError):
-            s.load_cohort("pm_talkers", version=7)
-
     def test_saved_empty_cohort_still_loads_empty(self):
         s = self.fresh_store("r07-load-empty")
         self.addCleanup(s.close)

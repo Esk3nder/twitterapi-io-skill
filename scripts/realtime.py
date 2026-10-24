@@ -19,7 +19,6 @@ UNVERIFIED. Do not present them as tested.
 """
 from __future__ import annotations
 
-import argparse
 import base64
 import json
 import os
@@ -32,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import Client, APIError, IncompleteDataError  # noqa: E402
 from axi import (RULE_FIELDS, TWEET_FIELDS, ArgumentParser, HelpFormatter, add_common_output_flags,
-                 emit, error, fast_version, format_record, prepare_output,
+                 emit, emit_line, error, fast_version, format_record, prepare_output,
                  parse_fields, run_cli, success, UsageError)  # noqa: E402
 
 WS_HOST = "ws.twitterapi.io"
@@ -114,10 +113,10 @@ def _check_interval(interval_seconds):
     try:
         value = float(interval_seconds)
     except (TypeError, ValueError):
-        raise ValueError(f"interval_seconds must be a number, got "
+        raise UsageError(f"interval_seconds must be a number, got "
                          f"{interval_seconds!r}") from None
     if not (INTERVAL_MIN <= value <= INTERVAL_MAX):
-        raise ValueError(f"interval_seconds must be between {INTERVAL_MIN} and "
+        raise UsageError(f"interval_seconds must be between {INTERVAL_MIN} and "
                          f"{INTERVAL_MAX}, got {interval_seconds!r}")
 
 
@@ -139,7 +138,7 @@ def find_rule(rules, rule_id):
     for rule in rules:
         if isinstance(rule, dict) and str(rule.get("rule_id", rule.get("id"))) == str(rule_id):
             return rule
-    raise ValueError(f"rule {rule_id!r} is not in `rules list` for this account")
+    raise UsageError(f"rule {rule_id!r} is not in `rules list` for this account")
 
 
 def update_rule(c: Client, rule_id, tag, value, interval_seconds,
@@ -187,7 +186,7 @@ def toggle_rule(c: Client, rule_id, active, *, tag=None, value=None,
     }
     missing = [name for name, field in fields.items() if field in (None, "")]
     if missing:
-        raise ValueError(
+        raise UsageError(
             f"rule {rule_id!r} reports no current {', '.join(missing)}; pass "
             + ", ".join(f"--{name}" for name in missing) + " explicitly")
     return update_rule(c, rule_id, fields["tag"], fields["value"],
@@ -433,20 +432,9 @@ def _main(argv=None):
 
     a = p.parse_args(argv)
     if a.cmd == "rules" and a.action == "list":
-        try:
-            parse_fields(a.fields, RULE_FIELDS, "realtime.py rules list")
-        except UsageError as exc:
-            emit(error("usage", str(exc), "realtime.py rules list",
-                       "Run `realtime.py rules list --help` for valid fields"))
-            return 2
+        parse_fields(a.fields, RULE_FIELDS, "realtime.py rules list")
     if a.cmd == "stream":
-        schema = dict(TWEET_FIELDS); schema["rule"] = ("rule",)
-        try:
-            parse_fields(a.fields, schema, "realtime.py stream")
-        except UsageError as exc:
-            emit(error("usage", str(exc), "realtime.py stream",
-                       "Run `realtime.py stream --help` for valid fields"))
-            return 2
+        parse_fields(a.fields, dict(TWEET_FIELDS, rule=("rule",)), "realtime.py stream")
     if a.cmd == "rules" and a.action != "list" and not a.confirm:
         emit(error("refusal", f"rules {a.action} changes server-side rule state; "
                    "--confirm is required", f"realtime.py rules {a.action}",
@@ -454,65 +442,41 @@ def _main(argv=None):
         return 2
     command = (f"realtime.py rules {a.action}" if a.cmd == "rules"
                else "realtime.py stream")
-    try:
-        if a.cmd == "rules" and getattr(a, "interval", None) is not None:
-            _check_interval(a.interval)
-        if a.cmd == "stream" and a.seconds is not None and a.seconds < 1:
-            raise ValueError(f"--seconds must be at least 1, got {a.seconds}; "
-                             f"omit it to stream until stopped")
-    except ValueError as exc:
-        emit(error("usage", str(exc), command,
-                   f"Run `{command} --help` for valid inputs"))
-        return 2
-    try:
-        c = Client(verbose=False)
-    except (RuntimeError, ValueError) as e:
-        # Construction sends no request: failure here is configuration.
-        emit(error("setup", str(e), command,
-                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
-        return 2
+    if a.cmd == "rules" and getattr(a, "interval", None) is not None:
+        _check_interval(a.interval)
+    if a.cmd == "stream" and a.seconds is not None and a.seconds < 1:
+        raise UsageError(f"--seconds must be at least 1, got {a.seconds}; "
+                         f"omit it to stream until stopped")
+    c = Client(verbose=False)
 
     if a.cmd == "rules":
-        try:
-            if a.action == "list":
-                rules = list_rules(c)
-                payload = prepare_output(
-                    {"rules": rules}, command="realtime.py rules list",
-                    fields=a.fields, full=a.full, collections={"rules": RULE_FIELDS},
-                    defaults={"rules": ("id", "tag", "value", "active")},
-                    context="for this twitterapi.io account",
-                    help_lines=("Run `realtime.py rules <add|activate|deactivate|delete> --help` for mutations",))
-                emit(success("realtime.py rules list", payload))
-                print(active_rule_warning(c, rules), file=sys.stderr)
-                return 0
-            if a.action == "add":
-                result = {
-                    "rule": add_rule(c, a.tag, a.value, a.interval, confirm=True),
-                    "help": ["Run `realtime.py rules list` to inspect rule state",
-                             "Run `realtime.py rules activate --rule-id <id> --confirm` to activate"]}
-            elif a.action in ("activate", "deactivate"):
-                # add_rule creates a rule INACTIVE (is_effect=0); it only bills
-                # and streams once activated. Without this the CLI could create
-                # a rule it could never turn on, so a user's stream stayed empty.
-                result = {"rule": toggle_rule(
-                    c, a.rule_id, a.action == "activate", tag=a.tag,
-                    value=a.value, interval_seconds=a.interval, confirm=True),
-                    "help": ["Run `realtime.py rules list` to verify current state"]}
-            else:
-                result = {"rule": delete_rule(c, a.rule_id, confirm=True),
-                          "help": ["Run `realtime.py rules list` to verify current state"]}
-        except PermissionError as e:
-            emit(error("refusal", str(e), command,
-                       f"Run `{command} --help` for required confirmation"))
-            return 2
-        except (APIError, IncompleteDataError) as e:
-            emit(error("api", str(e), command,
-                       f"Run `realtime.py rules list`, then rerun `{command}`"))
-            return 1
-        except ValueError as e:
-            emit(error("usage", str(e), command,
-                       f"Run `{command} --help` for valid inputs"))
-            return 2
+        if a.action == "list":
+            rules = list_rules(c)
+            payload = prepare_output(
+                {"rules": rules}, command="realtime.py rules list",
+                fields=a.fields, full=a.full, collections={"rules": RULE_FIELDS},
+                defaults={"rules": ("id", "tag", "value", "active")},
+                context="for this twitterapi.io account",
+                help_lines=("Run `realtime.py rules <add|activate|deactivate|delete> --help` for mutations",))
+            emit(success("realtime.py rules list", payload))
+            print(active_rule_warning(c, rules), file=sys.stderr)
+            return 0
+        if a.action == "add":
+            result = {
+                "rule": add_rule(c, a.tag, a.value, a.interval, confirm=True),
+                "help": ["Run `realtime.py rules list` to inspect rule state",
+                         "Run `realtime.py rules activate --rule-id <id> --confirm` to activate"]}
+        elif a.action in ("activate", "deactivate"):
+            # add_rule creates a rule INACTIVE (is_effect=0); it only bills
+            # and streams once activated. Without this the CLI could create
+            # a rule it could never turn on, so a user's stream stayed empty.
+            result = {"rule": toggle_rule(
+                c, a.rule_id, a.action == "activate", tag=a.tag,
+                value=a.value, interval_seconds=a.interval, confirm=True),
+                "help": ["Run `realtime.py rules list` to verify current state"]}
+        else:
+            result = {"rule": delete_rule(c, a.rule_id, confirm=True),
+                      "help": ["Run `realtime.py rules list` to verify current state"]}
         # Every mutation reports the active-rule count: a rule left active
         # bills whether or not anything consumes it.
         warning = _post_mutation_warning(c)
@@ -523,12 +487,6 @@ def _main(argv=None):
     if a.cmd == "stream":
         return _stream_cli(c, a)
     return 0
-
-
-def _emit_line(doc):
-    """Single-line JSON: stream output is JSON Lines, and a summary or error
-    after records must not span several lines."""
-    print(json.dumps(doc, ensure_ascii=False))
 
 
 def _stream_cli(c, a):
@@ -546,16 +504,16 @@ def _stream_cli(c, a):
         ended_by = "interrupted"
     except (APIError, IncompleteDataError) as e:
         # The active-rule check before connecting failed; nothing streamed.
-        _emit_line(error("api", str(e), "realtime.py stream",
-                         "Run `realtime.py rules list`, then rerun the stream"))
+        emit_line(error("api", str(e), "realtime.py stream",
+                        "Run `realtime.py rules list`, then rerun the stream"))
         return 1
     except OSError as e:
         if "connected_at" not in status:
             # StreamConnectError, or a transport failure in the rule check:
             # no observation window ever started, so this is a failure.
             print(f"[realtime] {e}; {reconnect}", file=sys.stderr)
-            _emit_line(error("runtime", str(e), "realtime.py stream",
-                             f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
+            emit_line(error("runtime", str(e), "realtime.py stream",
+                            f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
             return 1
         if isinstance(e, TimeoutError):
             # A quiet stream is normal (no rule matched anything yet); it ends
@@ -567,8 +525,8 @@ def _stream_cli(c, a):
         else:                           # server close or reset
             print(f"[realtime] {e}; {reconnect}", file=sys.stderr)
             if not state["records"]:
-                _emit_line(error("runtime", str(e), "realtime.py stream",
-                                 f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
+                emit_line(error("runtime", str(e), "realtime.py stream",
+                                f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
                 return 1
             ended_by, detail = "closed", str(e)
 
@@ -588,7 +546,7 @@ def _stream_cli(c, a):
                         if a.seconds else "with no --seconds window requested")),
             "closed": f"the server closed the stream: {detail}",
         }[ended_by]
-    _emit_line(success("realtime.py stream", {
+    emit_line(success("realtime.py stream", {
         "events_count": f"{n} of {n if complete else 'unknown'} total",
         "events_state": (None if n else
                          ("0 matching posts received during the requested stream window"

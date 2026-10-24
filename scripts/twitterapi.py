@@ -126,9 +126,6 @@ ENDPOINTS = {
     "replies_v2": dict(
         path="/twitter/tweet/replies/v2", key_param="tweetId",
         items="tweets", items_in="root", page_param=None, page_max=38),
-    "replies_v1": dict(
-        path="/twitter/tweet/replies/v1", key_param="tweetId",
-        items="tweets", items_in="root", page_param=None, page_max=38),
     # data-wrapped with ROOT pagination — same trap as last_tweets.
     "articles": dict(                       # param is all-lowercase `username`
         path="/twitter/user/articles", key_param="username",
@@ -152,9 +149,6 @@ ENDPOINTS = {
         path="/twitter/spaces/detail", key_param="space_id",
         items=None, items_in="root", page_param=None, page_max=1),
 }
-# Backward-compatible misleading name: alias the canonical spec object so the
-# endpoint cannot drift through two independently edited table entries.
-ENDPOINTS["community_search"] = ENDPOINTS["community_tweets_all"]
 
 # Endpoints whose results are stable enough to cache indefinitely (a follow
 # graph or profile doesn't change between two questions in a session). Content
@@ -234,14 +228,14 @@ def prepare_search_query(query):
     top_clauses = list(_MIN_FAVES.finditer(top))
     any_clauses = len(_ANY_MIN_FAVES.findall(unquoted))
     if any_clauses and len(top_clauses) != any_clauses:
-        raise ValueError(
+        raise UsageError(
             f"min_faves inside a group or negated cannot be enforced exactly "
             f"in {query!r}. The search index filters min_faves on a stale "
             "likes snapshot, so this client moves min_faves out of the query "
             "and checks live likeCount instead, which is exact only for a "
             "top-level AND clause. Split the query into separate searches.")
     if top_clauses and _TOP_LEVEL_OR.search(top):
-        raise ValueError(
+        raise UsageError(
             f"min_faves with a top-level OR in {query!r} cannot be enforced "
             "exactly: each min_faves binds to its own OR branch, and one "
             "global likes threshold would drop tweets that match. Run one "
@@ -279,6 +273,16 @@ class APIError(RuntimeError):
 
 class CostLimitExceeded(RuntimeError):
     pass
+
+
+class UsageError(ValueError):
+    """An invalid request, detected before any API call. The CLI contract
+    maps it to exit 2."""
+
+
+class SetupError(RuntimeError):
+    """The client cannot be configured (no API key, invalid QPS). The CLI
+    contract maps it to exit 2."""
 
 
 class IncompleteDataError(RuntimeError):
@@ -358,16 +362,27 @@ def _warn_if_facts_stale():
 class Client:
     def __init__(self, api_key=None, timeout=45, max_usd=None, verbose=True,
                  store=None, cache_max_age=None, qps=None):
+        # Configuration first: a missing key must fail before a store path is
+        # opened, or the error leaks a sqlite connection.
+        self.key = api_key or os.environ.get("TWITTERAPI_IO_KEY")
+        if not self.key:
+            raise SetupError(
+                "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it.")
+        configured_qps = qps if qps is not None else os.environ.get(
+            "TWITTERAPI_IO_QPS")
+        try:
+            self._qps = (float(configured_qps) if configured_qps is not None
+                         else None)
+        except ValueError:
+            raise SetupError(f"qps must be a number, got {configured_qps!r}") from None
+        if self._qps is not None and self._qps <= 0:
+            raise SetupError("qps must be greater than zero")
         if isinstance(store, (str, os.PathLike)):
             # Accept the same path-oriented store contract as the CLIs, but
             # resolve it before any request can be sent and later fail during
             # paid write-through.
             from store import Store
             store = Store(os.fspath(store))
-        self.key = api_key or os.environ.get("TWITTERAPI_IO_KEY")
-        if not self.key:
-            raise RuntimeError(
-                "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it.")
         self.timeout = timeout
         self.verbose = verbose
         self.max_usd = max_usd            # cumulative ceiling across all calls
@@ -379,11 +394,6 @@ class Client:
         self.spent_credits = 0.0
         self.saved_credits = 0.0          # credits NOT spent thanks to cache hits
         self._last_call = 0.0
-        configured_qps = qps if qps is not None else os.environ.get(
-            "TWITTERAPI_IO_QPS")
-        self._qps = float(configured_qps) if configured_qps is not None else None
-        if self._qps is not None and self._qps <= 0:
-            raise ValueError("qps must be greater than zero")
         self._fixed_qps = self._qps is not None
         self._qps_checked_at = 0
         self._lock = threading.Lock()
@@ -703,7 +713,7 @@ class Client:
             # limit can estimate the number of pages. Make max_usd the explicit
             # scan bound instead of presenting a limit-derived underestimate.
             if self.max_usd is None:
-                raise ValueError(
+                raise UsageError(
                     f"{name} uses a local predicate that may require a full "
                     f"result scan; limit={n_records!r} bounds returned matches, "
                     "not fetched rows. Pass max_usd= to bound paid scan cost.")
@@ -742,11 +752,6 @@ class Client:
 
     def _paginate_records(self, stream, name, key, *, limit=None, extra=None,
                           page_size=None, key_param=None):
-        if name == "community_search":
-            print("[twitterapi] WARNING: 'community_search' returns tweets, "
-                  "not communities or community IDs; use the explicit "
-                  "'community_tweets_all' name.", file=sys.stderr)
-            name = "community_tweets_all"
         if name not in ENDPOINTS:
             from difflib import get_close_matches
             valid = sorted(n for n, endpoint in ENDPOINTS.items()
@@ -1141,7 +1146,7 @@ def main(argv=None):
 
 
 def _main(argv=None):
-    from axi import ArgumentParser, display_path, emit, error, fast_version, success
+    from axi import ArgumentParser, display_path, emit, fast_version, success
     if fast_version(argv):
         return 0
     p = ArgumentParser(description="Inspect the read-only twitterapi.io client")
@@ -1158,12 +1163,8 @@ def _main(argv=None):
     }
     if not args.balance:
         emit(success("twitterapi.py", body)); return 0
-    try:
-        c = Client(verbose=False)
-        credits = c.balance()
-    except RuntimeError as exc:
-        emit(error("runtime", str(exc), "twitterapi.py --balance",
-                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun")); return 1
+    c = Client(verbose=False)
+    credits = c.balance()
     emit(success("twitterapi.py --balance", {
         "balance_credits": credits, "balance_usd": round(credits_to_usd(credits), 2),
         "qps": c.qps}))
@@ -1171,4 +1172,8 @@ def _main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Run through the importable module: run as a script, this file's classes
+    # would be __main__.SetupError etc., which axi.classify (importing
+    # `twitterapi`) would not recognise, so a missing key would exit 1, not 2.
+    import twitterapi
+    raise SystemExit(twitterapi.main())

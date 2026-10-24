@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import E2ETest, HAVE_KEY, SKILL, require_key
+from tests.e2e_base import E2ETest, SKILL
 
 
 class TestCostTable(E2ETest):
@@ -328,22 +328,17 @@ class TestDocumentationContracts(E2ETest):
     def _read(name):
         return Path(SKILL, name).read_text()
 
-    def test_skill_and_readme_present_one_library_story(self):
-        """The skill must not forbid the library surface the README teaches."""
-        skill = self._read("SKILL.md")
-        self.assertNotIn("Run the workflows; do not hand-roll requests", skill)
-        self.assertIn("library", skill.lower())
-
     def test_composition_example_preserves_the_injected_store(self):
         """Following the skill example must not silently open the home cache."""
         skill = self._read("SKILL.md")
         self.assertIn('Cohort.load("pm_talkers", client=c, store=s)', skill)
         self.assertIn('Cohort.load("crypto_ai", client=c, store=s)', skill)
 
-    def test_readme_describes_only_paginated_endpoints(self):
-        """Four single-object methods must not be advertised through paginate()."""
-        readme = self._read("README.md")
-        self.assertIn("one of the 27 paginated endpoints", readme)
+    def test_readme_paginated_endpoint_count_matches_the_table(self):
+        """The README's count must follow ENDPOINTS, not a stale literal."""
+        from twitterapi import ENDPOINTS
+        paged = sum(1 for spec in ENDPOINTS.values() if spec["items"] is not None)
+        self.assertIn(f"one of the {paged} paginated endpoints", self._read("README.md"))
 
     def test_readme_scopes_cached_tweets_and_two_pass_page_caps(self):
         """Cached authorship and per-pass caps must not imply broader coverage."""
@@ -361,15 +356,13 @@ class TestDocumentationContracts(E2ETest):
         self.assertIn("pbs.twimg.com", combined)
 
 
-@unittest.skipUnless(HAVE_KEY, "Cohort construction requires the API key "
-                               "(no HTTP is made in these tests)")
 class TestSetAlgebra(E2ETest):
     """Pure in-memory determinism of cohort set algebra. The Client instance
-    is real but never used for network here."""
+    is real but holds a dummy key and is never used for network here."""
 
     def _client(self):
         from twitterapi import Client
-        return Client(verbose=False)
+        return Client(api_key="offline-test", verbose=False)
 
     def _cohort(self, label, members):
         from cohort import Cohort

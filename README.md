@@ -10,7 +10,7 @@ advertises its own triggers, so an agent loads it on its own when you write
 tweet history, or how a post spread. The slash command is there for when you
 want to force it or read what it says.
 
-**Read-only. Standard library only — nothing to `pip install`.** 32 endpoints,
+**Read-only. Standard library only — nothing to `pip install`.** 30 endpoints,
 with every path, parameter spelling, response shape and price confirmed by live
 API calls. `verify.py` re-checks the 22 probeable endpoints for about $0.05; the
 other 10 need a list, community or Space ID that no API route discovers.
@@ -208,7 +208,7 @@ c2 = Client(store="/tmp/twitter.db", max_usd=10)  # paths are coerced before HTT
 
 c.estimate("follower_ids", 200_000_000)    # -> 900.0 dollars, before spending
 c.bulk_search(["from:openai", "from:anthropicai", "from:google"])  # 3 queries, 1 request
-c.paginate("community_members", "1493446837214187523", limit=500)  # one of the 27 paginated endpoints
+c.paginate("community_members", "1493446837214187523", limit=500)  # one of the 26 paginated endpoints
 c.paginate("community_tweets_all", "market structure")  # tweets, not communities
 ```
 
@@ -398,7 +398,7 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
   part of the research task.
 - **Community IDs are not discoverable** — the all-community search returns
   tweets and commonly has `communityInfo: null`. Use `community_tweets_all`
-  for that tweet search; the legacy `community_search` alias warns. Community
+  for that tweet search. Community
   endpoints need an ID from `x.com/i/communities/<id>`, and a null identity
   raises instead of becoming zero-valued facts.
 - **List IDs must come from `x.com/i/lists/<id>`.** The list family has no
@@ -432,7 +432,7 @@ while active; `realtime.py` prints the active-rule count on every command.
 SKILL.md                      agent-facing entry point
 references/facts.json         machine-checkable evidence, dated
 references/verified-facts.md  prose evidence and rationale
-scripts/twitterapi.py         32 endpoints: casing, envelopes, cost, QPS, cache
+scripts/twitterapi.py         30 endpoints: casing, envelopes, cost, QPS, cache
 scripts/axi.py                shared JSON command boundary
 scripts/store.py              sqlite cache, normalisers, versioned cohorts
 scripts/cohort.py             resolvers, set algebra, authority ranking
