@@ -200,7 +200,7 @@ def _audience_cli(a):
             fh.close()
     print(f"{got:,} records | {c.spend_report()}", file=sys.stderr)
     if refused:
-        emit(error("refusal", truncated_reason, "workflows.py audience",
+        emit_line(error("refusal", truncated_reason, "workflows.py audience",
                    "Pass `--limit <count>` or raise `--max-usd <amount>`"))
         return 2
     complete = not truncated
@@ -531,7 +531,7 @@ def _history_walk(a, c, q):
         try:
             profile = c.user_info(a.user)
         except APIError as exc:
-            emit(error("api", f"@{a.user} could not be resolved: {exc}",
+            emit_line(error("api", f"@{a.user} could not be resolved: {exc}",
                        "workflows.py history",
                        "Check the handle spelling; suspended, deleted, and "
                        "nonexistent accounts have no searchable history"))
@@ -766,7 +766,7 @@ def _main(argv=None):
     p = _parser()
     args = p.parse_args(argv)
     if args.cmd == "history" and not (args.user or args.query):
-        p.error("history needs a USER or --query")
+        raise UsageError("history needs a USER or --query")
     parse_fields(args.fields,
                  ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
                  f"workflows.py {args.cmd}")
@@ -834,7 +834,7 @@ def _parser():
 
 
 def main(argv=None):
-    return run_cli("workflows.py", _main, argv, parser=_parser, dest="cmd")
+    return run_cli("workflows.py", _main, argv, parser=_parser, dests=("cmd",))
 
 
 if __name__ == "__main__":

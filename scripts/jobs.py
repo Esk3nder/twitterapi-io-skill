@@ -999,7 +999,7 @@ def _main(argv=None):
     p = _job_parser()
     a = p.parse_args(argv)
     if a.job is None:
-        p.error("a job name is required")
+        raise UsageError("a job name is required")
     command = f"jobs.py {a.job}"
     store_path = getattr(a, "store", None)
     # 0 or a negative count is never a real request: --limit 0 returned an
@@ -1038,7 +1038,7 @@ def _main(argv=None):
 
 
 def main(argv=None):
-    return run_cli("jobs.py", _main, argv, parser=_job_parser, dest="job")
+    return run_cli("jobs.py", _main, argv, parser=_job_parser, dests=("job",))
 
 
 if __name__ == "__main__":

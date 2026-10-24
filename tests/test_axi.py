@@ -79,7 +79,7 @@ class TestExitContract(unittest.TestCase):
             with self.subTest(kind=kind, exc=type(exc).__name__), \
                     contextlib.redirect_stdout(output):
                 rc = axi.run_cli("tool.py", fail, ["sub"], parser=self._parser,
-                                    dest="cmd")
+                                    dests=("cmd",))
             self.assertEqual(rc, code)
             self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
             body = json.loads(output.getvalue())
@@ -95,6 +95,47 @@ class TestExitContract(unittest.TestCase):
         p.add_subparsers(dest="cmd").add_parser("sub")
         return p
 
+    def test_empty_unexpected_argument_is_a_usage_error_not_internal(self):
+        """Codex review of PR 3: an empty argument reached the usage formatter
+        with no token to read, so it became an internal error (exit 1)."""
+        p = self._parser()
+        output = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, \
+                contextlib.redirect_stdout(output):
+            p.parse_args(["sub", ""])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
+        self.assertEqual(json.loads(output.getvalue())["error"]["type"], "usage")
+
+    def test_failed_subcommand_recovery_adds_no_second_line(self):
+        """Codex review of PR 3: a missing subcommand made the recovery parse
+        print a second usage line on stdout, after the real runtime error."""
+        def fail(_argv):
+            raise OSError("disk")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = axi.run_cli("tool.py", fail, [], parser=self._parser,
+                             dests=("cmd",))
+        self.assertEqual(rc, 1)
+        self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
+        self.assertEqual(json.loads(output.getvalue())["error"]["type"], "runtime")
+
+    def test_nested_subcommand_path_is_named(self):
+        """Codex review of PR 3: `rules add` was reported as `rules`."""
+        p = axi.ArgumentParser(prog="tool.py")
+        sub = p.add_subparsers(dest="cmd", required=True)
+        rules = sub.add_parser("rules").add_subparsers(dest="action", required=True)
+        rules.add_parser("add")
+
+        def fail(_argv):
+            raise OSError("disk")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            axi.run_cli("tool.py", fail, ["rules", "add"], parser=lambda: p,
+                        dests=("cmd", "action"))
+        self.assertEqual(json.loads(output.getvalue())["error"]["command"],
+                         "tool.py rules add")
+
     def test_error_names_the_subcommand_after_global_flags(self):
         """`jobs.py --max-usd 5 brief` was reported as plain `jobs.py`; a
         flag's value must not be read as the subcommand either."""
@@ -108,7 +149,7 @@ class TestExitContract(unittest.TestCase):
             output = io.StringIO()
             with self.subTest(argv=argv), contextlib.redirect_stdout(output):
                 axi.run_cli("tool.py", fail, list(argv), parser=self._parser,
-                            dest="cmd")
+                            dests=("cmd",))
             self.assertEqual(json.loads(output.getvalue())["error"]["command"],
                              command)
 
@@ -162,6 +203,7 @@ class TestArgumentParser(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 parser.parse_args(["--stat", "closed"])
         self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
         body = json.loads(output.getvalue())
         self.assertEqual(body["error"]["type"], "usage")
         self.assertIn("--stat", body["error"]["message"])

@@ -439,7 +439,7 @@ def _main(argv=None):
     if a.cmd == "stream":
         parse_fields(a.fields, dict(TWEET_FIELDS, rule=("rule",)), "realtime.py stream")
     if a.cmd == "rules" and a.action != "list" and not a.confirm:
-        emit(error("refusal", f"rules {a.action} changes server-side rule state; "
+        emit_line(error("refusal", f"rules {a.action} changes server-side rule state; "
                    "--confirm is required", f"realtime.py rules {a.action}",
                    f"Run `realtime.py rules {a.action} --help` and review the billing warning"))
         return 2
@@ -568,7 +568,7 @@ def _stream_cli(c, a):
 
 
 def main(argv=None):
-    return run_cli("realtime.py", _main, argv, parser=_parser, dest="cmd")
+    return run_cli("realtime.py", _main, argv, parser=_parser, dests=("cmd", "action"))
 
 
 if __name__ == "__main__":
