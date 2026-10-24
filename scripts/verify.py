@@ -382,12 +382,15 @@ def _main(argv=None):
     drift = check_internal_consistency(facts)   # offline, free, runs first
     c = Client(verbose=False)
     observed = {}
-    # A SetupError here (bad key, no credits, outage) exits 2: a setup
-    # problem, not a contract change, so callers can tell "fix your key"
-    # apart from "the API moved" (exit 1).
-    probe_failures = check_contracts(c, facts, endpoint_names, observed)
-    if a.pricing:
-        drift += check_pricing(c, facts)
+    # A setup problem (bad key, no credits, outage, no network) exits 2, not
+    # 1: callers must be able to tell "fix your setup" from "the API moved".
+    try:
+        probe_failures = check_contracts(c, facts, endpoint_names, observed)
+        if a.pricing:
+            drift += check_pricing(c, facts)
+    except OSError as e:                # DNS, refused connection, timeout
+        raise SetupError(f"network failure, verification was not completed: "
+                         f"{e}") from e
 
     coverage = f"probed {len(endpoint_names)}/{len(ENDPOINTS)}"
     if a.quick:

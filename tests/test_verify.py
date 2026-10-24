@@ -225,7 +225,6 @@ class TestArgparseExitsAreNotSilent(unittest.TestCase):
                       "the structured usage JSON must reach stdout")
 
 
-
 class TestVerifyExitContract(unittest.TestCase):
     """Review 2026-10-23: --help needed a key, --quick --update re-stamped the
     whole facts file after a partial sweep, and a drift failure's JSON named
@@ -269,6 +268,27 @@ class TestVerifyExitContract(unittest.TestCase):
         message = json.loads(out.getvalue())["error"]["message"]
         self.assertIn("followers", message)
         self.assertIn("top-level key set changed", message)
+
+    def test_network_failure_is_setup_not_drift(self):
+        """Codex review 2026-10-23: a DNS failure exited 1, which verify
+        defines as API drift, though no contract was ever observed."""
+        import urllib.error
+
+        def unreachable(*args):
+            raise urllib.error.URLError("DNS unavailable")
+
+        with mock.patch.dict(os.environ, {"TWITTERAPI_IO_KEY": "x"}), \
+                mock.patch.object(verify, "Client", lambda **kw: FakeClient({})), \
+                mock.patch.object(verify, "check_contracts", unreachable), \
+                mock.patch.object(verify, "check_internal_consistency", lambda f: []), \
+                contextlib.redirect_stderr(io.StringIO()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = verify.main(["--quick"])
+        self.assertEqual(rc, 2)
+        error = json.loads(out.getvalue())["error"]
+        self.assertEqual(error["type"], "setup")
+        self.assertIn("DNS unavailable", error["message"])
 
 
 if __name__ == "__main__":

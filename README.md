@@ -12,8 +12,8 @@ want to force it or read what it says.
 
 **Read-only. Standard library only — nothing to `pip install`.** 30 endpoints,
 with every path, parameter spelling, response shape and price confirmed by live
-API calls. `verify.py` re-checks the 22 probeable endpoints for about $0.05; the
-other 10 need a list, community or Space ID that no API route discovers.
+API calls. `verify.py` re-checks the 21 probeable endpoints for about $0.05; the
+other 9 need a list, community or Space ID that no API route discovers.
 
 ## What you get
 
