@@ -17,12 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
+from twitterapi import (APIError, Client, CostLimitExceeded, IncompleteDataError,
                         credits_to_usd, enrich_tweet_media, filter_search_tweets,
                         prepare_search_query)  # noqa: E402
 from store import Store  # noqa: E402
@@ -31,6 +32,11 @@ from axi import (ACCOUNT_FIELDS, TWEET_FIELDS, ArgumentParser, UsageError,
                  format_record, parse_fields, run_cli, success)  # noqa: E402
 
 TW_FMT = "%a %b %d %H:%M:%S %z %Y"      # verified: "Mon Aug 10 17:16:53 +0000 2026"
+SEARCH_PAGE = 20                        # advanced_search returns at most 20 per call
+DEFAULT_MAX_USD = 5.0                   # ceiling for a Client this module creates itself
+MONITOR_SEEN_CAP = 5000                 # newest ids kept for monitor dedupe
+MONITOR_OVERLAP = 120                   # seconds each poll re-scans for late-indexed posts
+_HANDLE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def parse_created_at(s):
@@ -42,6 +48,74 @@ def _strictest(*limits):
     loosened by a client that happens to carry max_usd=100."""
     vals = [v for v in limits if v is not None]
     return min(vals) if vals else None
+
+
+def _bounded_client(client, max_usd):
+    """The client a library workflow spends through.
+
+    max_usd=None means "no extra ceiling": a caller-configured client keeps its
+    own ceiling. A library default must never tighten it, or `--max-usd 50`
+    silently stops at the default and "raise --max-usd" advice cannot work.
+    Only a client this module creates itself falls back to DEFAULT_MAX_USD."""
+    if client is None:
+        return Client(max_usd=DEFAULT_MAX_USD if max_usd is None else max_usd)
+    client.max_usd = _strictest(client.max_usd, max_usd)
+    return client
+
+
+class SetupError(RuntimeError):
+    """The API client could not be configured (for example, no API key)."""
+
+
+def _cli_client(max_usd):
+    """Client for a CLI run. Construction sends no request, so any failure here
+    is configuration (missing TWITTERAPI_IO_KEY, invalid QPS), not runtime."""
+    try:
+        return Client(max_usd=max_usd)
+    except (RuntimeError, ValueError) as exc:
+        raise SetupError(str(exc)) from exc
+
+
+def _emit_line(doc):
+    """One single-line JSON document. Streaming commands print JSON Lines, so a
+    summary or error that follows records must not span several lines."""
+    print(json.dumps(doc, ensure_ascii=False))
+
+
+def _clean_handle(raw, flag="USER"):
+    handle = (raw or "").strip().lstrip("@")
+    if not _HANDLE.match(handle):
+        raise UsageError(f"{flag} must be an X handle (letters, digits, "
+                         f"underscore), got {raw!r}")
+    return handle
+
+
+def _day_ts(value, flag):
+    """UTC midnight of a YYYY-MM-DD day, or None. Malformed input is a usage
+    error, never an internal failure."""
+    if value is None:
+        return None
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise UsageError(f"{flag} must be YYYY-MM-DD, got {value!r}") from None
+    return int(day.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _window_ts(since, until):
+    """Validated (since_ts, until_ts). An empty or inverted window is refused
+    before any paid request, never sent and billed."""
+    since_ts, until_ts = _day_ts(since, "--since"), _day_ts(until, "--until")
+    if since_ts is not None and until_ts is not None and since_ts >= until_ts:
+        raise UsageError(f"--since {since} must be earlier than --until {until}")
+    return since_ts, until_ts
+
+
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _emit(records, out):
@@ -56,7 +130,7 @@ def _emit(records, out):
 
 
 # ---------------------------------------------------------------- audience --
-def audience(user, *, ids_only=True, limit=None, max_usd=5.0,
+def audience(user, *, ids_only=True, limit=None, max_usd=None,
              verified_only=False, client=None, quiet=False):
     """Yield an account's followers (IDs by default, profiles on request).
 
@@ -65,27 +139,49 @@ def audience(user, *, ids_only=True, limit=None, max_usd=5.0,
     cheaper and 25x fewer requests. Only turn it off when you actually need
     profile fields (bio, follower counts, verified status).
 
-    Raises CostLimitExceeded BEFORE spending if the full crawl would exceed
-    max_usd. Records already yielded are always paid for and valid.
+    When the record count is known, raises CostLimitExceeded BEFORE spending
+    if the crawl would exceed the ceiling. When it is unknown (verified
+    followers are an unknown subset of all followers; a profile may omit its
+    follower count), the walk is bounded page by page by the client ceiling.
+    Records already yielded are always paid for and valid.
+
+    Sets client.last_audience_total to the endpoint's known record total, or
+    None when no honest denominator exists.
     """
-    c = client or Client(max_usd=max_usd)
-    c.max_usd = _strictest(c.max_usd, max_usd)
+    if limit is not None and limit < 1:
+        raise UsageError(f"--limit must be at least 1, got {limit}")
+    c = _bounded_client(client, max_usd)
     info = c.user_info(user)            # Client.user_info charges its own 18 credits
-    total, uid = int(info.get("followers") or 0), info.get("id")
-    want = min(limit, total) if limit else total
-    c.last_audience_total = total
-    c.last_audience_context = {"account_followers": total, "requested": want}
+    followers, uid = _int_or_none(info.get("followers")), info.get("id")
     endpoint = ("verified_followers" if verified_only
                 else "follower_ids" if ids_only else "followers")
-    est = c.estimate(endpoint, want)
+    if verified_only and uid in (None, ""):
+        raise IncompleteDataError(
+            f"could not resolve @{user} to the user id the verified-followers "
+            f"endpoint requires")
+    # The verified endpoint returns an unknown subset of all followers, so the
+    # account's follower count is neither its cost basis nor its denominator.
+    total = None if verified_only else followers
+    want = limit if total is None else (min(limit, total) if limit else total)
+    c.last_audience_total = total
+    c.last_audience_context = {"account_followers": followers, "requested": want}
+    est = None if want is None else c.estimate(endpoint, want)
 
     if not quiet:
-        print(f"@{user}: {total:,} followers | {want:,} via {endpoint} "
-              f"| est ${est:,.2f}", file=sys.stderr)
-        if ids_only and not verified_only and want > 1000:
+        shown = "unknown" if followers is None else f"{followers:,}"
+        if est is None:
+            ceiling = ("no ceiling" if c.max_usd is None
+                       else f"the ${c.max_usd:,.2f} ceiling")
+            print(f"@{user}: {shown} followers | record count for {endpoint} "
+                  f"unknown | walk bounded page by page by {ceiling}",
+                  file=sys.stderr)
+        else:
+            print(f"@{user}: {shown} followers | {want:,} via {endpoint} "
+                  f"| est ${est:,.2f}", file=sys.stderr)
+        if ids_only and not verified_only and want and want > 1000:
             print(f"  full profiles would cost ${c.estimate('followers', want):,.2f}",
                   file=sys.stderr)
-    if est > c.max_usd:
+    if est is not None and c.max_usd is not None and est > c.max_usd:
         raise CostLimitExceeded(
             f"{endpoint} for {want:,} records ~= ${est:,.2f}, over the "
             f"${c.max_usd:,.2f} ceiling. Pass --limit, or raise --max-usd "
@@ -103,7 +199,12 @@ def audience(user, *, ids_only=True, limit=None, max_usd=5.0,
 
 
 def _audience_cli(a):
-    c = Client(max_usd=a.max_usd)
+    if a.limit is not None and a.limit < 1:
+        emit(error("usage", f"--limit must be at least 1, got {a.limit}",
+                   "workflows.py audience",
+                   "Omit `--limit` for every follower, or pass a positive count"))
+        return 2
+    c = _cli_client(a.max_usd)
     got = 0
     fh = open(a.out, "w") if a.out else sys.stdout
     was_truncated = False
@@ -140,16 +241,20 @@ def _audience_cli(a):
                    "Pass `--limit <count>` or raise `--max-usd <amount>`"))
         return 2
     complete = not truncated
-    total = getattr(c, "last_audience_total", got)
+    total = getattr(c, "last_audience_total", None)
+    limit_reached = bool(a.limit) and got >= a.limit
+    if total is None and complete and not limit_reached:
+        total = got                     # the walk itself proved the full count
+    more = (total is None and limit_reached) or (total is not None and got < total)
     summary = success(
         "workflows.py audience", {
-            "records_count": f"{got} of {total} total",
+            "records_count": f"{got} of {'unknown' if total is None else total} total",
             "records_state": (None if got else
                               f"0 followers found for @{a.user} in the requested scope"),
             "artifact": a.out,
             "help": (["Run `workflows.py audience <user> --profiles` for profile fields"]
                      + (["Run `workflows.py audience <user> --limit <count>` with a larger count to show more"]
-                        if got < total and complete else [])
+                        if more and complete else [])
                      + (["Run `workflows.py audience <user> --full` for complete text"]
                         if was_truncated else [])),
         }, complete=complete, reason=truncated_reason,
@@ -161,42 +266,53 @@ def _audience_cli(a):
 
 
 # ----------------------------------------------------------------- history --
-def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
-                   max_pages=None, client=None, progress=True,
-                   _since_ts=None, _until_ts=None):
-    """Historical tweet search using a SLIDING TIME WINDOW, not cursors.
+def search_window(client, query, since_ts=None, until_ts=None, *,
+                  max_pages=None, progress=False):
+    """THE sliding-time-window walk over advanced_search. Generator.
 
-    twitterapi.io's own guide reports that cursor pagination infinite-loops on
-    historical ranges (2019-2022). advanced_search caps at 20 tweets per call,
-    so the reliable walk is: request newest-first within [since, until), take
-    the OLDEST createdAt in the page, and set until_time to one second before
-    it. Terminate when a page returns fewer than 20 results or the boundary
-    stops moving.
+    Cursor pagination loops on historical ranges, and advanced_search returns
+    at most 20 tweets per call, so the walk requests newest-first within
+    [since_ts, until_ts), takes the OLDEST createdAt on the page, and moves
+    until_time to that second (re-including it; dedupe by id absorbs the
+    overlap). Spends through `client` under the client's own ceiling; this
+    function never changes client.max_usd.
 
-    Yields tweet dicts newest-first. Deduplicates by tweet id.
+    Yields qualifying tweet dicts newest-first, each id once. Every fetched
+    page is persisted to client.store (when set) before its tweets are yielded.
+
+    Completeness: normal exhaustion (StopIteration) happens ONLY when the
+    window is proven walked: an empty page, a short page without
+    has_next_page, or the boundary reaching since_ts. Otherwise it raises,
+    after yielding everything already acquired (those records stay valid):
+      CostLimitExceeded   the client ceiling stops the next paid page;
+      IncompleteDataError contract drift (no `tweets` list), a page that
+                          asserts more data but has no parseable timestamps,
+                          20+ tweets in one second, or max_pages reached.
     """
-    c = client or Client(max_usd=max_usd)
+    c = client
     query, local_min_faves = prepare_search_query(query)
-    c.max_usd = _strictest(c.max_usd, max_usd)
-    since_ts = _since_ts if _since_ts is not None else (
-        int(datetime.strptime(since, "%Y-%m-%d")
-            .replace(tzinfo=timezone.utc).timestamp()) if since else None)
-    until_ts = _until_ts if _until_ts is not None else (
-        int(datetime.strptime(until, "%Y-%m-%d")
-            .replace(tzinfo=timezone.utc).timestamp()) if until else None)
     seen, pages = set(), 0
     while True:
         q = query
-        if since_ts:
+        if since_ts is not None:
             q += f" since_time:{since_ts}"
-        if until_ts:
+        if until_ts is not None:
             q += f" until_time:{until_ts}"
         resp = c._raw("GET", "/twitter/tweet/advanced_search",
                       {"query": q, "queryType": "Latest"},
-                      max_credits=Client.page_credits("search", 20, 20))
-        batch = [enrich_tweet_media(tweet)
-                 for tweet in (resp.get("tweets") or [])]
-        c._charge("search", len(batch), 20)
+                      max_credits=Client.page_credits("search", SEARCH_PAGE,
+                                                      SEARCH_PAGE))
+        tweets = resp.get("tweets") if isinstance(resp, dict) else None
+        if not isinstance(tweets, list):
+            problem = ("omitted the 'tweets' field"
+                       if not isinstance(resp, dict) or "tweets" not in resp
+                       else f"returned 'tweets' as {type(tweets).__name__}")
+            raise IncompleteDataError(
+                f"advanced_search {problem}; refusing to read contract drift "
+                f"as an empty window. The {len(seen):,} tweets already "
+                f"yielded are valid, but the result is partial.")
+        batch = [enrich_tweet_media(tweet) for tweet in tweets]
+        c._charge("search", len(batch), SEARCH_PAGE)
         pages += 1
 
         # A fetched page is already paid for. Persist it before yielding so a
@@ -228,16 +344,31 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
             print(f"  page {pages}: {len(batch)} returned, {fresh} new, "
                   f"{len(seen):,} total, ${c.spent_usd:,.4f}", file=sys.stderr)
 
-        if len(batch) < 20:
-            break                       # short page = genuinely end of range
+        has_more = resp.get("has_next_page")
+        if not isinstance(has_more, bool):
+            # Unknown, never "no more pages". This page's tweets are valid and
+            # were yielded above; only whether more of the window exists is
+            # unknown.
+            raise IncompleteDataError(
+                f"advanced_search omitted has_next_page (got {has_more!r}); "
+                f"whether more of the window exists is unknown. The "
+                f"{len(seen):,} tweets already yielded are valid, but the "
+                f"result is partial.")
+        full = len(batch) >= SEARCH_PAGE
+        if not batch:
+            return                      # nothing left in [since, until)
+        if not full and not has_more:
+            return                      # short page, no more asserted: exhausted
+        # A full page, or a short page that asserts has_next_page (results can
+        # be filtered server-side), is NOT exhaustion: keep walking by time.
         if not stamps:
             raise IncompleteDataError(
-                f"full search page had no parseable createdAt timestamps; "
-                f"the {len(seen):,} tweets already yielded are valid, but no "
-                f"safe resume boundary exists")
-        # A full page may require another paid request. At exact exhaustion,
-        # stop honestly before that next request; a short terminal page above
-        # already proves completeness and is allowed to finish at the ceiling.
+                f"a search page asserting more data had no parseable createdAt "
+                f"timestamps; the {len(seen):,} tweets already yielded are "
+                f"valid, but no safe resume boundary exists")
+        # Another paid request is needed. At exact exhaustion of the ceiling,
+        # stop honestly before it; a terminal page above already proves
+        # completeness and is allowed to finish at the ceiling.
         if c._over_ceiling():
             raise CostLimitExceeded(
                 f"Spend ceiling hit at ${c.spent_usd:,.2f} after {pages} pages; "
@@ -249,7 +380,7 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
                 f"but the result is partial.")
 
         oldest = min(stamps)
-        if max(stamps) == oldest:
+        if full and max(stamps) == oldest:
             # Every tweet on a FULL page shares one second. A time window
             # cannot page within a single second, so advancing past it drops
             # whatever else was posted in that second. Record it — never lose
@@ -270,22 +401,62 @@ def history_search(query, since=None, until=None, *, max_usd=5.0, out=None,
         if until_ts is not None and new_until >= until_ts:
             new_until = until_ts - 1    # force progress rather than loop
         until_ts = new_until
-        if since_ts and until_ts <= since_ts:
-            break
+        if since_ts is not None and until_ts <= since_ts:
+            return                      # boundary reached = clean exhaustion
+
+
+def history_search(query, since=None, until=None, *, max_usd=None,
+                   max_pages=None, client=None, progress=True):
+    """Historical tweet search over [since, until) as YYYY-MM-DD UTC days.
+
+    Validates the window (malformed or inverted dates raise UsageError before
+    any request), then delegates to search_window(); see it for the walk and
+    completeness semantics. max_usd=None keeps a supplied client's ceiling.
+    """
+    since_ts, until_ts = _window_ts(since, until)
+    c = _bounded_client(client, max_usd)
+    return search_window(c, query, since_ts, until_ts, max_pages=max_pages,
+                         progress=progress)
+
+
 def _history_cli(a):
+    try:
+        if a.user and a.query:
+            raise UsageError("pass a USER or --query, not both; a USER is the "
+                             "query `from:USER`, so --query would be ignored")
+        if a.user:
+            a.user = _clean_handle(a.user)
+        since_ts, _ = _window_ts(a.since, a.until)
+        if a.max_pages is not None and a.max_pages < 1:
+            raise UsageError(f"--max-pages must be at least 1, got {a.max_pages}")
+    except UsageError as exc:
+        emit(error("usage", str(exc), "workflows.py history",
+                   "Run `workflows.py history --help` for valid arguments"))
+        return 2
     if a.exclude_retweets and not a.user:
         emit(error("refusal", "--exclude-retweets cannot be combined with --query; "
                    "a raw query may explicitly select native retweets",
                    "workflows.py history",
                    "Put `-filter:nativeretweets` in `<query>` explicitly"))
         return 2
-    c = Client(max_usd=a.max_usd)
-    if c.store is None:
-        store_path = getattr(a, "store", None)
-        c.store = Store(store_path) if store_path else Store()
+    if a.include_retweets and not a.user:
+        emit(error("refusal", "--include-retweets needs the USER shorthand",
+                   "workflows.py history",
+                   "Put `filter:nativeretweets` in `<query>` explicitly"))
+        return 2
     q = f"from:{a.user}" if a.user else a.query
     if a.exclude_replies:
         q += " -filter:replies"
+    try:
+        prepare_search_query(q)     # refuses unsafe min_faves forms, $0
+    except ValueError as exc:
+        emit(error("usage", str(exc), "workflows.py history",
+                   "Rewrite `<query>` as the error describes"))
+        return 2
+    c = _cli_client(a.max_usd)
+    if c.store is None:
+        store_path = getattr(a, "store", None)
+        c.store = Store(store_path) if store_path else Store()
     if a.exclude_retweets:
         # No-op kept for compatibility: a `from:` query never returns native
         # retweets in the first place, so this filter removes nothing. Say so
@@ -293,12 +464,6 @@ def _history_cli(a):
         print("[history] note: --exclude-retweets is redundant — `from:` search "
               "never returns native retweets. Use --include-retweets to fetch "
               "them in a second pass.", file=sys.stderr)
-    if a.include_retweets and not a.user:
-        emit(error("refusal", "--include-retweets needs the USER shorthand",
-                   "workflows.py history",
-                   "Put `filter:nativeretweets` in `<query>` explicitly"))
-        return 2
-
     if not a.user:
         scope = ("raw query results; composition depends on the query and "
                  "native retweets are not added automatically")
@@ -335,7 +500,7 @@ def _history_cli(a):
                 print(f"[history] {label}: {search_query!r}", file=sys.stderr)
             records = iter(history_search(
                 search_query, a.since, a.until, client=c,
-                max_pages=a.max_pages))
+                max_usd=a.max_usd, max_pages=a.max_pages))
             while True:
                 try:
                     t = next(records)
@@ -421,6 +586,36 @@ def _history_cli(a):
               f"native retweets, and search-index depth reduce reachable results.",
               file=sys.stderr)
 
+    if a.user and not n and not truncated:
+        # Zero posts is ambiguous: a quiet account, or a handle that does not
+        # exist (search answers both with an empty page). Resolve the identity
+        # only at this boundary; user_info raises for a missing account.
+        try:
+            profile = c.user_info(a.user)
+        except APIError as exc:
+            emit(error("api", f"@{a.user} could not be resolved: {exc}",
+                       "workflows.py history",
+                       "Check the handle spelling; suspended, deleted, and "
+                       "nonexistent accounts have no searchable history"))
+            return 1
+        except CostLimitExceeded as exc:
+            truncated = True
+            truncated_reason = (f"0 posts found, but confirming @{a.user} exists "
+                                f"would exceed the ceiling: {exc}")
+        else:
+            if not isinstance(profile, dict) or profile.get("id") in (None, ""):
+                truncated = True
+                truncated_reason = (f"0 posts found and the profile lookup for "
+                                    f"@{a.user} returned no account id, so an "
+                                    f"empty history cannot be confirmed")
+
+    # Only an OPEN-ENDED handle history claims lifetime coverage, so only it
+    # is checked against account creation. A dated window is not: its walk
+    # ends by proven exhaustion, and a gap between --since and the oldest
+    # post is the ordinary case for any account that was quiet at the start
+    # of the window (measured 2026-10-23: @karpathy, --since 2026-10-01,
+    # oldest post the next day, was falsely labelled partial by a --since
+    # variant of this check).
     index_limited = False
     if (not truncated and a.user and not a.since and oldest_ts is not None
             and account_created_ts is not None
@@ -460,8 +655,35 @@ def _history_cli(a):
 
 
 # ----------------------------------------------------------------- monitor --
-def monitor(users, *, interval=60, max_usd=5.0, state_file=None, client=None,
-            once=False, on_tweet=None, lookback=900):
+def _monitor_params(users, interval, lookback, overlap):
+    """Validated handle list. Raises UsageError before any client or request:
+    an empty handle list would send and bill the query `()`, and a zero or
+    negative interval cannot be polled."""
+    if isinstance(users, str):
+        users = users.split(",")
+    handles = [_clean_handle(u, "each monitored user") for u in users if u.strip()]
+    if not handles:
+        raise UsageError("monitor needs at least one handle, e.g. `alice,bob`")
+    if not interval or interval <= 0:
+        raise UsageError(f"--interval must be greater than 0 seconds, got {interval}")
+    if lookback is None or lookback <= 0:
+        raise UsageError(f"--lookback must be greater than 0 seconds, got {lookback}")
+    if overlap is None or overlap < 0:
+        raise UsageError(f"--overlap must be 0 or more seconds, got {overlap}")
+    return handles
+
+
+def _save_monitor_state(path, window_start, seen_ids):
+    """Atomic checkpoint: a crash mid-write must not leave unreadable state."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump({"last_ts": window_start,
+                   "seen_ids": seen_ids[-MONITOR_SEEN_CAP:]}, fh)
+    os.replace(tmp, path)
+
+
+def monitor(users, *, interval=60, max_usd=None, state_file=None, client=None,
+            once=False, on_tweet=None, lookback=900, overlap=MONITOR_OVERLAP):
     """Poll for new tweets from a set of accounts.
 
     Polling advanced_search over a sliding since_time window is the vendor's
@@ -471,39 +693,54 @@ def monitor(users, *, interval=60, max_usd=5.0, state_file=None, client=None,
     On a cold start (no state file) the first poll looks back `lookback`
     seconds. Without that the first window would be [now, now] — zero width —
     and the run would report nothing with no indication why.
+
+    Each poll re-scans `overlap` seconds before the previous window end, so a
+    post the index publishes late is still found; seen ids drop the repeats.
+
+    Checkpoint (`state_file`): `last_ts` is the start of the window not yet
+    fully walked; it advances only after a whole window completes. `seen_ids`
+    is saved after EVERY emitted tweet, so a poll stopped by the ceiling or a
+    crash resumes the same window without re-emitting what was already sent.
     """
-    c = client or Client(max_usd=max_usd)
-    c.max_usd = _strictest(c.max_usd, max_usd)
+    users = _monitor_params(users, interval, lookback, overlap)
+    c = _bounded_client(client, max_usd)
     state = {}
     if state_file and os.path.exists(state_file):
-        state = json.load(open(state_file))
-    last_seen = int(state.get("last_ts") or (time.time() - lookback))
-    # A list, not a set: the trim below must drop the OLDEST ids, and a set
-    # has no order, so list(set)[-5000:] keeps an arbitrary subset.
-    seen_ids = list(state.get("seen_ids") or [])
+        with open(state_file) as fh:
+            state = json.load(fh)
+    window_start = int(state.get("last_ts") or (time.time() - lookback))
+    # A list, not a set: the trim must drop the OLDEST ids, and a set has no
+    # order, so list(set)[-N:] keeps an arbitrary subset.
+    seen_ids = list(state.get("seen_ids") or [])[-MONITOR_SEEN_CAP:]
     seen_set = set(seen_ids)
+    q = "(" + " OR ".join(f"from:{u}" for u in users) + ")"
+    if state_file and "last_ts" not in state:
+        # Pin the cold-start window now: a first poll that stops early must
+        # resume here, not at a later now - lookback that skips posts.
+        _save_monitor_state(state_file, window_start, seen_ids)
 
     while True:
         now = int(time.time())
-        q = "(" + " OR ".join(f"from:{u.strip().lstrip('@')}" for u in users) + ")"
         # advanced_search caps at 20 per call. A single request would silently
         # drop everything past the 20th tweet in a busy interval, so walk the
-        # window with the same sliding technique history_search uses.
+        # window with the shared sliding-window walker.
         new = []
-        for t in history_search(q, client=c, progress=False,
-                                since=None, until=None,
-                                _since_ts=last_seen, _until_ts=now):
-            if t.get("id") in seen_set:
+        for t in search_window(c, q, max(0, window_start - overlap), now):
+            tweet_id = t.get("id")
+            if tweet_id in seen_set:
                 continue
-            seen_set.add(t["id"])
-            seen_ids.append(t["id"])
+            seen_set.add(tweet_id)
+            seen_ids.append(tweet_id)
             new.append(t)
             (on_tweet or _print_tweet)(t)
-        last_seen = now
+            if len(seen_ids) > 2 * MONITOR_SEEN_CAP:
+                seen_ids = seen_ids[-MONITOR_SEEN_CAP:]
+                seen_set = set(seen_ids)
+            if state_file:              # emitted first: at-least-once on crash
+                _save_monitor_state(state_file, window_start, seen_ids)
+        window_start = now              # the whole window has been walked
         if state_file:
-            keep = seen_ids[-5000:]     # newest 5000, insertion-ordered
-            json.dump({"last_ts": last_seen, "seen_ids": keep},
-                      open(state_file, "w"))
+            _save_monitor_state(state_file, window_start, seen_ids)
         print(f"  [{datetime.now():%H:%M:%S}] {len(new)} new "
               f"| ${c.spent_usd:,.4f} spent", file=sys.stderr)
         if once:
@@ -524,8 +761,13 @@ def _print_tweet(t):
 
 
 def _monitor_cli(a):
-    users = [u for u in a.users.split(",") if u.strip()]
-    c = Client(max_usd=a.max_usd)
+    try:
+        users = _monitor_params(a.users, a.interval, a.lookback, a.overlap)
+    except UsageError as exc:
+        emit(error("usage", str(exc), "workflows.py monitor",
+                   "Run `workflows.py monitor --help` for valid arguments"))
+        return 2
+    c = _cli_client(a.max_usd)
     print(f"monitoring {users} every {a.interval}s "
           f"(~${credits_to_usd(15) * (86400 / a.interval):.2f}/day at minimum billing)",
           file=sys.stderr)
@@ -548,20 +790,26 @@ def _monitor_cli(a):
         print(json.dumps(rendered, ensure_ascii=False))
     try:
         monitor(users, interval=a.interval, client=c, state_file=a.state,
-                once=a.once, lookback=a.lookback, on_tweet=output_tweet)
+                once=a.once, lookback=a.lookback, overlap=a.overlap,
+                on_tweet=output_tweet)
     except KeyboardInterrupt:
         interrupted = True
         print(f"\nstopped | {c.spend_report()}", file=sys.stderr)
     except (CostLimitExceeded, IncompleteDataError) as e:
         # Preserve usable records and carry truncation in the final payload;
-        # exit 0 alone never claims completeness.
+        # exit 0 alone never claims completeness. Single-line: this summary
+        # ends a JSON Lines stream.
         print(f"\nSTOPPED: {e}", file=sys.stderr)
-        emit(success("workflows.py monitor", {
+        restart = ("restart from `--state <path>` to resume the same window"
+                   if a.state else "rerun with `--state <path>` to make runs resumable")
+        _emit_line(success("workflows.py monitor", {
                          "records_count": f"{state['records']} of unknown total",
                          "records_state": (None if state["records"] else
                                            "0 new posts emitted before the monitor stopped")},
                      complete=False, reason=str(e),
-                     resume="Raise `--max-usd <amount>` and restart from `--state <path>`",
+                     resume=(f"Raise `--max-usd <amount>` and {restart}"
+                             if isinstance(e, CostLimitExceeded)
+                             else restart[0].upper() + restart[1:]),
                      records_returned=state["records"]))
         return 0
     summary = success("workflows.py monitor", {
@@ -641,6 +889,9 @@ def _main(argv=None):
     m.add_argument("--once", action="store_true", help="poll once and exit")
     m.add_argument("--lookback", type=int, default=900,
                    help="cold-start lookback window in seconds (default 900)")
+    m.add_argument("--overlap", type=int, default=MONITOR_OVERLAP,
+                   help="seconds each poll re-scans before the last window, "
+                        "to catch late-indexed posts; re-scanned posts are billed")
     m.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
                    help="hard spend ceiling (default 5.00)")
     add_common_output_flags(m)
@@ -657,11 +908,22 @@ def _main(argv=None):
         emit(error("usage", str(exc), f"workflows.py {args.cmd}",
                    f"Run `workflows.py {args.cmd} --help` for valid fields"))
         return 2
+    # Errors are single-line: a streaming command may already have printed
+    # JSON Lines records, and an indented document would break the stream.
+    command = f"workflows.py {args.cmd}"
     try:
         return args.func(args)
+    except SetupError as e:
+        _emit_line(error("setup", str(e), command,
+                         "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
+        return 2
+    except APIError as e:
+        _emit_line(error("api", str(e), command,
+                         f"Check the arguments, then rerun `{command}`"))
+        return 1
     except RuntimeError as e:
-        emit(error("runtime", str(e), f"workflows.py {args.cmd}",
-                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
+        _emit_line(error("runtime", str(e), command,
+                         "Check network access and the API status, then rerun"))
         return 1
 
 

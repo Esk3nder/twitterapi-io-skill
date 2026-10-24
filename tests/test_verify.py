@@ -125,8 +125,14 @@ class TestVerifyCoverage(unittest.TestCase):
 
 class TestVerifyFailures(unittest.TestCase):
     def test_unittest_summary_names_missing_key_skips(self):
+        import tempfile
         env = dict(os.environ)
         env.pop("TWITTERAPI_IO_KEY", None)
+        # Own store dir: under run_e2e.sh the parent's E2E_STORE_DIR already
+        # holds the stores test_00_pure created, and fresh_store() names are
+        # deterministic, so the nested run would reopen them (cohort versions
+        # 3,4 instead of 1,2 — measured 2026-10-23).
+        env["E2E_STORE_DIR"] = tempfile.mkdtemp(prefix="twapi-nested-")
         run = subprocess.run(
             [sys.executable, "-m", "unittest", "tests.test_00_pure"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -222,3 +228,53 @@ class TestArgparseExitsAreNotSilent(unittest.TestCase):
         self.assertIn("unknown", p.stdout.lower(),
                       "the structured usage JSON must reach stdout")
 
+
+
+class TestVerifyExitContract(unittest.TestCase):
+    """Review 2026-10-23: --help needed a key, --quick --update re-stamped the
+    whole facts file after a partial sweep, and a drift failure's JSON named
+    no endpoint."""
+
+    def _run(self, *argv, key=False):
+        env = dict(os.environ)
+        env.pop("TWITTERAPI_IO_KEY", None)
+        if key:
+            env["TWITTERAPI_IO_KEY"] = "test-key-never-sent"
+        return subprocess.run([sys.executable, os.path.join(SCRIPTS, "verify.py"),
+                               *argv], capture_output=True, text=True, timeout=60,
+                              env=env)
+
+    def test_help_and_usage_errors_need_no_key(self):
+        help_run = self._run("--help")
+        self.assertEqual(help_run.returncode, 0)
+        self.assertIn("usage", help_run.stdout.lower())
+        bogus = self._run("--bogus-flag")
+        self.assertEqual(bogus.returncode, 2)
+        self.assertEqual(json.loads(bogus.stdout)["error"]["type"], "usage")
+
+    def test_missing_key_is_a_setup_failure_not_a_pass(self):
+        p = self._run()
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(json.loads(p.stdout)["error"]["type"], "setup")
+
+    def test_update_refuses_a_partial_sweep(self):
+        for argv in (("--quick", "--update"), ("--update",),
+                     ("--quick", "--pricing", "--update")):
+            p = self._run(*argv, key=True)
+            self.assertEqual(p.returncode, 2, argv)
+            self.assertEqual(json.loads(p.stdout)["error"]["type"], "usage", argv)
+
+    def test_drift_json_names_the_failed_checks(self):
+        drift = [("followers", "top-level key set changed", "+extra")]
+        with mock.patch.dict(os.environ, {"TWITTERAPI_IO_KEY": "x"}), \
+                mock.patch.object(verify, "Client", lambda **kw: FakeClient({})), \
+                mock.patch.object(verify, "check_contracts", lambda *a: list(drift)), \
+                mock.patch.object(verify, "check_internal_consistency", lambda f: []), \
+                contextlib.redirect_stderr(io.StringIO()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = verify._axi_main(["--quick"])
+        self.assertEqual(rc, 1)
+        message = json.loads(out.getvalue())["error"]["message"]
+        self.assertIn("followers", message)
+        self.assertIn("top-level key set changed", message)

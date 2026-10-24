@@ -89,6 +89,7 @@ UNPROBEABLE = {
 }
 
 _LAST_SETUP_ERROR = None
+_LAST_DRIFT = []
 
 
 def probe_endpoint_names(*, quick=False):
@@ -336,8 +337,9 @@ def check_pricing(c, facts):
 
 
 def _legacy_main(argv=None):
-    global _LAST_SETUP_ERROR
+    global _LAST_SETUP_ERROR, _LAST_DRIFT
     _LAST_SETUP_ERROR = None
+    _LAST_DRIFT = []
     from axi import ArgumentParser
     p = ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,10 +350,21 @@ def _legacy_main(argv=None):
     p.add_argument("--update", action="store_true",
                    help="rewrite facts.json from what was just observed")
     a = p.parse_args(argv)
+    if a.update and (a.quick or not a.pricing):
+        # verified_at certifies the WHOLE file, prices included, and Client
+        # reads it to decide whether to warn that facts are stale. Stamping
+        # it after a 9-endpoint smoke sweep with no price check silenced that
+        # warning on evidence that never covered it.
+        p.error("--update re-stamps every recorded fact, so it requires the "
+                "full sweep with --pricing (and without --quick)")
 
+    # Checked after argument parsing so --help and usage errors never need a
+    # key. A missing key is a setup failure (exit 2), not a passing check:
+    # callers that want to skip verification without a key decide that
+    # themselves (see .github/workflows/e2e.yml).
     if not os.environ.get("TWITTERAPI_IO_KEY"):
-        print("NOTICE: TWITTERAPI_IO_KEY not set — cannot verify. Skipping.")
-        return 0
+        _LAST_SETUP_ERROR = "TWITTERAPI_IO_KEY not set; verification was not run"
+        return 2
 
     facts = load_facts()
     age = days_since(facts.get("verified_at", ""))
@@ -397,6 +410,7 @@ def _legacy_main(argv=None):
     drift += probe_failures
 
     if drift:
+        _LAST_DRIFT = drift
         print(f"\nVERIFY FAILED — {len(drift)} check(s) failed:\n")
         for name, kind, detail in drift:
             print(f"  {name}: {kind} — {detail}")
@@ -429,10 +443,6 @@ def _axi_main(argv=None):
     from axi import emit, error, fast_version, success
     if fast_version(argv):
         return 0
-    if not os.environ.get("TWITTERAPI_IO_KEY"):
-        emit(error("setup", "TWITTERAPI_IO_KEY not set; verification was not run",
-                   "verify.py", "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
-        return 2
     progress = io.StringIO()
     try:
         with contextlib.redirect_stdout(progress):
@@ -453,15 +463,24 @@ def _axi_main(argv=None):
         print(rendered, file=sys.stderr, end="")
     lines = [line.strip() for line in rendered.splitlines() if line.strip()]
     coverage = next((line for line in lines if line.startswith("COVERAGE")), None)
-    detail = (_LAST_SETUP_ERROR if rc == 2 and _LAST_SETUP_ERROR else
-              coverage or (lines[-1] if lines else "verification produced no summary"))
+    if rc == 2 and _LAST_SETUP_ERROR:
+        detail = _LAST_SETUP_ERROR
+    elif rc == 1 and _LAST_DRIFT:
+        # Name every failed check in the JSON itself; the per-line detail on
+        # stderr is not something a caller parsing stdout ever sees.
+        detail = (f"{coverage}; " if coverage else "") + "drift: " + "; ".join(
+            f"{name}: {kind} — {info}" for name, kind, info in _LAST_DRIFT)
+    else:
+        detail = coverage or (lines[-1] if lines else "verification produced no summary")
     if rc == 0:
         emit(success("verify.py", {"verification": "passed", "summary": detail,
                                    "help": ["Run `verify.py --quick` for a lower-cost smoke sweep"]}))
     else:
         kind = "setup" if rc == 2 else "runtime"
-        emit(error(kind, detail, "verify.py",
-                   "Inspect stderr diagnostics, fix the reported condition, and rerun `verify.py`"))
+        hint = ("Set `TWITTERAPI_IO_KEY` in the environment and rerun"
+                if _LAST_SETUP_ERROR and "TWITTERAPI_IO_KEY" in _LAST_SETUP_ERROR else
+                "Inspect stderr diagnostics, fix the reported condition, and rerun `verify.py`")
+        emit(error(kind, detail, "verify.py", hint))
     return rc
 
 

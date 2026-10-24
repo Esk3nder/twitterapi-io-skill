@@ -98,8 +98,13 @@ class TestFollowerCrawlAndCache(E2ETest):
 
 
 class TestLiveEndpointRegressions(E2ETest):
-    def test_articles_returns_all_13_paid_rows_with_honest_completeness(self):
-        """F24 live: @trq212 has articles, unlike the old zero-row probe."""
+    def test_articles_returns_every_paid_row_with_honest_completeness(self):
+        """F24 live: @trq212 has articles, unlike the old zero-row probe.
+
+        The account had 13 articles when this was written and 14 on
+        2026-10-23. The regression was zero or first-page-only rows, so the
+        floor is the count once observed, not an exact count of a live
+        account that keeps publishing."""
         require_key()
         from twitterapi import Client
 
@@ -111,7 +116,9 @@ class TestLiveEndpointRegressions(E2ETest):
                  f"warning={stream._warning!r} requests={c.requests_made} "
                  f"spent={c.spent_credits}")
 
-        self.assertEqual(len(articles), 13)
+        self.assertGreaterEqual(len(articles), 13)
+        self.assertEqual(len({a.get('id') for a in articles}), len(articles),
+                         "articles must not repeat across pages")
         if not stream.complete:
             self.assertIn("partial", stream._warning.lower())
 

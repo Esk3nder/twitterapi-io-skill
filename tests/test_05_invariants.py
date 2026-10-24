@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import E2ETest, require_key
+from tests.e2e_base import E2ETest, book_floor, require_key
 
 
 def tweet(tweet_id, ts, handle="alpha"):
@@ -67,12 +67,12 @@ class ScriptedClientMixin:
 
     def _raw(self, method, path, params=None, **kwargs):
         self.raw_calls.append((method, path, dict(params or {})))
-        self._bill_request(path)
+        book_floor(self, path)
         return self._take(self.raw_responses)
 
     def _raw_json(self, method, path, body, **kwargs):
         self.json_calls.append((method, path, body))
-        self._bill_request(path)
+        book_floor(self, path)
         return self._take(self.json_responses)
 
 
@@ -608,7 +608,7 @@ class TestCorpusInvariants(E2ETest):
 class TestWindowCompleteness(E2ETest):
     def test_full_page_inside_one_second_raises_incomplete(self):
         """An unsplittable second cannot produce a confidently complete count."""
-        from jobs import _search_window
+        from workflows import search_window
         base = 1_700_000_000
         c = scripted_client(raw=[
             {"tweets": [tweet(i, base) for i in range(20)],
@@ -616,28 +616,28 @@ class TestWindowCompleteness(E2ETest):
             {"tweets": [], "has_next_page": False, "next_cursor": ""},
         ], store=MemoryStore())
         with self.assertRaises(RuntimeError):
-            _search_window(c, "from:alpha", base - 5, base + 5, max_pages=2)
+            list(search_window(c, "from:alpha", base - 5, base + 5, max_pages=2))
 
     def test_max_pages_exhaustion_raises_incomplete(self):
         """A safety cap is not evidence that the requested time range ended."""
-        from jobs import _search_window
+        from workflows import search_window
         base = 1_700_000_000
         page = {"tweets": [tweet(i, base - i) for i in range(20)],
                 "has_next_page": True, "next_cursor": "ignored"}
         c = scripted_client(raw=[page], store=MemoryStore())
         with self.assertRaises(RuntimeError):
-            _search_window(c, "from:alpha", base - 100, base + 5, max_pages=1)
+            list(search_window(c, "from:alpha", base - 100, base + 5, max_pages=1))
 
     def test_full_page_without_parseable_timestamps_raises_incomplete(self):
         """A full page with no resume boundary cannot be called exhaustive."""
-        from jobs import _search_window
+        from workflows import search_window
         records = [{"id": str(i), "createdAt": "not-a-date",
                     "author": {"userName": "alpha"}} for i in range(20)]
         c = scripted_client(raw=[{
             "tweets": records, "has_next_page": True, "next_cursor": "ignored",
         }], store=MemoryStore())
         with self.assertRaises(RuntimeError):
-            _search_window(c, "from:alpha", 1_699_999_000, 1_700_000_000)
+            list(search_window(c, "from:alpha", 1_699_999_000, 1_700_000_000))
 
 
 class TestJobAndWorkflowOrchestration(E2ETest):
@@ -705,22 +705,34 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         self.assertEqual([r["tweets_in_window"] for r in out["entities"]], [1, 1])
 
     def test_monitor_does_not_advance_checkpoint_after_incomplete_window(self):
-        """A partial poll must be retried, not checkpointed past missing tweets."""
+        """A partial poll must be retried, not checkpointed past missing tweets.
+
+        Contract (2026-10-23 review): the checkpoint now records emitted ids
+        incrementally, so the file exists; `last_ts` must stay at the start of
+        the unfinished window."""
         import workflows
 
-        def incomplete_history(*args, **kwargs):
+        def incomplete_window(*args, **kwargs):
             yield tweet("seen-before-gap", 1_700_000_000)
             raise RuntimeError("window incomplete")
 
         state_path = self.store_path("monitor-state.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
         c = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
                             _over_ceiling=lambda: False)
-        with mock.patch.object(workflows, "history_search", incomplete_history):
+        now = 1_800_000_000
+        with mock.patch.object(workflows, "search_window", incomplete_window), \
+             mock.patch.object(workflows.time, "time", return_value=now):
             with self.assertRaises(RuntimeError):
                 workflows.monitor(["alpha"], client=c, state_file=state_path,
-                                  once=True, on_tweet=lambda _: None)
-        self.assertFalse(os.path.exists(state_path),
+                                  once=True, on_tweet=lambda _: None,
+                                  lookback=900)
+        with open(state_path) as fh:
+            saved = json.load(fh)
+        self.assertEqual(saved["last_ts"], now - 900,
                          "checkpoint must not advance after a partial window")
+        self.assertEqual(saved["seen_ids"], ["seen-before-gap"])
 
     def test_unreadable_facts_emit_warning_instead_of_silently_disabling_it(self):
         """Unknown verification age must not let stale prices look trustworthy."""
@@ -927,8 +939,11 @@ class TestHistoryHonesty(E2ETest):
             calls.append(query)
             return iter(())
 
+        # A zero-post USER history now resolves the handle (2026-10-23 review:
+        # a nonexistent account must not read as an empty archive).
         client = SimpleNamespace(max_usd=1.0, spent_usd=0.0,
                                  store=MemoryStore(),
+                                 user_info=lambda handle: {"id": "1", "userName": handle},
                                  spend_report=lambda: "0 requests, ~$0.0000")
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(workflows, "Client", return_value=client), \
@@ -1266,8 +1281,10 @@ class TestLocalCorpusCapabilities(E2ETest):
             "total": 4, "unique": 4, "originals": 1, "replies": 1,
             "self_thread_replies": 1, "quotes": 1, "native_retweets": 1,
         })
+        # Contract change (2026-10-23 review): each metric also reports how
+        # many rows carried a known value, so averages never fold in absences.
         self.assertEqual(result["engagement"]["likes"],
-                         {"total": 14, "average": 3.5})
+                         {"total": 14, "average": 3.5, "known": 4, "unknown": 0})
         self.assertEqual(set(result["engagement"]), {
             "likes", "retweets", "replies", "quotes", "views", "bookmarks",
         })

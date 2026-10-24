@@ -1,4 +1,4 @@
-# Paid E2E suite against the live twitterapi.io API (~$0.13/run).
+# Paid E2E suite against the live twitterapi.io API (~$0.17/run incl. verify).
 #
 # Deliberately NOT per-push: every run spends real money from the account
 # behind the TWITTERAPI_IO_KEY secret. Manual dispatch + a weekly canary is
@@ -28,13 +28,20 @@ jobs:
         with:
           python-version: "3.12"   # stdlib only — no pip install step
 
-      # Runs first: ~$0.002 and ~15s. If the API's response contracts have
+      # Runs first: ~$0.05 and ~30s. If the API's response contracts have
       # drifted, every recorded fact downstream is suspect, so fail here
       # before spending the suite's budget proving it in a slower way.
+      # verify.py treats a missing key as a setup failure (exit 2); skipping
+      # is this workflow's decision, made here so forks stay green.
       - name: Verify recorded API facts still hold
         env:
           TWITTERAPI_IO_KEY: ${{ secrets.TWITTERAPI_IO_KEY }}
-        run: python3 scripts/verify.py
+        run: |
+          if [ -z "${TWITTERAPI_IO_KEY:-}" ]; then
+            echo "NOTICE: TWITTERAPI_IO_KEY is not set — verify.py was SKIPPED."
+            exit 0
+          fi
+          python3 scripts/verify.py
 
       - name: Run paid E2E suite (budget-capped at $0.25)
         env:
@@ -46,6 +53,7 @@ jobs:
         run: |
           echo "::warning::If 'Verify recorded API facts' failed, the live API no"
           echo "::warning::longer matches references/facts.json. Re-probe the named"
-          echo "::warning::endpoints, run 'python3 scripts/verify.py --update', and"
-          echo "::warning::fix any prose in references/verified-facts.md that repeats"
-          echo "::warning::the changed value. See tests/TRIAGE.md."
+          echo "::warning::endpoints, update the changed value in facts.json and any"
+          echo "::warning::prose in references/verified-facts.md that repeats it, then"
+          echo "::warning::re-stamp with 'python3 scripts/verify.py --pricing --update'."
+          echo "::warning::See tests/TRIAGE.md."
