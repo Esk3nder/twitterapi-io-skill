@@ -1,6 +1,6 @@
 {
   "_readme": [
-    "MACHINE-CHECKABLE EVIDENCE. Regenerate with: python3 scripts/verify.py --update",
+    "MACHINE-CHECKABLE EVIDENCE. Re-stamp with: python3 scripts/verify.py --pricing --update (full sweep only)",
     "Prose lives in verified-facts.md; THIS file is what scripts/verify.py diffs",
     "the live API against, and what Client reads to warn when it has gone stale.",
     "Never hand-edit `observed_at` — it is a claim about when someone looked."

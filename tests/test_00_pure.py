@@ -82,10 +82,18 @@ class TestEnvelopeUnpack(E2ETest):
 
     def test_the_trap_pagination_inside_data_is_ignored(self):
         """Pagination keys nested inside `data` must NOT be honoured — the API
-        puts them at the root; a nested copy would be a contract change."""
-        from twitterapi import Client, ENDPOINTS
+        puts them at the root; a nested copy would be a contract change.
+
+        Contract changed 2026-10-23: with no ROOT has_next_page, whether more
+        pages exist is unknown. Reading that as False marked cut-short walks
+        complete, so it is now IncompleteDataError — still never the nested
+        value."""
+        from twitterapi import Client, ENDPOINTS, IncompleteDataError
         resp = {"data": {"tweets": [{"id": "1"}], "has_next_page": True,
                          "next_cursor": "WRONG"}}
+        with self.assertRaises(IncompleteDataError):
+            Client._unpack(resp, ENDPOINTS["last_tweets"])
+        resp["has_next_page"] = False
         items, has_next, cur = Client._unpack(resp, ENDPOINTS["last_tweets"])
         self.assertEqual(len(items), 1)
         self.assertFalse(has_next, "must read pagination from ROOT, not data")
@@ -296,7 +304,10 @@ class TestPublicCohortConstruction(E2ETest):
         s.save_cohort("keep", [("3", "carol", 1.0, "test")])
 
         self.assertEqual(s.delete_cohort("test"), 2)
-        self.assertEqual(s.load_cohort("test"), [])
+        # Contract change 2026-10-23: a name with no saved version raises
+        # KeyError instead of loading as an empty cohort.
+        with self.assertRaises(KeyError):
+            s.load_cohort("test")
         self.assertEqual(s.cohort_versions("test"), [])
         self.assertEqual(s.cohort_versions("keep"), [1])
 
@@ -435,39 +446,38 @@ class TestSetAlgebra(E2ETest):
         self.assertEqual(r1, r2, "same inputs must produce identical member sets")
 
 
-@unittest.skipUnless(HAVE_KEY, "cohort_drift constructs a Client (no HTTP here)")
 class TestCohortVersioningAndDrift(E2ETest):
+    """Runs without a key: Cohort creates its Client only for paid calls, so
+    load, set algebra and drift are local (review 2026-10-23)."""
+
     def test_save_load_drift(self):
-        from twitterapi import Client
         from cohort import Cohort
         from jobs import cohort_drift
         s = self.fresh_store("drift")
-        c = Client(verbose=False, store=s)
         v1 = s.save_cohort("scene", [("1", "alice", 1.0, "t"), ("2", "bob", 1.0, "t")])
         v2 = s.save_cohort("scene", [("2", "bob", 1.0, "t"), ("3", "carol", 1.0, "t")])
         self.assertEqual((v1, v2), (1, 2), "versions must auto-increment")
-        out = cohort_drift("scene", client=c)
+        out = cohort_drift("scene", store=s)
         self.log(f"drift: {out}")
         self.assertEqual(out["joined"], ["carol"])
         self.assertEqual(out["left"], ["alice"])
         self.assertEqual((out["old_size"], out["new_size"]), (2, 2))
         # load() round-trips
-        got = Cohort.load("scene", client=c, store=s)
+        got = Cohort.load("scene", store=s)
         self.assertEqual(len(got), 2)
+        self.assertIsNone(got._client, "loading must not construct a Client")
 
     def test_drift_default_is_previous_step_not_whole_history(self):
         """Three versions, because with only two, first-ever and previous
         coincide — which is exactly how the versions[0] default survived the
         original two-version test while a 30-day watch would have reported a
         month of churn as one day's."""
-        from twitterapi import Client
         from jobs import cohort_drift
         s = self.fresh_store("drift3")
-        c = Client(verbose=False, store=s)
         s.save_cohort("w", [("1", "a", 1.0, "t")])
         s.save_cohort("w", [("1", "a", 1.0, "t"), ("2", "b", 1.0, "t")])
         s.save_cohort("w", [("2", "b", 1.0, "t"), ("3", "x", 1.0, "t")])
-        out = cohort_drift("w", client=c)
+        out = cohort_drift("w", store=s)
         self.assertEqual((out["from_version"], out["to_version"]), (2, 3),
                          "default drift must diff the previous version, "
                          "not the first ever saved")
@@ -477,7 +487,7 @@ class TestCohortVersioningAndDrift(E2ETest):
         with self.assertRaises(ValueError, msg="an absent version loads as an "
                                "EMPTY cohort, so without validation a typo "
                                "reports every member as newly joined"):
-            cohort_drift("w", v_old=1, v_new=99, client=c)
+            cohort_drift("w", v_old=1, v_new=99, store=s)
 
 
 class TestFollowerIdsCrawlGenerations(E2ETest):

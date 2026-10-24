@@ -25,31 +25,37 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from statistics import median
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import (APIError, Client, CostLimitExceeded,
-                        IncompleteDataError, enrich_tweet_media,
-                        filter_search_tweets, prepare_search_query)  # noqa: E402
+                        IncompleteDataError)  # noqa: E402
 from store import Store  # noqa: E402
+from workflows import search_window  # noqa: E402
 from cohort import Cohort  # noqa: E402
-from axi import (ACCOUNT_FIELDS, MEDIA_FIELDS, TWEET_FIELDS, ArgumentParser,
+from axi import (MEDIA_FIELDS, TWEET_FIELDS, ArgumentParser,
                  HelpFormatter, UsageError, add_common_output_flags, dashboard, emit, error,
-                 check_hooks, display_path, fast_version, parse_fields, prepare_output,
-                 run_cli, script_command, setup_hooks,
-                 success)  # noqa: E402
+                 display_path, fast_version, parse_fields, prepare_output,
+                 run_cli, success)  # noqa: E402
+
+DEFAULT_MAX_USD = 5.0
+DEFAULT_RESUME = ("Rerun (cached pages are free); if the reason names the "
+                  "spend ceiling, raise `--max-usd <amount>`, or narrow the "
+                  "requested scope")
 
 
-def _client(max_usd=5.0, store_path=None):
+class SetupError(RuntimeError):
+    """Missing configuration. The CLI contract maps this to exit 2."""
+
+
+def _client(max_usd=DEFAULT_MAX_USD, store_path=None):
     # Validate configuration before opening sqlite, so a missing key cannot
     # leak a connection while the first-run error crosses the CLI boundary.
     if not os.environ.get("TWITTERAPI_IO_KEY"):
-        raise RuntimeError(
+        raise SetupError(
             "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it.")
     store = Store(store_path) if store_path else Store()
     try:
@@ -63,14 +69,87 @@ def _days_ago(days):
     return int(time.time()) - days * 86400
 
 
-def _materialize_complete(stream, label):
-    """Consume a PaginationStream without losing its post-iteration status."""
-    rows = list(stream)
+# ------------------------------------------------------- partial results ----
+# One mechanism for every paid job: a gather step that stops early (spend
+# ceiling, unprovable completeness) hands back the rows it already holds plus
+# a reason, and the job reports them as the partial contract. Only a stop that
+# happened before anything was gathered OR paid is a true refusal; it re-raises
+# so the CLI exits 2. An API or network failure is a stop only where the
+# paginated stream already holds rows (Client.paginate marks it partial); on a
+# first page, and in the search-window walker, it propagates and exits 1.
+_STOPS = (CostLimitExceeded, IncompleteDataError)
+
+
+def _stop_reason(c, exc, rows):
+    if (isinstance(exc, CostLimitExceeded) and not rows
+            and not (getattr(c, "spent_usd", 0) or 0) > 0):
+        raise exc
+    return str(exc)
+
+
+def _drain(c, stream, label):
+    """Consume a paginated stream -> (rows, stop reason or None)."""
+    rows = []
+    try:
+        for row in stream:
+            rows.append(row)
+    except _STOPS as exc:
+        return rows, _stop_reason(c, exc, rows)
     if getattr(stream, "complete", True) is False:
-        raise IncompleteDataError(
-            getattr(stream, "_warning", None) or
-            f"{label} ended before completeness was proven; returned rows are partial")
-    return rows
+        return rows, (getattr(stream, "_warning", None) or
+                      f"{label} ended before completeness was proven")
+    return rows, None
+
+
+def _walk(c, gather):
+    """Run a walker -> (rows, stop reason or None).
+
+    `gather()` returns an iterable. Rows are collected as they arrive, so a
+    generator that raises after yielding (workflows.search_window) keeps what
+    it already bought; a list-returning walker that stops early may attach
+    its acquired rows as `exc.records` instead."""
+    rows = []
+    try:
+        for row in gather():
+            rows.append(row)
+        return rows, None
+    except _STOPS as exc:
+        rows.extend(getattr(exc, "records", None) or [])
+        return rows, _stop_reason(c, exc, rows)
+
+
+def _status(reasons, resume=None):
+    """Completeness keys every paid job merges into its payload."""
+    reasons = [r.removeprefix("PARTIAL: ") for r in reasons if r]
+    return {"complete": not reasons,
+            "_warning": ("PARTIAL: " + "; ".join(reasons)) if reasons else None,
+            "_resume": (resume or DEFAULT_RESUME) if reasons else None}
+
+
+def _known_bool(record, key):
+    """True/False when the field was reported; None when it was absent."""
+    value = (record or {}).get(key)
+    return None if value is None else bool(value)
+
+
+def _tweet_row(t):
+    """A tweet exposing every TWEET_FIELDS name; absent counts stay null."""
+    return {"id": t.get("id"), "text": t.get("text"),
+            "likes": t.get("likeCount"), "retweets": t.get("retweetCount"),
+            "replies": t.get("replyCount"), "quotes": t.get("quoteCount"),
+            "views": t.get("viewCount"), "author": t.get("author"),
+            "created_at": t.get("createdAt"), "media": _row_media(t)}
+
+
+def _clean_handles(handles):
+    """Strip whitespace and '@', drop empties, dedupe case-insensitively."""
+    out, keys = [], set()
+    for handle in handles:
+        clean = (handle or "").strip().lstrip("@").strip()
+        if clean and clean.casefold() not in keys:
+            keys.add(clean.casefold())
+            out.append(clean)
+    return out
 
 
 # ---------------------------------------------------------------- corpus ----
@@ -114,7 +193,8 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
             queries.append(q)
         try:
             results = c.bulk_search(queries)
-        except CostLimitExceeded:
+        except CostLimitExceeded as exc:
+            exc.records = out          # earlier batches were bought and stored
             raise
         except Exception as e:
             # Batching is an optimisation, never a correctness dependency:
@@ -167,12 +247,17 @@ def corpus(handles, since_ts=None, until_ts=None, *, client=None):
     # Only the busy handles pay for a full sliding-window walk. Dedupe by id
     # absorbs the first page the walk re-fetches.
     for h, resume_ts in needs_walk:
-        # CostLimitExceeded propagates: a truncated corpus must never be
-        # returned as if it were complete — brief/narrative/benchmark would
-        # silently compare complete-vs-partial windows.
-        for t in _search_window(c, f"from:{h}", since_ts or 0, resume_ts):
-            if t.get("id") not in seen:      # the walk re-fetches page 1
-                seen.add(t.get("id")); out.append(t)
+        # A stop propagates so a truncated corpus is never returned as if it
+        # were complete — brief/narrative/benchmark would silently compare
+        # complete-vs-partial windows. The rows already bought travel with
+        # it as `exc.records` so the caller can return them as a partial.
+        try:
+            for t in search_window(c, f"from:{h}", since_ts or 0, resume_ts):
+                if t.get("id") not in seen:  # the walk re-fetches page 1
+                    seen.add(t.get("id")); out.append(t)
+        except _STOPS as exc:
+            exc.records = out
+            raise
     return out
 
 
@@ -196,6 +281,24 @@ def _raw_tweet(row):
         except (TypeError, ValueError):
             raw = {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _metric(row, raw, column, wire):
+    """One engagement count, or None when it was never reported.
+
+    The stored wire payload is authoritative for presence: a pre-migration
+    column holds 0 for an absent count, which is indistinguishable from a
+    real zero. Without a raw payload, a NULL column is unknown."""
+    if raw:
+        value = raw.get(wire)
+    else:
+        value = row.get(column) if column else None
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _row_media(row):
@@ -263,9 +366,16 @@ def catalogue(handle, *, store=None):
         "replies": 0, "self_thread_replies": 0, "quotes": 0,
         "native_retweets": 0,
     }
-    metric_names = ("likes", "retweets", "replies", "quotes", "views",
-                    "bookmarks")
-    metric_values = {name: [] for name in metric_names}
+    # Public metric -> (store column, wire field). The wire payload decides
+    # whether a count was REPORTED: last_tweets omits viewCount, and an absent
+    # count is unknown, not zero. Averages use known values only.
+    metrics = {"likes": ("likes", "likeCount"),
+               "retweets": ("retweets", "retweetCount"),
+               "replies": ("replies", "replyCount"),
+               "quotes": ("quotes", "quoteCount"),
+               "views": ("views", "viewCount"),
+               "bookmarks": (None, "bookmarkCount")}
+    metric_values = {name: [] for name in metrics}
     monthly = {}
     stamps = []
 
@@ -293,38 +403,35 @@ def catalogue(handle, *, store=None):
                          or (reply_name and reply_name == author_name)):
             counts["self_thread_replies"] += 1
 
-        values = {
-            "likes": row.get("likes", raw.get("likeCount", 0)),
-            "retweets": row.get("retweets", raw.get("retweetCount", 0)),
-            "replies": row.get("replies", raw.get("replyCount", 0)),
-            "quotes": row.get("quotes", raw.get("quoteCount", 0)),
-            "views": row.get("views", raw.get("viewCount", 0)),
-            "bookmarks": raw.get("bookmarkCount", 0),
-        }
-        for name, value in values.items():
-            try:
-                metric_values[name].append(int(value or 0))
-            except (TypeError, ValueError):
-                metric_values[name].append(0)
+        likes = None
+        for name, (column, wire) in metrics.items():
+            value = _metric(row, raw, column, wire)
+            if value is not None:
+                metric_values[name].append(value)
+            if name == "likes":
+                likes = value
 
         stamp = int(row.get("created_ts") or 0)
         if stamp:
             stamps.append(stamp)
             month = datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m")
-            monthly.setdefault(month, []).append(metric_values["likes"][-1])
+            monthly.setdefault(month, []).append(likes)
 
     engagement = {}
     for name, values in metric_values.items():
         total = sum(values)
         engagement[name] = {
-            "total": total,
+            "total": total if values else None,
             "average": round(total / len(values), 2) if values else None,
+            "known": len(values),
+            "unknown": len(rows) - len(values),
         }
-    month_series = [
-        {"month": month, "volume": len(likes),
-         "median_likes": float(median(likes))}
-        for month, likes in sorted(monthly.items())
-    ]
+    month_series = []
+    for month, likes in sorted(monthly.items()):
+        known = [v for v in likes if v is not None]
+        month_series.append({"month": month, "volume": len(likes),
+                             "median_likes": (float(median(known))
+                                              if known else None)})
     return {
         "handle": handle.lstrip("@"),
         "counts": counts,
@@ -390,23 +497,21 @@ def entity_brief(handle, *, days=30, client=None):
     output. Returns structure; the model writes the actual brief."""
     c = client or _client()
     info = c.user_info(handle)
-    tweets = corpus([handle], since_ts=_days_ago(days), client=c)
-    tweets.sort(key=lambda t: t.get("likeCount", 0), reverse=True)
+    tweets, stop = _walk(c, lambda: corpus(
+        [handle], since_ts=_days_ago(days), client=c))
+    tweets.sort(key=lambda t: t.get("likeCount") or 0, reverse=True)
     return {
         "entity": handle,
         "profile": {"name": info.get("name"), "followers": info.get("followers"),
                     "description": info.get("description"),
-                    "verified": bool(info.get("isBlueVerified"))},
+                    "verified": _known_bool(info, "isBlueVerified")},
         "window_days": days,
         "tweet_count": len(tweets),
-        "top_tweets": [{"id": t.get("id"), "text": t.get("text"),
-                        "likes": t.get("likeCount"),
-                        "retweets": t.get("retweetCount"),
-                        "created_at": t.get("createdAt"),
-                        "media": _row_media(t)} for t in tweets[:15]],
+        "top_tweets": [_tweet_row(t) for t in tweets[:15]],
         "top_tweets_total": len(tweets),
         "media": _media_summary(tweets),
         "_note": "Interpretation (themes, posture) is the caller's job, not this function's.",
+        **_status([stop]),
         "spend": c.spend_report(),
     }
 
@@ -421,8 +526,10 @@ def narrative_tracker(query, *, days=30, client=None):
     # Both windows use the SAME bounded walk so the author diff is apples-to-
     # apples. An earlier version compared an unbounded current against a
     # capped prior, misclassifying dropped prior authors as "new".
-    cur = _search_window(c, query, now - days * 86400, now)
-    prior = _search_window(c, query, now - 2 * days * 86400, now - days * 86400)
+    cur, cur_stop = _walk(c, lambda: search_window(
+        c, query, now - days * 86400, now))
+    prior, prior_stop = _walk(c, lambda: search_window(
+        c, query, now - 2 * days * 86400, now - days * 86400))
 
     def authors(ts):
         return {(t.get("author") or {}).get("userName", "").lower()
@@ -437,12 +544,21 @@ def narrative_tracker(query, *, days=30, client=None):
                     h[k] = h.get(k, 0) + 1
         return h
 
-    a_now, a_prior = authors(cur), authors(prior)
-    h_now, h_prior = hashtags(cur), hashtags(prior)
-    new_authors = sorted(a_now - a_prior)
-    rising_hashtags = sorted(
-        ((k, h_now[k], h_prior.get(k, 0)) for k in h_now),
-        key=lambda x: x[1] - x[2], reverse=True)
+    reasons = [f"current window: {cur_stop}" if cur_stop else None,
+               f"prior window: {prior_stop}" if prior_stop else None]
+    if prior_stop:
+        # Against a partial prior window, an author or tag it never reached
+        # would be reported as "new" — absence read as a confident diff.
+        new_authors, rising_hashtags = [], []
+        reasons.append("new_authors and rising_hashtags are omitted because "
+                       "the prior window is incomplete")
+    else:
+        a_now, a_prior = authors(cur), authors(prior)
+        h_now, h_prior = hashtags(cur), hashtags(prior)
+        new_authors = sorted(a_now - a_prior)
+        rising_hashtags = sorted(
+            ((k, h_now[k], h_prior.get(k, 0)) for k in h_now),
+            key=lambda x: x[1] - x[2], reverse=True)
     return {
         "query": query, "window_days": days,
         "new_authors": new_authors[:40],
@@ -451,86 +567,9 @@ def narrative_tracker(query, *, days=30, client=None):
         "rising_hashtags": rising_hashtags[:20],
         "rising_hashtags_total": len(rising_hashtags),
         "_note": "New authors and rising tags are computed; naming the narrative is the caller's job.",
+        **_status(reasons),
         "spend": c.spend_report(),
     }
-
-
-def _search_window(c, query, since_ts, until_ts, max_pages=1000):
-    """Sliding-window historical search (same technique as workflows.history).
-
-    max_pages defaults high (effectively "until the range is exhausted"); pass a
-    smaller value only when a deliberate cap is wanted. A low fixed cap here
-    silently truncates a busy window — the bug that biased narrative_tracker."""
-    from store import parse_ts
-    # Same wire discipline as Client.paginate("search") and history_search:
-    # bare since:/until: tokens resolve outside UTC on the index, and
-    # min_faves filters on a stale like-count snapshot, so the operator is
-    # stripped here and enforced locally against each tweet's live likeCount.
-    # Sending the query raw resurrected both documented traps for any
-    # user-supplied `narrative` query that carried them.
-    query, local_min_faves = prepare_search_query(query)
-    out, seen = [], set()
-    ut = until_ts
-    for _ in range(max_pages):
-        q = f"{query} since_time:{since_ts} until_time:{ut}"
-        resp = c._raw("GET", "/twitter/tweet/advanced_search",
-                      {"query": q, "queryType": "Latest"},
-                      max_credits=Client.page_credits("search", 20, 20))
-        batch = [enrich_tweet_media(tweet)
-                 for tweet in (resp.get("tweets") or [])]
-        c._charge("search", len(batch), 20)
-        if c.store:
-            c.store.put_tweets(batch)
-        # Stamps come from the WHOLE page (resume boundary must not depend
-        # on which tweets qualify); the local min_faves predicate gates only
-        # what the caller receives. The full page is already persisted above —
-        # paid data is kept even when filtered from this result.
-        qualifying = {t.get("id") for t in filter_search_tweets(batch, local_min_faves)}
-        stamps = []
-        for t in batch:
-            ts = parse_ts(t.get("createdAt") or "")
-            if ts:
-                stamps.append(ts)
-            if t.get("id") not in seen and t.get("id") in qualifying:
-                seen.add(t.get("id")); out.append(t)
-        if len(batch) < 20:
-            break                       # short page = range genuinely exhausted
-        if not stamps:
-            raise IncompleteDataError(
-                f"full search page for {query!r} had no parseable createdAt "
-                f"timestamps, so no safe resume boundary exists")
-        # Ceiling stop is an ERROR, not an end-of-data: raise so the caller
-        # knows the corpus is partial. (A bare break here made corpus()'s
-        # except-CostLimitExceeded dead code and silently truncated windows.)
-        if c._over_ceiling():
-            raise CostLimitExceeded(
-                f"Spend ceiling hit at ${c.spent_usd:,.2f} of ${c.max_usd:,.2f} "
-                f"mid-window on {query!r}; the corpus for this window is "
-                f"INCOMPLETE. Raise max_usd to fetch it fully.")
-        oldest = min(stamps)
-        if max(stamps) == oldest:
-            # A FULL page inside one second: a time window cannot page within
-            # a single second, so whatever else was posted in it is dropped.
-            # Record it — never lose data silently. (Same guard as
-            # workflows.history_search.)
-            print(f"[jobs] WARNING: 20+ tweets share second {oldest}; "
-                  f"time-window paging cannot split a second — some tweets "
-                  f"in it are being skipped.", file=sys.stderr)
-            raise IncompleteDataError(
-                f"20+ tweets share second {oldest}; a time window cannot split "
-                f"that second, so the corpus for {query!r} is INCOMPLETE.")
-        else:
-            new_ut = oldest + 1         # re-include boundary; dedupe handles it
-        if new_ut >= ut:
-            new_ut = ut - 1             # force progress rather than refetch
-        ut = new_ut
-        if ut <= since_ts:
-            break                       # boundary reached = clean exhaustion
-    else:
-        raise IncompleteDataError(
-            f"search hit max_pages={max_pages} before exhausting {query!r}; "
-            f"the corpus is INCOMPLETE.")
-    return out
 
 
 # --------------------------------------------------------- authority map ----
@@ -539,13 +578,21 @@ def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
     """Who a scene itself follows (frontier), from a topic seed. Expensive —
     the follow-graph crawl — so it estimates and refuses past max_usd."""
     c = client or _client(max_usd)
-    co = Cohort.from_search(seed_query, limit=cohort_limit, client=c, store=c.store)
+    try:
+        co = Cohort.from_search(seed_query, limit=cohort_limit, client=c,
+                                store=c.store)
+    except _STOPS as exc:
+        # The seed search stopped early: a partial cohort is a different
+        # population, so no frontier is ranked from it.
+        return {"seed": seed_query, "cohort_size": None, "members_crawled": 0,
+                "frontier": [], "frontier_total": 0,
+                **_status([f"seed search: {_stop_reason(c, exc, [])}"]),
+                "spend": c.spend_report()}
     co.authority(max_usd=max_usd, confirm=True, progress=progress)
     ranked = [m for m in co.top(len(co)) if m["weight"] > 0]
-    complete = getattr(co, "authority_complete", True)
+    complete = getattr(co, "authority_complete", True) is not False
     return {
         "seed": seed_query, "cohort_size": len(co),
-        "complete": complete,
         "members_crawled": getattr(co, "authority_crawled", len(co)),
         "frontier": [{"handle": m["user_name"], "in_degree": m["weight"]}
                      for m in ranked[:30]],
@@ -553,9 +600,12 @@ def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
         # The reason comes from the crawl itself: a ceiling stop and an API
         # failure mid-walk are different problems with different fixes, and
         # hardcoding the ceiling text here misdiagnosed the latter.
-        "_warning": None if complete else "PARTIAL: " + (
+        **_status([None if complete else (
             getattr(co, "authority_incomplete_reason", None)
-            or "the follow-graph walk ended before completeness was proven"),
+            or "the follow-graph walk ended before completeness was proven")],
+            resume=("Raise `--max-usd <amount>` and rerun if the spend "
+                    "ceiling stopped the crawl; members whose followings "
+                    "failed (protected, suspended) stay uncounted")),
         "spend": c.spend_report(),
     }
 
@@ -566,39 +616,56 @@ def overlap(handle_a, handle_b, *, ids_only=True, max_usd=5.0, client=None):
     point of caching. Returns counts + a sample of overlapping ids."""
     c = client or _client(max_usd)
     # Estimate BEFORE crawling: full follower sets of two large accounts can be
-    # tens of dollars. Refuse up front rather than aborting mid-crawl.
-    na = c.follower_count(handle_a)
-    nb = c.follower_count(handle_b)
-    est = c.estimate("follower_ids", na) + c.estimate("follower_ids", nb)
+    # tens of dollars. Refuse up front rather than aborting mid-crawl. Pages
+    # the store already holds are served free, so only the uncached remainder
+    # is priced; a fully cached rerun needs no lookup at all.
+    est, counts = 0.0, []
+    for handle in (handle_a, handle_b):
+        cached = c.store.follower_ids_for(handle) if c.store else []
+        if getattr(cached, "complete", False):
+            counts.append(f"@{handle} cached")
+            continue
+        n = c.user_info(handle).get("followers")
+        if n is None:
+            raise CostLimitExceeded(
+                f"overlap({handle_a},{handle_b}): @{handle}'s follower count "
+                f"is unknown, so the crawl cost cannot be bounded; refusing "
+                f"before the crawl.")
+        remaining = max(0, int(n) - len(cached))
+        counts.append(f"@{handle} {remaining:,} uncached of {int(n):,}")
+        est += c.estimate("follower_ids", remaining)
     if est > max_usd:
         raise CostLimitExceeded(
             f"overlap({handle_a},{handle_b}) ~= ${est:,.2f} "
-            f"({na:,}+{nb:,} followers), over ${max_usd:,.2f}. Raise --max-usd "
+            f"({', '.join(counts)}), over ${max_usd:,.2f}. Raise --max-usd "
             f"to run it (results cache, so a re-run is free).")
+    ids_a, stop_a = _drain(c, c.follower_ids(handle_a), f"followers for @{handle_a}")
+    ids_b, stop_b = _drain(c, c.follower_ids(handle_b), f"followers for @{handle_b}")
     A = Cohort(client=c, store=c.store, label=f"followers:{handle_a}")
-    stream_a = c.follower_ids(handle_a)
-    for uid in stream_a:
+    for uid in ids_a:
         A._add(uid, None, 1.0, "follower")
-    if getattr(stream_a, "complete", True) is False:
-        raise IncompleteDataError(getattr(stream_a, "_warning", None) or
-                                  f"followers for @{handle_a} are partial")
     B = Cohort(client=c, store=c.store, label=f"followers:{handle_b}")
-    stream_b = c.follower_ids(handle_b)
-    for uid in stream_b:
+    for uid in ids_b:
         B._add(uid, None, 1.0, "follower")
-    if getattr(stream_b, "complete", True) is False:
-        raise IncompleteDataError(getattr(stream_b, "_warning", None) or
-                                  f"followers for @{handle_b} are partial")
     both = A.intersect(B)
-    empty = len(A) == 0 or len(B) == 0
+    partial = bool(stop_a or stop_b)
+    empty = not partial and (len(A) == 0 or len(B) == 0)
+    reasons = [stop_a, stop_b]
+    if partial:
+        reasons.append("overlap is a lower bound over the followers fetched; "
+                       "jaccard is omitted")
+    status = _status(reasons)
+    if empty:
+        status["_warning"] = ("one or both accounts returned 0 followers "
+                              "(suspended, private, or renamed) — the overlap "
+                              "is not meaningful")
     return {
         "a": handle_a, "b": handle_b,
         "a_followers": len(A), "b_followers": len(B), "overlap": len(both),
-        "jaccard": round(len(both) / max(1, len(A) + len(B) - len(both)), 4),
+        "jaccard": (None if partial else
+                    round(len(both) / max(1, len(A) + len(B) - len(both)), 4)),
         "sample_ids": both.ids()[:50], "sample_ids_total": len(both),
-        "_warning": ("one or both accounts returned 0 followers (suspended, "
-                     "private, or renamed) — the overlap is not meaningful"
-                     if empty else None),
+        **status,
         "spend": c.spend_report(),
     }
 
@@ -610,39 +677,55 @@ def authenticity_audit(handle, *, sample=1000, client=None):
     renders the verdict."""
     c = client or _client()
     info = c.user_info(handle)
-    followers = _materialize_complete(
-        c.paginate("followers", handle, limit=sample), f"followers for @{handle}")
+    followers, stop = _drain(
+        c, c.paginate("followers", handle, limit=sample), f"followers for @{handle}")
     now = datetime.now(timezone.utc)
-    ages, no_bio, egg_like = [], 0, 0
+    ages, no_bio, bio_known, egg_like, counts_known = [], 0, 0, 0, 0
     from store import parse_ts
+
+    def first_present(record, *keys):
+        # 0 is a real count; only an absent key (or null) is unknown.
+        return next((record[k] for k in keys if record.get(k) is not None), None)
+
     for f in followers:
         ca = f.get("created_at") or f.get("createdAt") or ""
         ts = parse_ts(ca)
         if ts:
             ages.append((now - datetime.fromtimestamp(ts, timezone.utc)).days)
-        if not (f.get("description") or f.get("bio")):
-            no_bio += 1
-        fo = f.get("followers_count") or f.get("followers") or 0
-        fr = f.get("following_count") or f.get("friends_count") or f.get("following") or 0
-        if fo == 0 and fr > 500:
-            egg_like += 1
-    n = len(followers) or 1
+        bio = first_present(f, "description", "bio")
+        if bio is not None:
+            bio_known += 1
+            no_bio += not bio
+        fo = first_present(f, "followers_count", "followers")
+        fr = first_present(f, "following_count", "friends_count", "following")
+        if fo is not None and fr is not None:
+            counts_known += 1
+            egg_like += fo == 0 and fr > 500
     ages.sort()
+    status = _status([stop])
+    if not followers and not stop:
+        status["_warning"] = ("0 followers sampled — account may be "
+                              "suspended/private; percentages below are not "
+                              "meaningful")
     return {
         "handle": handle,
         "stated_followers": info.get("followers"),
         "sampled": len(followers),
-        "_warning": ("0 followers sampled — account may be suspended/private; "
-                     "percentages below are not meaningful" if not followers else None),
         "median_follower_age_days": ages[len(ages) // 2] if ages else None,
         # Denominator is the PARSED subset: dividing by the whole sample
         # understates the young-account signal when created_at fails to parse.
         "pct_accounts_under_90d": (round(100 * sum(a < 90 for a in ages)
                                          / len(ages), 1) if ages else None),
         "created_at_parse_failures": len(followers) - len(ages),
-        "pct_no_bio": round(100 * no_bio / n, 1),
-        "pct_egg_like": round(100 * egg_like / n, 1),
+        # Denominators are the profiles that REPORTED the field: an absent
+        # bio or count is unknown, not "no bio" / 0 followers.
+        "pct_no_bio": round(100 * no_bio / bio_known, 1) if bio_known else None,
+        "bio_unknown": len(followers) - bio_known,
+        "pct_egg_like": (round(100 * egg_like / counts_known, 1)
+                         if counts_known else None),
+        "counts_unknown": len(followers) - counts_known,
         "_note": "These are signals, not a verdict. Interpretation is the caller's job.",
+        **status,
         "spend": c.spend_report(),
     }
 
@@ -657,17 +740,31 @@ def diffusion_trace(tweet_id, *, limit=500, client=None):
     date, which must NOT be used to order them (doing so invents a false
     timeline). They are reported as a separate count, not placed on the axis.
 
-    `limit` bounds each of the three crawls (replies, quotes, retweeters) —
-    a moderately viral tweet at the old fixed 500 cost ~$0.22 with no lever.
-    CostLimitExceeded propagates: a truncated trace must never be returned as
-    if it were complete (same contract as Cohort.from_engagers).
+    `limit` (`--limit`) bounds each of the three crawls (replies, quotes,
+    retweeters). A leg that stops at the limit while more data existed, at the
+    spend ceiling, or with unprovable completeness makes the trace PARTIAL:
+    replies arrive newest first (queryType=Latest), so a truncated leg can
+    miss the true earliest movers. Transport and API failures propagate.
     """
     from store import parse_ts
     c = client or _client()
-    timed, retweeters = [], 0
-    for kind, ep in (("reply", "replies_v2"), ("quote", "quotes")):
-        records = _materialize_complete(
-            c.paginate(ep, str(tweet_id), limit=limit), f"{kind}s for {tweet_id}")
+    timed, retweeters, reasons, limited = [], 0, [], False
+    legs = (("reply", "replies_v2", {"queryType": "Latest"}),
+            ("quote", "quotes", None),
+            ("retweet", "retweeters", None))
+    for kind, ep, extra in legs:
+        stream = c.paginate(ep, str(tweet_id), limit=limit, extra=extra)
+        records, stop = _drain(c, stream, f"{kind}s for {tweet_id}")
+        if stop:
+            reasons.append(stop)
+        elif getattr(stream, "truncated_by_limit", False):
+            limited = True
+            reasons.append(
+                f"{kind}s for {tweet_id} stopped at --limit {limit:,} while "
+                f"more existed; earliest_movers may miss the true earliest")
+        if kind == "retweet":
+            retweeters = len(records)
+            continue
         for rec in records:
             a = rec.get("author") or {}
             ts = parse_ts(rec.get("createdAt") or "")
@@ -676,11 +773,6 @@ def diffusion_trace(tweet_id, *, limit=500, client=None):
                               "handle": a.get("userName") or a.get("screen_name"),
                               "followers": a.get("followers"),
                               "createdAt": rec.get("createdAt"), "_ts": ts})
-    # Transport, API, incompleteness, and ceiling failures all propagate. A
-    # partial three-leg crawl cannot be represented by confident zero counts.
-    retweeters = len(_materialize_complete(
-        c.paginate("retweeters", str(tweet_id), limit=limit),
-        f"retweeters for {tweet_id}"))
     timed.sort(key=lambda e: e["_ts"])
     for e in timed:
         e.pop("_ts", None)
@@ -692,15 +784,19 @@ def diffusion_trace(tweet_id, *, limit=500, client=None):
                     "quote": sum(1 for e in timed if e["kind"] == "quote"),
                     "retweet": retweeters},
         "_note": "Retweeters lack a retweet timestamp and are counted, not time-ordered.",
+        **_status(reasons, resume=(
+            "Raise `--limit <count>` (and `--max-usd <amount>` if needed) and rerun"
+            if limited else None)),
         "spend": c.spend_report(),
     }
 
 
 # --------------------------------------------------------- cohort drift -----
-def cohort_drift(name, v_old=None, v_new=None, *, client=None):
-    """Who joined, left, or rose between two saved resolutions of a cohort."""
-    c = client or _client()
-    versions = c.store.cohort_versions(name)
+def cohort_drift(name, v_old=None, v_new=None, *, store):
+    """Who joined or left between two saved resolutions of a cohort.
+
+    Pure local computation over the store: no API key, no Client, $0."""
+    versions = store.cohort_versions(name)
     if len(versions) < 2:
         raise ValueError(
             f"cohort '{name}' has versions {versions or '[]'} — drift needs at "
@@ -713,49 +809,67 @@ def cohort_drift(name, v_old=None, v_new=None, *, client=None):
     v_new = v_new if v_new is not None else versions[-1]
     missing = [v for v in (v_old, v_new) if v not in versions]
     if missing:
-        # Cohort.load returns an EMPTY cohort for an absent version, so
-        # without this check a typo'd version reports every member as joined.
+        # Named here with the available versions; Cohort.load would also
+        # refuse, but with a bare KeyError.
         raise ValueError(f"version(s) {missing} not saved for '{name}'; "
                          f"available: {versions}")
     if v_old == v_new:
         raise ValueError(f"v_old and v_new are both {v_old}; pick two different "
                          f"versions from {versions}.")
-    old = Cohort.load(name, v_old, client=c, store=c.store)
-    new = Cohort.load(name, v_new, client=c, store=c.store)
-    joined = new.minus(old)
-    left = old.minus(new)
-    joined_values = [m["user_name"] or m["account_id"] for m in joined]
-    left_values = [m["user_name"] or m["account_id"] for m in left]
+    # No client: Cohort creates one only for paid calls, and drift makes none.
+    old = Cohort.load(name, v_old, store=store)
+    new = Cohort.load(name, v_new, store=store)
+    joined_values = [m["user_name"] or m["account_id"]
+                     for m in new.minus(old).members.values()]
+    left_values = [m["user_name"] or m["account_id"]
+                   for m in old.minus(new).members.values()]
+    partial = [f"version {v} was saved partial: {'; '.join(co.incomplete_reasons)}"
+               for v, co in ((v_old, old), (v_new, new)) if not co.complete]
     return {
+        **_status(partial, "Re-resolve the cohort with a higher limit or "
+                           "`--max-usd`, save it, and rerun drift"),
         "cohort": name, "from_version": v_old, "to_version": v_new,
-        "old_size": len(old), "new_size": len(new),
+        "old_size": len(old.members), "new_size": len(new.members),
         "joined": joined_values[:60], "joined_total": len(joined_values),
         "left": left_values[:60], "left_total": len(left_values),
+        "spend": "$0.00 (local cache only)",
     }
 
 
 # ----------------------------------------------- competitive benchmark ------
 def competitive_benchmark(handles, *, days=30, client=None):
     """N entities on shared axes: reach, recent volume, top-post engagement."""
+    # "stripe, vercel" must not send `from: vercel` (a different, empty query).
+    handles = _clean_handles(handles)
+    if not handles:
+        raise UsageError("benchmark needs at least one handle, e.g. "
+                         "`jobs.py benchmark stripe,vercel`")
     c = client or _client()
     # ONE corpus call for all handles so bulk_search actually batches them.
     # Calling corpus([h]) per handle made every batch a single query, which
     # defeated the point entirely.
     since = _days_ago(days)
-    allt = corpus(handles, since_ts=since, client=c)
+    allt, stop = _walk(c, lambda: corpus(handles, since_ts=since, client=c))
+    reasons = [stop]
     by_handle = {}
     for t in allt:
         by_handle.setdefault(
-            ((t.get("author") or {}).get("userName") or "").lower(), []).append(t)
+            ((t.get("author") or {}).get("userName") or "").casefold(), []).append(t)
     rows = []
     for h in handles:
-        info = c.user_info(h)
-        tw = by_handle.get(h.lstrip("@").lower(), [])
-        peak = max((t.get("likeCount", 0) for t in tw), default=0)
+        try:
+            info = c.user_info(h)
+        except CostLimitExceeded as exc:
+            info = {}
+            reasons.append(f"profile for @{h}: {_stop_reason(c, exc, allt or rows)}")
+        tw = by_handle.get(h.casefold(), [])
+        likes = [t.get("likeCount") for t in tw if t.get("likeCount") is not None]
         rows.append({"handle": h, "followers": info.get("followers"),
-                     "tweets_in_window": len(tw), "peak_likes": peak,
-                     "verified": bool(info.get("isBlueVerified"))})
-    return {"window_days": days, "entities": rows, "spend": c.spend_report()}
+                     "tweets_in_window": len(tw),
+                     "peak_likes": max(likes) if likes else None,
+                     "verified": _known_bool(info, "isBlueVerified")})
+    return {"window_days": days, "entities": rows, **_status(reasons),
+            "spend": c.spend_report()}
 
 
 # Every job takes the shared client so --max-usd actually binds. Jobs that
@@ -770,16 +884,17 @@ JOBS = {
     "overlap": lambda a, c: overlap(a.target, a.target2, max_usd=a.max_usd, client=c),
     "authenticity": lambda a, c: authenticity_audit(
         a.target, sample=a.sample if a.sample is not None else 1000, client=c),
-    "diffusion": lambda a, c: diffusion_trace(a.target, client=c),
-    "drift": lambda a, c: cohort_drift(a.target, a.v_old, a.v_new, client=c),
+    "diffusion": lambda a, c: diffusion_trace(a.target, limit=a.limit, client=c),
     "benchmark": lambda a, c: competitive_benchmark(a.target.split(","),
                                                     days=a.days, client=c),
 }
 
+# Local jobs read only the store: no API key, no Client, no spend.
 LOCAL_JOBS = {
     "catalogue": lambda a, s: catalogue(a.target, store=s),
     "media": lambda a, s: media_inventory(a.target, store=s),
     "threads": lambda a, s: reconstruct_threads(a.target, store=s),
+    "drift": lambda a, s: cohort_drift(a.target, a.v_old, a.v_new, store=s),
 }
 
 
@@ -801,17 +916,39 @@ COLLECTIONS = {
 
 DEFAULT_FIELDS = {"brief": {"top_tweets": ("id", "created_at", "likes", "text")}}
 
+SAMPLE_HELP = {
+    "authority": ("number of seed-search tweets whose authors form the cohort; "
+                  "the cohort has at most this many members, fewer when an "
+                  "author posted more than once (default 150)"),
+    "authenticity": "number of follower profiles to sample (default 1000)",
+}
+
+
+def _add_common_job_flags(parser, *, paid):
+    """--max-usd and --store, accepted before or after the job name.
+
+    SUPPRESS keeps a subparser from overwriting a value given before the job
+    name, and lets the CLI tell an explicit flag from the default."""
+    if paid:
+        parser.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
+                            help=f"hard spend ceiling in USD (default {DEFAULT_MAX_USD:.2f})")
+    parser.add_argument("--store", default=argparse.SUPPRESS,
+                        help="SQLite store path (default ~/.twitterapi-cache/store.db)")
+
 
 def _job_parser():
     p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
+    _add_common_job_flags(p, paid=True)
     sub = p.add_subparsers(dest="job")
     descriptions = {
         "brief": "profile and top recent posts", "narrative": "compare topic windows",
         "authority": "rank a scene's follow graph", "overlap": "compare audiences",
         "authenticity": "sample audience quality signals", "diffusion": "trace early spread",
-        "drift": "compare two saved cohort versions", "benchmark": "compare accounts",
-        "catalogue": "summarize cached posts", "media": "list cached media",
-        "threads": "reconstruct cached threads",
+        "drift": "compare two saved cohort versions ($0, local)",
+        "benchmark": "compare accounts",
+        "catalogue": "summarize cached posts ($0, local)",
+        "media": "list cached media ($0, local)",
+        "threads": "reconstruct cached threads ($0, local)",
     }
     for name in sorted(set(JOBS) | set(LOCAL_JOBS)):
         examples = f"Examples:\n  jobs.py {name} <target>\n  jobs.py {name} <target> --full"
@@ -828,98 +965,28 @@ def _job_parser():
                            help="lookback or comparison window in days")
         else:
             q.set_defaults(days=30)
-        if name in {"authority", "authenticity"}:
-            q.add_argument("--sample", type=int, default=None,
-                           help="authority cohort limit or authenticity sample")
+        if name in SAMPLE_HELP:
+            q.add_argument("--sample", type=int, default=None, help=SAMPLE_HELP[name])
         else:
             q.set_defaults(sample=None)
-        if name in JOBS:
-            q.add_argument("--max-usd", type=float, default=5.0,
-                           help="hard spend ceiling in USD")
-        else:
-            q.set_defaults(max_usd=5.0)
+        if name == "diffusion":
+            q.add_argument("--limit", type=int, default=500,
+                           help="maximum records per leg (replies, quotes, "
+                                "retweeters); a leg stopped by it is partial")
         if name == "drift":
             q.add_argument("--v-old", type=int, help="older saved cohort version")
             q.add_argument("--v-new", type=int, help="newer saved cohort version")
         else:
             q.set_defaults(v_old=None, v_new=None)
-        q.add_argument("--store", help="SQLite store path")
+        _add_common_job_flags(q, paid=name in JOBS)
         add_common_output_flags(
             q, fields=any(bool(schema) for schema in COLLECTIONS.get(name, {}).values()))
-    setup = sub.add_parser("setup", help="install session context hooks",
-                           description="Install or repair opt-in SessionStart/SessionEnd integration",
-                           epilog="Examples:\n  jobs.py setup\n  jobs.py setup --agent codex --scope user",
-                           formatter_class=HelpFormatter)
-    setup.add_argument("--agent", action="append",
-                       choices=("claude", "codex", "opencode"),
-                       help="agent target; repeat (default: all three)")
-    setup.add_argument("--scope", choices=("project", "user"), default="project")
-    setup.add_argument("--check", action="store_true",
-                       help="check managed hooks and static guidance without writing")
-    context = sub.add_parser("session-context", help=argparse.SUPPRESS,
-                             epilog="Example:\n  jobs.py session-context --scope-root <path>",
-                             formatter_class=HelpFormatter)
-    context.add_argument("--scope-root", required=True)
-    capture = sub.add_parser("session-capture", help=argparse.SUPPRESS,
-                             epilog="Example:\n  jobs.py session-capture --scope-root <path>",
-                             formatter_class=HelpFormatter)
-    capture.add_argument("--scope-root", required=True)
     return p
 
 
-def _context(scope_root):
-    root = os.path.realpath(os.path.expanduser(scope_root))
-    cwd = os.path.realpath(os.getcwd())
-    if os.path.commonpath([root, cwd]) != root:
-        return {"twitterapi_io": "no context: current directory is outside configured scope"}
-    baseline_dir = Path(root) / ".twitterapi-io"
-    baseline_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = {}
-    for path in Path(root).rglob("*"):
-        if path.is_file() and ".git" not in path.parts and ".twitterapi-io" not in path.parts:
-            try:
-                snapshot[str(path.relative_to(root))] = path.stat().st_mtime_ns
-            except OSError:
-                pass
-    (baseline_dir / "session-baseline.json").write_text(json.dumps({
-        "started_at": datetime.now(timezone.utc).isoformat(), "files": snapshot,
-    }))
-    return {"twitterapi_io": "read-only X research tools available in this directory",
-            "bin": display_path(__file__),
-            "help": ["Run `jobs.py` to inspect local saved state"]}
-
-
-def _capture(scope_root):
-    root = Path(scope_root).resolve()
-    cwd = Path.cwd().resolve()
-    if os.path.commonpath([str(root), str(cwd)]) != str(root):
-        raise UsageError("current directory is outside the configured hook scope")
-    state_dir = root / ".twitterapi-io"
-    baseline_path = state_dir / "session-baseline.json"
-    try:
-        baseline = json.loads(baseline_path.read_text())
-    except (OSError, ValueError):
-        baseline = {"started_at": None, "files": {}}
-    touched = []
-    for path in root.rglob("*"):
-        if path.is_file() and ".git" not in path.parts and ".twitterapi-io" not in path.parts:
-            try:
-                rel = str(path.relative_to(root))
-                if path.stat().st_mtime_ns != baseline["files"].get(rel):
-                    touched.append(rel)
-            except OSError:
-                pass
-    history = state_dir / "session-history.jsonl"
-    history.parent.mkdir(parents=True, exist_ok=True)
-    with history.open("a") as fh:
-        fh.write(json.dumps({"started_at": baseline.get("started_at"),
-                             "ended_at": datetime.now(timezone.utc).isoformat(),
-                             "working_directory": str(cwd),
-                             "files_touched": sorted(touched)}) + "\n")
-    return {"captured": True, "history": display_path(history)}
-
-
 def _format_job(a, result):
+    result = dict(result)
+    resume = result.pop("_resume", None)
     complete = result.get("complete", True) is not False
     reason = result.get("_warning") if not complete else None
     context = f"for `{a.job}` target {a.target!r}"
@@ -929,11 +996,12 @@ def _format_job(a, result):
         defaults=DEFAULT_FIELDS.get(a.job), context=context,
         help_lines=(f"Run `jobs.py {a.job} <target> --help` for options",))
     if (a.job == "catalogue" and result.get("counts", {}).get("total") == 0):
-        store_name = display_path(a.store or "~/.twitterapi-cache/store.db")
+        store_name = display_path(getattr(a, "store", None)
+                                  or "~/.twitterapi-cache/store.db")
         payload["posts_state"] = (
             f"0 cached posts found for @{a.target.lstrip('@')} in local store {store_name}")
     return success(f"jobs.py {a.job}", payload, complete=complete, reason=reason,
-                   resume=("Raise `--max-usd <amount>` and rerun" if not complete else None))
+                   resume=((resume or DEFAULT_RESUME) if not complete else None))
 
 
 def _main(argv=None):
@@ -945,66 +1013,74 @@ def _main(argv=None):
         return 0
     p = _job_parser()
     a = p.parse_args(argv)
-    if a.job == "setup":
-        root = Path.home() if a.scope == "user" else Path.cwd()
-        command = script_command(
-            __file__, f"session-context --scope-root {shlex.quote(str(root.resolve()))}")
-        agents = a.agent or ["claude", "codex", "opencode"]
-        if a.check:
-            result = check_hooks(root, agents=agents, command=command, scope=a.scope)
-            emit(success("jobs.py setup --check", result, complete=result["ok"],
-                         reason=(None if result["ok"] else
-                                 "one or more managed integrations are missing or stale"),
-                         resume=(None if result["ok"] else "Run `jobs.py setup` to repair")))
-            return 0 if result["ok"] else 2
-        emit(success("jobs.py setup", setup_hooks(
-            root, agents=agents, command=command, scope=a.scope)))
-        return 0
-    if a.job == "session-context":
-        emit(success("jobs.py session-context", _context(a.scope_root))); return 0
-    if a.job == "session-capture":
-        try:
-            emit(success("jobs.py session-capture", _capture(a.scope_root))); return 0
-        except UsageError as exc:
-            emit(error("setup", str(exc), "jobs.py session-capture",
-                       "Run `jobs.py setup` from the intended project")); return 2
+    if a.job is None:
+        p.error("a job name is required")
+    command = f"jobs.py {a.job}"
+    store_path = getattr(a, "store", None)
+    # 0 or a negative count is never a real request: --limit 0 returned an
+    # empty "partial", and --sample 0 an empty audit.
+    for flag in ("days", "sample", "limit"):
+        value = getattr(a, flag, None)
+        if value is not None and value < 1:
+            emit(error("usage", f"--{flag} must be at least 1, got {value}",
+                       command, f"Run `jobs.py {a.job} <target> --help` for options"))
+            return 2
     if getattr(a, "fields", None):
         schema = next(iter(COLLECTIONS[a.job].values()))
         try:
-            parse_fields(a.fields, schema, f"jobs.py {a.job}")
+            parse_fields(a.fields, schema, command)
         except UsageError as exc:
-            emit(error("usage", str(exc), f"jobs.py {a.job}",
+            emit(error("usage", str(exc), command,
                        f"Run `jobs.py {a.job} <target> --help` for valid fields"))
             return 2
     if a.job in LOCAL_JOBS:
-        s = Store(a.store) if a.store else Store()
+        if hasattr(a, "max_usd"):
+            emit(error("usage", f"--max-usd does not apply to `{a.job}`: it reads "
+                       "only the local store and spends $0", command,
+                       f"Run `jobs.py {a.job} <target> --help` for options"))
+            return 2
+        s = Store(store_path) if store_path else Store()
         try:
             emit(_format_job(a, LOCAL_JOBS[a.job](a, s)))
+        except ValueError as exc:
+            emit(error("usage", str(exc), command,
+                       f"Run `jobs.py {a.job} <target> --help` for options"))
+            return 2
         finally:
             s.close()
         return 0
 
+    a.max_usd = getattr(a, "max_usd", DEFAULT_MAX_USD)
+    c = None
     try:
-        c = _client(a.max_usd, store_path=a.store)  # one ceiling + chosen cache
-        result = JOBS[a.job](a, c)
-        emit(_format_job(a, result))
-    except IncompleteDataError as e:
-        emit(success(f"jobs.py {a.job}", {}, complete=False, reason=str(e),
-                     resume="Raise `--max-usd <amount>` or narrow the requested scope"))
-        print(f"[jobs] partial: {e}", file=sys.stderr)
-        return 0
+        c = _client(a.max_usd, store_path=store_path)  # one ceiling + chosen cache
+        emit(_format_job(a, JOBS[a.job](a, c)))
+    except SetupError as e:
+        emit(error("setup", str(e), command,
+                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
+        return 2
+    except UsageError as e:
+        emit(error("usage", str(e), command,
+                   f"Run `jobs.py {a.job} <target> --help` for options"))
+        return 2
     except (CostLimitExceeded, ValueError) as e:
-        emit(error("refusal", str(e), f"jobs.py {a.job}",
-                   f"Run `jobs.py {a.job} <target> --help` for valid limits"))
+        # Jobs turn a mid-gather stop into a partial payload themselves, so a
+        # CostLimitExceeded here is an up-front refusal. Lookups bought while
+        # estimating are still disclosed.
+        body = error("refusal", str(e), command,
+                     f"Run `jobs.py {a.job} <target> --help` for valid limits")
+        if c is not None and getattr(c, "requests_made", 0):
+            body["spend"] = c.spend_report()
+        emit(body)
         return 2
     except APIError as e:
-        emit(error("api", str(e), f"jobs.py {a.job}",
+        emit(error("api", str(e), command,
                    "Check the handle or ID and verify `TWITTERAPI_IO_KEY`"))
         return 1
-    except RuntimeError as e:
-        emit(error("runtime", str(e), f"jobs.py {a.job}",
-                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
-        return 1
+    finally:
+        close = getattr(getattr(c, "store", None), "close", None)
+        if close:
+            close()
     return 0
 
 

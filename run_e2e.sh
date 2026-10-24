@@ -36,6 +36,13 @@ echo
 FILES=(
   test_00_pure
   test_05_invariants
+  test_07_review_client
+  test_07_review_store
+  test_07_review_workflows
+  test_07_review_jobs
+  test_08_docs
+  test_axi
+  test_verify
   test_10_errors
   test_20_envelopes
   test_30_refusals

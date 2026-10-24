@@ -2,16 +2,13 @@
 
 Domain functions continue to exchange ordinary JSON-compatible values.  This
 module owns only command-boundary concerns: JSON emission, concise projections,
-text previews, completeness, structured usage errors, home views, and explicit
-session-hook setup.
+text previews, completeness, structured usage errors, and home views.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import shlex
-import shutil
 import sys
 from pathlib import Path
 
@@ -80,7 +77,10 @@ def run_cli(command: str, function, argv=None) -> int:
             if kind == "runtime" else
             f"Rerun `{command} --help`; if the failure persists, report this error"
         )
-        emit(error(kind, message, command, help_line))
+        # One line: a streaming command may already have printed JSON Lines
+        # records, and an indented document would break the stream.
+        print(json.dumps(error(kind, message, command, help_line),
+                         ensure_ascii=False))
         return 1
 
 
@@ -255,17 +255,6 @@ def add_common_output_flags(parser, *, fields=True):
                         help="do not truncate long text fields")
 
 
-def script_command(script: str, suffix: str = "") -> str:
-    path = str(Path(script).resolve())
-    found = shutil.which(Path(script).name)
-    executable = Path(found).resolve() if found else None
-    if executable == Path(path):
-        base = shlex.quote(Path(script).name)
-    else:
-        base = f"{shlex.quote(sys.executable)} {shlex.quote(path)}"
-    return f"{base} {suffix}".strip()
-
-
 def display_path(path) -> str:
     text = str(Path(path).expanduser().resolve())
     home = str(Path.home())
@@ -330,144 +319,6 @@ def dashboard(script: str, description: str, *, store_path=None,
                           f"0 saved cohorts found in local store {display_path(path)}"),
         "help": [
             f"Run `{Path(script).name} --help` to see commands",
-            "Run `jobs.py setup --help` to install session context",
         ],
     }
     return success(Path(script).name, payload, records_returned=len(shown))
-
-
-def _merge_json_hook(path: Path, command: str) -> str:
-    data = json.loads(path.read_text()) if path.exists() else {}
-    events = data.setdefault("hooks", {})
-    desired = {
-        "SessionStart": command,
-        "SessionEnd": command.replace("session-context", "session-capture"),
-    }
-    prior = []
-    same = True
-    for event, event_command in desired.items():
-        hooks = events.setdefault(event, [])
-        entry = {"matcher": "", "hooks": [{"type": "command", "command": event_command,
-                                             "timeout": 10,
-                                             "statusMessage": "Loading twitterapi.io state"}],
-                 "_twitterapi_io": True}
-        old = next((item for item in hooks if item.get("_twitterapi_io")), None)
-        prior.append(old)
-        same = same and old == entry
-        hooks[:] = [item for item in hooks if not item.get("_twitterapi_io")]
-        hooks.append(entry)
-    status = "unchanged" if same else "repaired" if any(prior) else "installed"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    return status
-
-
-def _merge_codex_feature(path: Path) -> None:
-    text = path.read_text() if path.exists() else ""
-    lines = text.splitlines()
-    section_start = next((i for i, line in enumerate(lines)
-                          if line.strip() == "[features]"), None)
-    if section_start is not None:
-        section_end = next((i for i in range(section_start + 1, len(lines))
-                            if lines[i].lstrip().startswith("[")), len(lines))
-        hook_line = next((i for i in range(section_start + 1, section_end)
-                          if lines[i].split("#", 1)[0].strip().startswith("hooks")), None)
-        if hook_line is not None and lines[hook_line].split("#", 1)[0].strip() == "hooks = true":
-            return
-        if hook_line is not None:
-            lines[hook_line] = "hooks = true"
-        else:
-            lines.insert(section_end, "hooks = true")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines).rstrip() + "\n")
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.rstrip() + "\n\n[features]\nhooks = true\n")
-
-
-def _write_opencode_plugin(path: Path, command: str) -> str:
-    end_command = command.replace("session-context", "session-capture")
-    content = """// Managed by twitterapi-io setup. Re-run setup to repair.\n""" + \
-        "export const TwitterApiContext = async ({ $ }) => ({\n" + \
-        "  'experimental.chat.system.transform': async (_input, output) => {\n" + \
-        f"    const result = await $`{command}`.quiet().nothrow();\n" + \
-        "    if (result.exitCode === 0) output.system.push(result.stdout.toString());\n" + \
-        "  },\n" + \
-        "  'session.idle': async () => {\n" + \
-        f"    await $`{end_command}`.quiet().nothrow();\n" + \
-        "  },\n});\n"
-    old = path.read_text() if path.exists() else None
-    status = "unchanged" if old == content else "repaired" if old is not None else "installed"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    return status
-
-
-def setup_hooks(root, *, agents, command: str, scope: str = "project") -> dict:
-    """Install/repair managed project-scoped session integrations."""
-    root = Path(root).resolve()
-    result = {"scope": scope, "root": str(root), "installed": [], "repaired": [],
-              "unchanged": []}
-    for agent in agents:
-        if agent == "claude":
-            status = _merge_json_hook(root / ".claude/settings.json", command)
-        elif agent == "codex":
-            status = _merge_json_hook(root / ".codex/hooks.json", command)
-            _merge_codex_feature(root / ".codex/config.toml")
-        elif agent == "opencode":
-            plugin = (root / ".config/opencode/plugins/twitterapi-io.js"
-                      if scope == "user" else
-                      root / ".opencode/plugins/twitterapi-io.js")
-            status = _write_opencode_plugin(plugin, command)
-        else:
-            raise UsageError(f"unknown agent {agent}; valid agents: claude, codex, opencode")
-        result[status].append(agent)
-    result["help"] = [
-        "Re-run setup after moving this repository to repair executable paths",
-        "Remove the managed twitterapi-io entries/files to uninstall session context",
-    ]
-    return result
-
-
-def check_hooks(root, *, agents, command: str, scope: str = "project") -> dict:
-    """Read-only drift check for managed integrations and static guidance."""
-    root = Path(root).resolve()
-    checks = {}
-    for agent in agents:
-        if agent in {"claude", "codex"}:
-            path = root / (".claude/settings.json" if agent == "claude"
-                           else ".codex/hooks.json")
-            try:
-                data = json.loads(path.read_text())
-                managed = []
-                for event in ("SessionStart", "SessionEnd"):
-                    managed.extend(item for item in data.get("hooks", {}).get(event, [])
-                                   if item.get("_twitterapi_io"))
-                text = json.dumps(managed)
-                okay = (len(managed) == 2 and command in text and
-                        command.replace("session-context", "session-capture") in text)
-                if agent == "codex":
-                    okay = okay and "hooks = true" in (
-                        root / ".codex/config.toml").read_text()
-            except (OSError, ValueError):
-                okay = False
-        elif agent == "opencode":
-            path = (root / ".config/opencode/plugins/twitterapi-io.js"
-                    if scope == "user" else
-                    root / ".opencode/plugins/twitterapi-io.js")
-            try:
-                text = path.read_text()
-                okay = (command in text and
-                        command.replace("session-context", "session-capture") in text)
-            except OSError:
-                okay = False
-        else:
-            raise UsageError(f"unknown agent {agent}; valid agents: claude, codex, opencode")
-        checks[agent] = "current" if okay else "missing_or_stale"
-    repo = Path(__file__).resolve().parent.parent
-    docs = "\n".join((repo / name).read_text() for name in ("README.md", "SKILL.md"))
-    checks["static_guidance"] = ("current" if "completeness.status" in docs
-                                 and "exits `3`" not in docs else "stale")
-    return {"scope": scope, "root": str(root), "checks": checks,
-            "ok": all(value == "current" for value in checks.values()),
-            "help": ["Run `jobs.py setup` to install or repair stale integrations"]}

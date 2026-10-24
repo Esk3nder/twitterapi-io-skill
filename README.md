@@ -12,7 +12,8 @@ want to force it or read what it says.
 
 **Read-only. Standard library only — nothing to `pip install`.** 32 endpoints,
 with every path, parameter spelling, response shape and price confirmed by live
-API calls and re-checkable in 15 seconds.
+API calls. `verify.py` re-checks the 22 probeable endpoints for about $0.05; the
+other 10 need a list, community or Space ID that no API route discovers.
 
 ## What you get
 
@@ -71,7 +72,7 @@ and key together:
 
 ```bash
 cd ~/.claude/skills/twitterapi-io && python3 scripts/verify.py
-# -> All recorded facts still hold.        (~$0.002, ~15s)
+# -> All probed endpoint contracts passed.  (~$0.05; --quick ~$0.013)
 ```
 
 `verify.py` distinguishes the two failure modes: **exit 2** means a setup
@@ -79,24 +80,8 @@ problem (bad key, no credits, rate limited) with the cause named, **exit 1**
 means the API itself has drifted from the recorded facts. See
 [`tests/TRIAGE.md`](tests/TRIAGE.md).
 
-The skill is the on-demand discovery path. For ambient, directory-scoped state
-at the beginning of Claude Code, Codex, or OpenCode sessions, explicitly opt in:
-
-```bash
-python3 scripts/jobs.py setup                         # project scope, all three
-python3 scripts/jobs.py setup --agent codex --scope user
-```
-
-Setup is idempotent and repairs moved executable paths. Ordinary commands never
-install hooks. Project setup writes managed entries under `.claude/`, `.codex/`,
-and `.opencode/`; user setup uses the corresponding home configuration (with
-OpenCode under `~/.config/opencode/plugins/`). Remove the entries/files marked
-as managed by `twitterapi-io` to uninstall the hooks. The installed SessionStart
-hook injects compact context; SessionEnd records only timestamps, working
-directory, and changed file paths under the configured scope.
-
 **Platform:** developed and tested on macOS and Linux. The Python is portable,
-but `run_e2e.sh` is a bash script and the setup lines above assume a POSIX
+but `run_e2e.sh` is a bash script and the install lines above assume a POSIX
 shell — on Windows use WSL, or set the environment variable your own way and
 call the Python entry points directly.
 
@@ -107,6 +92,18 @@ elsewhere except the cache.
 rm -rf ~/.claude/skills/twitterapi-io ~/.agents/skills/twitterapi-io
 rm -rf ~/.twitterapi-cache          # optional: the local data cache
 ```
+
+**If you ran `jobs.py setup` in an older version:** that command installed
+session hooks, and it no longer exists. Remove what it wrote, in each directory
+where you ran it (or in `~` if you used `--scope user`):
+
+- `.claude/settings.json` and `.codex/hooks.json`: under `hooks`, delete the
+  SessionStart and SessionEnd entries that carry `"_twitterapi_io": true`;
+- `.opencode/plugins/twitterapi-io.js` (user scope:
+  `~/.config/opencode/plugins/twitterapi-io.js`): delete the file;
+- `.codex/config.toml`: setup set `hooks = true` under `[features]`; remove
+  it only if no other Codex hook needs it;
+- `.twitterapi-io/`: the captured session state; delete the directory.
 
 ## 3. Use it from your agent
 
@@ -180,8 +177,9 @@ with `... (truncated, N chars total)`, and deliberately bounded lists report
 `N of M total`. Errors are JSON on stdout with an actionable `help` array;
 progress, spend, warnings, and diagnostics remain on stderr.
 
-`--sample` is intentionally scoped: for `authority` it limits the seed cohort;
-for `authenticity` it limits sampled tweets. Supplying it to another job is an
+`--sample` is intentionally scoped: for `authority` it limits the seed-search
+tweets, so the cohort has at most that many members; for `authenticity` it
+limits the follower profiles sampled. Supplying it to another job is an
 error rather than a silently ignored flag. `authority` writes flushed progress
 to stderr while preserving JSON-only stdout.
 
@@ -300,9 +298,12 @@ at the default page size. Same data.
 - You cannot buy a partial page — 3,000 IDs bills the full 5,000-record page.
 - Billing settles 20–60s late, so a balance read straight after a call shows no
   change. Use `client.spend_report()` for the live figure.
-- `Client.estimate()` is a conservative **upper bound**, not a prediction of
-  actual history spend. Deleted posts, query filters, native-retweet exclusion,
-  and finite search-index depth can make the reachable corpus smaller.
+- `Client.estimate()` prices the requested records at full pages. It is
+  **not** an upper bound: the server decides page fill, and short or empty
+  pages still bill the 15-credit floor. `max_usd` is the hard bound; every
+  request books its worst-case cost against it before it is sent. Deleted
+  posts, query filters, native-retweet exclusion, and finite search-index depth
+  can make the reachable corpus smaller.
 
 `overlap` and `authority` estimate first and refuse rather than start a crawl
 they cannot afford. `authority` conservatively budgets 2,000 followings per
@@ -351,21 +352,21 @@ Prices and response shapes are dated observations, recorded as machine-checkable
 evidence in [`references/facts.json`](references/facts.json).
 
 ```bash
-python3 scripts/verify.py             # ~$0.002, ~15s. Exit 1 = drift.
-python3 scripts/verify.py --pricing   # also re-measures prices by balance delta
-python3 scripts/verify.py --update    # re-stamp after confirming
+python3 scripts/verify.py                     # ~$0.05. Exit 1 = drift, 2 = setup.
+python3 scripts/verify.py --pricing           # also re-measures prices by balance delta
+python3 scripts/verify.py --pricing --update  # re-stamp; refused for partial sweeps
 ```
 
 It checks that the evidence file still agrees with the client's endpoint table
 (offline, free), that live response key sets are unchanged, and optionally that
-credits-per-call still match. On drift it names the endpoint with
-expected-vs-actual.
+credits-per-call still match. On drift the JSON error names every failed check
+with expected-vs-actual.
 
 Four layers keep a stale fact from passing as true:
 
 | Layer | Catches | When |
 |---|---|---|
-| `verify.py` | contract or price drift | on demand, ~$0.002 |
+| `verify.py` | contract or price drift | on demand, ~$0.05 |
 | Runtime warning | facts older than 90 days | at first API call |
 | `run_e2e.sh` | behavioural regressions and spend cap | before release, <$0.25 |
 | Weekly CI | drift nobody looked for | Mondays, automatic |
@@ -432,7 +433,7 @@ SKILL.md                      agent-facing entry point
 references/facts.json         machine-checkable evidence, dated
 references/verified-facts.md  prose evidence and rationale
 scripts/twitterapi.py         32 endpoints: casing, envelopes, cost, QPS, cache
-scripts/axi.py                shared JSON command boundary and session setup
+scripts/axi.py                shared JSON command boundary
 scripts/store.py              sqlite cache, normalisers, versioned cohorts
 scripts/cohort.py             resolvers, set algebra, authority ranking
 scripts/jobs.py               analytical jobs, including $0 catalogue/threads

@@ -39,6 +39,12 @@ CREDITS_PER_USD = 100_000
 #                but their pagination keys stay at the ROOT — the trap)
 #   page_param : name of the page-size parameter, None if fixed
 #   page_max   : maximum page size the API honours
+#   key_list   : True when the key is a comma-joined id list; the request's
+#                page size is then the number of ids sent, not page_max
+#   paged      : False for single-response list endpoints that carry no
+#                has_next_page (verified envelopes: /twitter/tweets, trends).
+#                Every other list endpoint MUST carry has_next_page; its
+#                absence is contract drift, never proof of completeness.
 # --------------------------------------------------------------------------
 ENDPOINTS = {
     "user_info": dict(
@@ -49,7 +55,8 @@ ENDPOINTS = {
         items=None, items_in="data", page_param=None, page_max=1),
     "batch_users": dict(
         path="/twitter/user/batch_info_by_ids", key_param="userIds",
-        items="users", items_in="root", page_param=None, page_max=100),
+        items="users", items_in="root", page_param=None, page_max=100,
+        key_list=True, paged=False),
     "search_users": dict(
         path="/twitter/user/search", key_param="query",
         items="users", items_in="root", page_param=None, page_max=20),
@@ -79,7 +86,8 @@ ENDPOINTS = {
         items="tweets", items_in="root", page_param=None, page_max=20),
     "tweets_by_ids": dict(
         path="/twitter/tweets", key_param="tweet_ids",
-        items="tweets", items_in="root", page_param=None, page_max=100),
+        items="tweets", items_in="root", page_param=None, page_max=100,
+        key_list=True, paged=False),
     "replies": dict(
         path="/twitter/tweet/replies", key_param="tweetId",
         items="tweets", items_in="root", page_param=None, page_max=20),
@@ -106,7 +114,8 @@ ENDPOINTS = {
         items="tweets", items_in="root", page_param=None, page_max=20),
     "trends": dict(                                  # NOT data-wrapped
         path="/twitter/trends", key_param="woeid",
-        items="trends", items_in="root", page_param="count", page_max=50),
+        items="trends", items_in="root", page_param="count", page_max=50,
+        paged=False),
     # Verified live. Note `query` is REQUIRED on this one.
     "community_tweets_all": dict(
         path="/twitter/community/get_tweets_from_all_community", key_param="query",
@@ -179,6 +188,32 @@ QPS_LADDER = [(50_000, 20), (10_000, 10), (5_000, 6), (1_000, 3), (0, 0.2)]
 _BARE_SEARCH_DATE = re.compile(
     r"(?<!\S)(since|until):(\d{4}-\d{2}-\d{2})(?=\s|$)")
 _MIN_FAVES = re.compile(r"(?<!\S)min_faves:(\d+)(?=\s|$)")
+# Any min_faves operator, however attached (inside a group, negated).
+_ANY_MIN_FAVES = re.compile(r"min_faves:")
+_TOP_LEVEL_OR = re.compile(r"(?<!\S)OR(?!\S)")
+
+
+def _query_views(query):
+    """Return (unquoted, top_level) views of a search query.
+
+    ``unquoted`` blanks quoted phrases; ``top_level`` also blanks every
+    parenthesised group. Positions are preserved, so a match in a view is at
+    the same offset in the original query."""
+    unquoted, top, depth, quoted = [], [], 0, False
+    for ch in query:
+        if ch == '"':
+            quoted = not quoted
+        if quoted or ch == '"':
+            unquoted.append(" ")
+            top.append(" ")
+            continue
+        unquoted.append(ch)
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(depth - 1, 0)
+        top.append(ch if depth == 0 and ch not in "()" else " ")
+    return "".join(unquoted), "".join(top)
 
 
 def prepare_search_query(query):
@@ -187,12 +222,35 @@ def prepare_search_query(query):
     The search index resolves bare dates outside UTC and uses a stale likes
     snapshot for ``min_faves``. Exact UTC tokens go to the API; engagement is
     checked against each returned tweet's current ``likeCount`` instead.
+
+    Moving ``min_faves`` out of the query is exact ONLY when every clause is a
+    top-level AND conjunct: the query then means "rest AND likes >= max(N)".
+    Under a top-level OR, inside a group, or negated, a clause binds to part
+    of the expression, and one global threshold would change which tweets
+    match. Those queries raise ValueError rather than being silently rewritten.
     """
     query = str(query or "")
-    thresholds = [int(value) for value in _MIN_FAVES.findall(query)]
-    query = _MIN_FAVES.sub("", query)
+    unquoted, top = _query_views(query)
+    top_clauses = list(_MIN_FAVES.finditer(top))
+    any_clauses = len(_ANY_MIN_FAVES.findall(unquoted))
+    if any_clauses and len(top_clauses) != any_clauses:
+        raise ValueError(
+            f"min_faves inside a group or negated cannot be enforced exactly "
+            f"in {query!r}. The search index filters min_faves on a stale "
+            "likes snapshot, so this client moves min_faves out of the query "
+            "and checks live likeCount instead, which is exact only for a "
+            "top-level AND clause. Split the query into separate searches.")
+    if top_clauses and _TOP_LEVEL_OR.search(top):
+        raise ValueError(
+            f"min_faves with a top-level OR in {query!r} cannot be enforced "
+            "exactly: each min_faves binds to its own OR branch, and one "
+            "global likes threshold would drop tweets that match. Run one "
+            "search per OR branch instead.")
+    for m in reversed(top_clauses):         # offsets are shared with `top`
+        query = query[:m.start()] + query[m.end():]
     query = _BARE_SEARCH_DATE.sub(
         lambda m: f"{m.group(1)}:{m.group(2)}_00:00:00_UTC", query)
+    thresholds = [int(m.group(1)) for m in top_clauses]
     return query.strip(), (max(thresholds) if thresholds else None)
 
 
@@ -233,10 +291,19 @@ class PaginationStream:
     A later page can fail after earlier records have already been retrieved and
     billed. Iteration then ends with ``complete=False`` and ``_warning`` set,
     preserving the usable records without presenting them as exhaustive.
+
+    ``complete`` answers "did retrieval fail?". ``truncated_by_limit`` answers
+    a different question: the caller's ``limit`` stopped the walk while the API
+    still had more records, so the rows are the first N, not the population.
+    A caller that asked for exactly N got what it asked for; a caller that
+    treats the rows as a population (a cohort, a follower set) must check it.
+    ``cached_pages`` counts pages served from the store instead of bought.
     """
 
     def __init__(self):
         self.complete = True
+        self.truncated_by_limit = False
+        self.cached_pages = 0
         self._warning = None
         self._iterator = None
 
@@ -320,6 +387,9 @@ class Client:
         self._fixed_qps = self._qps is not None
         self._qps_checked_at = 0
         self._lock = threading.Lock()
+        # Worst-case credits booked by this thread's last successful request,
+        # held until _charge/_settle replaces them with the real page cost.
+        self._provisional = threading.local()
         _warn_if_facts_stale()
 
     # -- rate limiting ----------------------------------------------------
@@ -366,75 +436,80 @@ class Client:
         if params:
             url += "?" + urllib.parse.urlencode(
                 {k: v for k, v in params.items() if v not in (None, "")})
-        req = urllib.request.Request(url, method=method)
-        req.add_header("x-api-key", self.key)
-        last = None
-        attempts = 5
-        for attempt in range(attempts):
-            if path != "/oapi/my/info":
-                self._require_budget(max_credits or MIN_REQUEST_CREDITS,
-                                     f"{method} {path} request attempt")
-                self._throttle()
-            self._bill_request(path)    # non-data calls still bill the 15cr floor
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    body = json.loads(r.read())
-                if not isinstance(body, dict):
-                    raise APIError(200, f"expected JSON object, got {type(body).__name__}", path)
-                # This API signals failure in the body while returning HTTP 200
-                # (verified: x_user_stream/add -> 200 {"status":"error", ...};
-                # user/info on a missing account -> 200 {"status":"error",
-                # "msg":"user not found"}). Treating that as success makes a
-                # failed call look like an empty result. Surface it.
-                if body.get("status") == "error":
-                    raise APIError(200, body.get("msg") or body.get("message")
-                                   or json.dumps(body)[:200], path)
-                return body
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", "replace")
-                try:
-                    detail = json.loads(body).get("detail") or json.loads(body).get("message") or body
-                except Exception:
-                    detail = body
-                if e.code == 429 or e.code >= 500:
-                    last = APIError(e.code, detail, path)
-                    if attempt < attempts - 1:      # don't sleep before giving up
-                        time.sleep(2 ** attempt)
-                    continue
-                raise APIError(e.code, detail, path) from None
-            except (urllib.error.URLError, TimeoutError) as e:
-                last = e
-                if attempt < attempts - 1:
-                    time.sleep(2 ** attempt)
-        raise last if isinstance(last, Exception) else RuntimeError("retries exhausted")
+
+        def request():
+            req = urllib.request.Request(url, method=method)
+            req.add_header("x-api-key", self.key)
+            return req
+        body = self._send(method, path, request, max_credits)
+        if not isinstance(body, dict):
+            raise APIError(200, f"expected JSON object, got {type(body).__name__}", path)
+        return body
 
     def _raw_json(self, method, path, body, *, max_credits=None):
         """Request with a JSON body. Used by bulk_search and the filter-rule
         endpoints — note DELETE /oapi/tweet_filter/delete_rule takes its
-        rule_id in the BODY, not the query string.
-
-        Mirrors _raw's ceiling check and 5xx/429 retry so a data path
-        (bulk_search) isn't less resilient than a GET."""
+        rule_id in the BODY, not the query string. Shares _raw's transport, so
+        a data path (bulk_search) has the same ceiling and retry rules."""
         data = json.dumps(body).encode()
-        attempts, last = 5, None
-        for attempt in range(attempts):
-            self._require_budget(max_credits or MIN_REQUEST_CREDITS,
-                                 f"{method} {path} request attempt")
-            self._throttle()
-            self._bill_request(path)   # non-data calls still bill the 15cr floor
+
+        def request():
             req = urllib.request.Request(BASE + path, data=data, method=method)
             req.add_header("x-api-key", self.key)
             req.add_header("Content-Type", "application/json")
+            return req
+        return self._send(method, path, request, max_credits)
+
+    def _send(self, method, path, make_request, max_credits):
+        """One logical request with retries; every attempt books its cost.
+
+        Each attempt books its WORST case (``max_credits``, default the
+        15-credit floor) under the lock before it is sent, so concurrent
+        requests cannot all pass the ceiling check and then overspend it.
+        What happens to that booking depends on what the server told us:
+
+        - success: the booking stays until _charge/_settle replaces it with
+          the real page cost (same thread);
+        - an HTTP error or an HTTP-200 body error: the server answered, and
+          such answers bill the floor, so the excess is released;
+        - a timeout or connection error: the response is lost and the server
+          may have billed it in full, so the worst case stays booked. A retry
+          books its own worst case and is refused if that crosses max_usd.
+
+        Measured 2026-08-10: settled billing exceeded accounting that skipped
+        data-less calls by ~1.2%, almost exactly the uncharged probes x 15
+        credits, so every attempt books at least the floor. Exception:
+        `/oapi/my/info` is FREE (21 calls moved the balance by 0 credits); it
+        is counted as a request but never charged.
+        """
+        free = path == "/oapi/my/info"
+        worst = max_credits or MIN_REQUEST_CREDITS
+        attempts, last = 5, None
+        for attempt in range(attempts):
+            operation = (f"{method} {path} request" if last is None else
+                         f"retry of {method} {path} after {type(last).__name__}")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    body_resp = json.loads(r.read())
-                # Same HTTP-200-with-body-error pattern as _raw. Without this,
-                # e.g. a failed add_rule prints as if it succeeded.
-                if isinstance(body_resp, dict) and body_resp.get("status") == "error":
-                    raise APIError(200, body_resp.get("msg") or body_resp.get("message")
-                                   or json.dumps(body_resp)[:200], path)
-                return body_resp
+                self._book_attempt(path, 0.0 if free else worst, operation)
+            except CostLimitExceeded as exc:
+                if last is None:
+                    raise
+                raise exc from last
+            if not free:
+                self._throttle()
+            try:
+                with urllib.request.urlopen(make_request(), timeout=self.timeout) as r:
+                    raw_body = r.read()
+                try:
+                    body = json.loads(raw_body)
+                except ValueError:
+                    # A 200 with an HTML or truncated body is an API failure,
+                    # not a bad argument. Whether it billed is unknown, so the
+                    # worst case stays booked.
+                    raise APIError(200, "response body is not JSON: "
+                                   + raw_body[:120].decode("utf-8", "replace"),
+                                   path) from None
             except urllib.error.HTTPError as e:
+                self._release_to_floor(0.0 if free else worst)
                 raw = e.read().decode("utf-8", "replace")
                 try:
                     j = json.loads(raw)
@@ -443,14 +518,27 @@ class Client:
                     detail = raw
                 if e.code == 429 or e.code >= 500:
                     last = APIError(e.code, detail, path)
-                    if attempt < attempts - 1:
+                    if attempt < attempts - 1:      # don't sleep before giving up
                         time.sleep(2 ** attempt)
                     continue
                 raise APIError(e.code, detail, path) from None
             except (urllib.error.URLError, TimeoutError) as e:
-                last = e
+                last = e                            # worst case stays booked
                 if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
+                continue
+            # This API signals failure in the body while returning HTTP 200
+            # (verified: x_user_stream/add -> 200 {"status":"error", ...};
+            # user/info on a missing account -> 200 {"status":"error",
+            # "msg":"user not found"}). Treating that as success makes a
+            # failed call look like an empty result. Surface it.
+            if isinstance(body, dict) and body.get("status") == "error":
+                self._release_to_floor(0.0 if free else worst)
+                raise APIError(200, body.get("msg") or body.get("message")
+                               or json.dumps(body)[:200], path)
+            if not free:                # a free balance read settles nothing
+                self._provisional.credits = worst
+            return body
         raise last if isinstance(last, Exception) else RuntimeError("retries exhausted")
 
     # -- envelope normalisation ------------------------------------------
@@ -461,6 +549,10 @@ class Client:
         The trap this exists for: data-wrapped endpoints nest the array under
         `data` but keep has_next_page/next_cursor at the ROOT. Reading
         pagination from inside `data` silently stops after one page.
+
+        A paged endpoint MUST state has_next_page as a boolean at the root. A
+        missing or non-boolean value is unknown, not "no more pages": reading
+        it as False would mark a cut-short walk complete.
         """
         # `or {}` not a .get default: a suspended account returns data
         # present-but-null, and .get("data", {}) hands back None -> crash.
@@ -477,7 +569,16 @@ class Client:
                 raise IncompleteDataError(
                     f"response field {spec['items']!r} must be a list, got "
                     f"{type(items).__name__}; results are INCOMPLETE")
-        return items, bool(resp.get("has_next_page")), resp.get("next_cursor") or ""
+        if spec["items"] is None or not spec.get("paged", True):
+            # A single object has no pages; neither does a list endpoint
+            # whose verified envelope carries no pagination fields.
+            return items, False, ""
+        has_next = resp.get("has_next_page")
+        if not isinstance(has_next, bool):
+            raise IncompleteDataError(
+                f"response omitted has_next_page (got {has_next!r}); whether "
+                f"more pages exist is unknown, so results are INCOMPLETE")
+        return items, has_next, resp.get("next_cursor") or ""
 
     # -- cost -------------------------------------------------------------
     @staticmethod
@@ -498,22 +599,45 @@ class Client:
         return max(records_in_page * rate, MIN_REQUEST_CREDITS)
 
     @staticmethod
+    def effective_page_size(name, page_size=None):
+        """Records one request can return, which is what it can bill.
+
+        Only endpoints with a page-size parameter honour ``page_size``; a
+        fixed endpoint returns its full page whatever the caller asked for, so
+        budgeting with the caller's number under-reserves (search with
+        page_size=1 still returns, and bills, 20 tweets). For id-list
+        endpoints the page size is the number of ids sent."""
+        spec = ENDPOINTS[name]
+        if spec["page_param"] is None and not spec.get("key_list"):
+            return spec["page_max"]
+        return min(page_size or spec["page_max"], spec["page_max"])
+
+    @staticmethod
     def credits_for(name, n_records, page_size=None):
-        """Credits to retrieve n_records.
+        """Full-page credits to retrieve n_records.
 
         Bills WHOLE pages. You cannot buy a partial page: asking for 3,000 IDs
         at a 5,000 page size still returns — and still charges for — 5,000.
         Measured: limit=3000 cost 2,250 credits (a full page), not 1,350.
-        Rounding up is also the safe direction for a spend guard."""
-        ps = min(page_size or ENDPOINTS[name]["page_max"],
-                 ENDPOINTS[name]["page_max"])           # API clamps; so do we
+
+        This assumes the API fills each page. It is NOT an upper bound: the
+        server decides how many records a page holds, every request bills at
+        least the 15-credit floor, and short, empty or duplicate pages each
+        cost a request. 200 ids served one per page cost 200 x 15 = 3,000
+        credits against 2,250 here, and no record count bounds a server that
+        keeps returning empty or repeated pages. The hard bound is max_usd:
+        every request reserves its worst-case page cost against it first."""
+        ps = Client.effective_page_size(name, page_size)
         if n_records <= 0:
             return MIN_REQUEST_CREDITS
         pages = -(-n_records // ps)                     # ceil
         return pages * Client.page_credits(name, ps, ps)
 
     def estimate(self, name, n_records, page_size=None) -> float:
-        """Estimated USD. Use BEFORE any large crawl."""
+        """Expected USD when every page is full. Use BEFORE any large crawl.
+
+        Not an upper bound — see credits_for(). Pass max_usd to the Client
+        for a hard bound."""
         return credits_to_usd(self.credits_for(name, n_records, page_size))
 
     @property
@@ -522,47 +646,48 @@ class Client:
         return credits_to_usd(self.spent_credits)
 
     def _charge(self, name, records_in_page, page_size):
-        """Account one request's real cost.
+        """Account one request's real cost; see _settle()."""
+        self._settle(self.page_credits(name, records_in_page, page_size))
+
+    def _settle(self, actual_credits):
+        """Replace this thread's last request booking with its real cost.
 
         Deliberately actuals-based rather than estimate-based: this covers
         unbounded crawls, page-size overrides and repeated calls, none of
-        which a pre-flight estimate can see. Accounting only — the ceiling is
-        enforced by _over_ceiling() AFTER the page is yielded, so data already
-        paid for is never discarded.
-
-        Locked: the multi-threaded history path calls this concurrently and an
-        unguarded += undercounts — the wrong direction for a spend guard."""
-        # _bill_request already booked MIN_REQUEST_CREDITS for the HTTP call
-        # that produced this page, so add only the amount ABOVE that floor.
-        # (page_credits is max(records*rate, MIN), so this never goes negative.)
-        cost = self.page_credits(name, records_in_page, page_size) - MIN_REQUEST_CREDITS
+        which a pre-flight estimate can see. The request already booked its
+        worst case (or, with no booking recorded, the 15-credit floor), so
+        only the difference moves. Locked: a caller may share one Client
+        across threads, and an unguarded += undercounts."""
+        booked = getattr(self._provisional, "credits", MIN_REQUEST_CREDITS)
+        self._provisional.credits = MIN_REQUEST_CREDITS
         with self._lock:
-            self.spent_credits += max(0.0, cost)
+            self.spent_credits += actual_credits - booked
 
-    def _bill_request(self, path=""):
-        """Book the per-request floor the server charges for calls that return
-        no data: 400s, 404s, HTTP-200 body errors, retried 5xx attempts, and
-        rule lookups.
+    def _book_attempt(self, path, credits, operation):
+        """Count one request attempt and book its worst-case cost atomically.
 
-        Measured 2026-08-10: a full live run's settled billing exceeded naive
-        client-side accounting by ~1.2%, and the gap was almost exactly the
-        number of uncharged probe requests x 15 credits. Undercounting is the
-        wrong direction for a spend guard, so the floor is booked up front and
-        _charge() adds only the excess.
-
-        EXCEPTION, measured: `/oapi/my/info` is FREE — 21 consecutive calls
-        moved the balance by exactly 0 credits. It is counted as a request but
-        never charged, or every lazy qps lookup would inflate spend by 15."""
+        Check and booking share the lock, so two threads cannot both see room
+        under max_usd and then both spend it."""
         with self._lock:
+            if credits:
+                self._require_budget(credits, operation)
             self.requests_made += 1     # count every attempt: failures bill too
-            if path != "/oapi/my/info":
-                self.spent_credits += MIN_REQUEST_CREDITS
+            self.spent_credits += credits
+
+    def _release_to_floor(self, booked):
+        """The server answered with an error: it bills the floor, not a page."""
+        if booked > MIN_REQUEST_CREDITS:
+            with self._lock:
+                self.spent_credits -= booked - MIN_REQUEST_CREDITS
 
     def _over_ceiling(self) -> bool:
         return self.max_usd is not None and self.spent_usd >= self.max_usd
 
     def _require_budget(self, credits, operation):
-        """Refuse before transport when a bounded next charge is unauthorized."""
+        """Refuse before transport when a bounded next charge is unauthorized.
+
+        spent_credits includes the worst case booked by requests still in
+        flight, so this also sees concurrent reservations."""
         if self.max_usd is None:
             return
         projected = self.spent_usd + credits_to_usd(credits)
@@ -606,7 +731,8 @@ class Client:
 
         Handles both envelope shapes, charges each page against the cumulative
         ceiling, and refuses to loop when the cursor stops advancing. The
-        returned stream exposes ``complete`` and ``_warning`` after iteration.
+        returned stream exposes ``complete``, ``truncated_by_limit``,
+        ``cached_pages`` and ``_warning`` after iteration.
         """
         stream = PaginationStream()
         stream._iterator = self._paginate_records(
@@ -639,11 +765,16 @@ class Client:
         if name == "search":
             key, local_min_faves = prepare_search_query(key)
         key = self._resolve_endpoint_key(name, key)
+        if spec.get("key_list"):
+            ids = [part for part in str(key).split(",") if part.strip()]
+            ps = min(max(len(ids), 1), spec["page_max"])
+        else:
+            ps = self.effective_page_size(name, page_size)
         self._preflight(
-            name, limit, page_size,
+            name, limit, ps,
             full_scan=(local_min_faves is not None and local_min_faves > 0),
         )
-        ps = min(page_size or spec["page_max"], spec["page_max"])
+        worst_page = self.page_credits(name, ps, ps)
         params = {key_param or spec["key_param"]: key}
         if spec["page_param"]:
             params[spec["page_param"]] = ps
@@ -667,6 +798,7 @@ class Client:
                     items, has_next, next_cursor = self._unpack(resp, spec)
                     # Cache hit = no API call: don't charge, record what we avoided.
                     self.cache_hits += 1
+                    stream.cached_pages += 1
                     self.saved_credits += self.page_credits(name, len(items), ps)
                     # Track HOW OLD the served data is. A follow graph cached
                     # indefinitely will answer "who follows X" with last year's
@@ -679,11 +811,16 @@ class Client:
                     # The page has a known maximum. Reserve against that bound,
                     # not the hoped-for record count, or a terminal full page can
                     # cross the caller's ceiling and still return as "complete".
-                    self._require_budget(self.page_credits(name, ps, ps),
-                                         f"next '{name}' page")
+                    self._require_budget(worst_page, f"next '{name}' page")
                     resp = self._raw("GET", spec["path"], params,
-                                     max_credits=self.page_credits(name, ps, ps))
-                    items, has_next, next_cursor = self._unpack(resp, spec)
+                                     max_credits=worst_page)
+                    try:
+                        items, has_next, next_cursor = self._unpack(resp, spec)
+                    except IncompleteDataError:
+                        # The response arrived but cannot be read: what it
+                        # billed is unknown, so keep the worst case booked.
+                        self._settle(worst_page)
+                        raise
                     self._charge(name, len(items), ps)
                     if cacheable:
                         self.store.put_page(
@@ -708,7 +845,9 @@ class Client:
                 items = [enrich_tweet_media(item) for item in items]
             acquired_items = items
             # Persist records so a corpus can be read back for free later.
-            if (self.store is not None and acquired_items
+            # Only FRESH pages: a cache hit re-persisted would stamp an old
+            # snapshot as just seen and overwrite newer rows with stale values.
+            if (cached is None and self.store is not None and acquired_items
                     and isinstance(acquired_items[0], dict)):
                 if spec["items"] == "tweets":
                     self.store.put_tweets(acquired_items)
@@ -723,16 +862,23 @@ class Client:
                 empty_pages += 1
             else:
                 empty_pages = 0
-            for it in items:
+            for position, it in enumerate(items):
                 identity = self._item_identity(it)
                 if identity is not None and identity in seen_items:
                     continue
                 if identity is not None:
                     seen_items.add(identity)
-                yield it
                 seen += 1
                 if limit and seen >= limit:
+                    # Decide BEFORE the last yield: a consumer that stops after
+                    # N records never resumes the generator.
+                    stream.truncated_by_limit = has_next or any(
+                        self._item_identity(rest) is None
+                        or self._item_identity(rest) not in seen_items
+                        for rest in items[position + 1:])
+                    yield it
                     return
+                yield it
             if not acquired_items and not has_next and seen == 0:
                 if name in COMMUNITY_COLLECTIONS:
                     # Empty is legitimate for a real community, so resolve
@@ -824,17 +970,27 @@ class Client:
         # A missing/suspended account comes back HTTP 200 with
         # {"status":"error","msg":"user not found"} — _raw raises APIError(200)
         # for it rather than returning {}, so callers can't mistake "no such
-        # user" for "user with zero followers". `data` is coalesced in case it
-        # is ever null on a success envelope.
+        # user" for "user with zero followers". A success envelope whose
+        # `data` is null or empty carries no profile either: same error, never
+        # an empty dict that reads as a user with no followers.
         self._require_budget(self.page_credits("user_info", 1, 1),
                              "user_info lookup")
         resp = self._raw("GET", spec["path"], {"userName": user_name},
                          max_credits=self.page_credits("user_info", 1, 1))
         self._charge("user_info", 1, 1)     # a profile lookup bills 18 credits
-        return resp.get("data") or {}
+        data = resp.get("data")
+        if not isinstance(data, dict) or not data:
+            raise APIError(200, f"user {user_name!r} not found: response "
+                                f"data is {data!r}", spec["path"])
+        return data
 
     def follower_count(self, user_name) -> int:
-        return int(self.user_info(user_name).get("followers") or 0)
+        followers = self.user_info(user_name).get("followers")
+        if followers in (None, ""):
+            raise IncompleteDataError(
+                f"profile for {user_name!r} omitted the followers count; "
+                "refusing to report an unknown count as 0")
+        return int(followers)
 
     def follower_ids(self, user_name=None, *, user_id=None, limit=None):
         """Cheapest way to enumerate followers: 0.45 credits/id at 5000/call
@@ -893,7 +1049,11 @@ class Client:
                 charges.append(full_page)  # unknown response: never undercount
                 continue
             tweets = r.get("tweets")
-            if not isinstance(tweets, list):
+            if not isinstance(tweets, list) or not isinstance(
+                    r.get("has_next_page"), bool):
+                # A missing has_next_page is unknown, never "no more pages"
+                # (verified 2026-10-23: every live subresult carries a bool,
+                # including empty ones).
                 invalid.append(result_key)
                 charges.append(full_page)
                 continue
@@ -904,13 +1064,12 @@ class Client:
             # NOT proof of completeness (results can be filtered). Callers that
             # infer from length alone silently lose data.
             out.append({"tweets": tweets,
-                        "has_next_page": bool(r.get("has_next_page")),
+                        "has_next_page": r["has_next_page"],
                         "next_cursor": r.get("next_cursor") or ""})
-        # ONE request produced N billable search results. _bill_request booked
-        # one 15-credit request floor, so add the combined pages minus that one
-        # floor. Missing/malformed subresults are conservatively booked full.
-        with self._lock:
-            self.spent_credits += max(sum(charges) - MIN_REQUEST_CREDITS, 0.0)
+        # ONE request produced N billable search results: settle its booking
+        # to the combined pages. Missing/malformed subresults are
+        # conservatively booked full.
+        self._settle(sum(charges))
         if invalid:
             raise IncompleteDataError(
                 f"bulk_search response omitted or malformed {invalid}; refusing "
@@ -941,7 +1100,14 @@ class Client:
                           "target_user_name": target_user_name},
                          max_credits=self.page_credits("check_follow", 1, 1)) or {}
         self._charge("check_follow", 1, 1)     # single record, profile-priced
-        return resp.get("data", {})
+        data = resp.get("data")
+        if not isinstance(data, dict) or not data:
+            # An empty dict would read as "neither follows the other".
+            raise IncompleteDataError(
+                f"check_follow_relationship returned no relationship data for "
+                f"@{source_user_name} -> @{target_user_name}; the relationship "
+                f"is unknown, not absent")
+        return data
 
     def replies(self, tweet_id, *, limit=None, query_type="Latest", v2=True):
         """Replies to a tweet. v2 returns ~31-38 per call vs 20 for v1/plain,

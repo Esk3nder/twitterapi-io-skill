@@ -5,7 +5,7 @@
 > reasoning. Before trusting a price or a response shape below, run:
 >
 > ```bash
-> python3 scripts/verify.py        # ~$0.002 — exits 1 if reality has moved
+> python3 scripts/verify.py        # ~$0.05 — exits 1 if reality has moved
 > ```
 >
 > The client also warns at runtime once these facts pass 90 days old. If

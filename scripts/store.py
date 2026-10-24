@@ -19,6 +19,7 @@ share a shape.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -29,7 +30,30 @@ import urllib.parse
 from datetime import datetime, timezone
 
 DEFAULT_DB = os.path.expanduser("~/.twitterapi-cache/store.db")
+# Request params that carry an X handle. Handles are case-insensitive, so the
+# page-cache key folds their case (see Store._key).
+HANDLE_PARAMS = ("userName", "username")
 TW_FMT = "%a %b %d %H:%M:%S %z %Y"
+
+# Every tweet fact column is nullable: NULL means the source record did not
+# carry the field (UNKNOWN), never zero / false / no media. `media` holds a
+# JSON list; NULL there means the record had no media keys at all, while '[]'
+# means the record asserted "no media". {name} lets the migration build the
+# same table under a temporary name — one definition, no drift.
+TWEETS_DDL = """CREATE TABLE IF NOT EXISTS {name} (
+  id TEXT PRIMARY KEY, author_id TEXT, author_name TEXT,
+  created_ts INTEGER, text TEXT, lang TEXT,
+  likes INTEGER, retweets INTEGER, replies INTEGER, quotes INTEGER,
+  views INTEGER, is_reply INTEGER, is_quote INTEGER, is_retweet INTEGER,
+  conversation_id TEXT, in_reply_to TEXT,
+  media TEXT, raw TEXT, seen_at REAL);"""
+TWEETS_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_tweets_author ON tweets(author_id);
+CREATE INDEX IF NOT EXISTS idx_tweets_ts ON tweets(created_ts);"""
+TWEET_COLUMNS = ("id", "author_id", "author_name", "created_ts", "text", "lang",
+                 "likes", "retweets", "replies", "quotes", "views", "is_reply",
+                 "is_quote", "is_retweet", "conversation_id", "in_reply_to",
+                 "media")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pages (
@@ -41,15 +65,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   is_blue INTEGER, is_verified INTEGER, created_at TEXT,
   location TEXT, raw TEXT, seen_at REAL);
 CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_name);
-CREATE TABLE IF NOT EXISTS tweets (
-  id TEXT PRIMARY KEY, author_id TEXT, author_name TEXT,
-  created_ts INTEGER, text TEXT, lang TEXT,
-  likes INTEGER, retweets INTEGER, replies INTEGER, quotes INTEGER,
-  views INTEGER, is_reply INTEGER, is_quote INTEGER, is_retweet INTEGER,
-  conversation_id TEXT, in_reply_to TEXT,
-  media TEXT NOT NULL DEFAULT '[]', raw TEXT, seen_at REAL);
-CREATE INDEX IF NOT EXISTS idx_tweets_author ON tweets(author_id);
-CREATE INDEX IF NOT EXISTS idx_tweets_ts ON tweets(created_ts);
+""" + TWEETS_DDL.format(name="tweets") + TWEETS_INDEXES + """
 CREATE TABLE IF NOT EXISTS cohorts (
   name TEXT, version INTEGER, member_key TEXT, account_id TEXT, user_name TEXT,
   weight REAL DEFAULT 1.0, provenance TEXT, added_at REAL,
@@ -100,18 +116,25 @@ def normalize_account(u: dict) -> dict:
         values = [u[k] for k in keys if k in u and u[k] not in (None, "")]
         return None if not values else int(any(bool(value) for value in values))
 
-    def optional_text(*keys):
+    def optional_bio(*keys):
         """Absent -> None (unknown). Present -> the value, including "" when the
-        source genuinely asserts an empty bio. The nested profile_bio shape used
-        by some endpoints is checked before giving up."""
-        for k in keys:
-            if k in u:
-                v = u[k]
-                return "" if v is None else str(v)
+        source genuinely asserts an empty bio — the upsert treats "" as
+        authoritative, so a hollow "" must never come out of here.
+
+        Author-shaped records put the real bio at profile_bio.description
+        and leave the top-level key "" (measured on the production store:
+        2,387 of 2,935 tweet authors). So a non-empty nested bio beats an
+        empty top-level one, and a nested "" alone asserts nothing.
+        put_tweets additionally strips the top-level key from tweet authors,
+        whose "" is hollow even without a nested bio."""
+        top = next((u[k] for k in keys if k in u), None)
+        if top not in (None, ""):
+            return str(top)
         nested = u.get("profile_bio")
-        if isinstance(nested, dict) and nested.get("description") is not None:
-            return str(nested["description"])
-        return None
+        nested = nested.get("description") if isinstance(nested, dict) else None
+        if nested not in (None, ""):
+            return str(nested)
+        return "" if any(k in u for k in keys) else None
 
     def optional_int(*keys):
         """Absent -> None (unknown). Present -> int, including a genuine 0.
@@ -136,7 +159,7 @@ def normalize_account(u: dict) -> dict:
         # ABSENT means unknown; PRESENT-but-empty is a real assertion that the
         # account has no bio (verified against /followers: genuinely bio-less
         # 10 of 10). g() collapses both to None, so the key is probed directly.
-        "description": optional_text("description", "bio"),
+        "description": optional_bio("description", "bio"),
         # Absent counts mean UNKNOWN, not zero. Coercing them to 0 forced the
         # upsert to use MAX() to protect a good value from a thin record — and
         # MAX then made a genuine DECLINE unwritable, so the store recorded the
@@ -225,32 +248,79 @@ def extract_tweet_media(t: dict) -> list[dict]:
     return out
 
 
+def carries_media(t: dict) -> bool:
+    """Does this record say ANYTHING about media? Live records always carry
+    `extendedEntities` ({} when there is no media; 2,935 of 2,935 on the
+    production store), so its presence is an assertion and an empty value
+    means "no media". A record with none of the media keys says nothing.
+
+    A top-level `media` list counts only when non-empty: twitterapi's
+    enrich_tweet_media attaches `media` to EVERY record, so `media: []`
+    without a source key is derived from nothing, not an assertion."""
+    if not isinstance(t, dict):
+        return False
+    if "extendedEntities" in t or "extended_entities" in t:
+        return True
+    if isinstance(t.get("media"), list) and t["media"]:
+        return True
+    entities = t.get("entities")
+    return isinstance(entities, dict) and "media" in entities
+
+
 def normalize_tweet(t: dict) -> dict:
     """One shape for tweets. Note `viewCount`/`url` appear on advanced_search
-    results but not on last_tweets — never assume a field exists."""
+    results but not on last_tweets — never assume a field exists.
+
+    ABSENT means UNKNOWN: every field whose source key is missing is None, so
+    the upsert keeps the stored value instead of overwriting it. Coercing
+    absence to 0 made a thin refetch erase paid data (views 12345 -> 0, one
+    photo -> []). A PRESENT value — including 0, false, "" — is authoritative.
+    """
     if not isinstance(t, dict):
         return {}
-    a = t.get("author") or {}
+    a = t.get("author") if isinstance(t.get("author"), dict) else None
+
+    def count(key):
+        value = t.get(key)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def text(key):
+        if key not in t:
+            return None
+        return "" if t[key] is None else str(t[key])
+
+    def flag(*keys):
+        if not any(k in t for k in keys):
+            return None
+        return int(any(bool(t.get(k)) for k in keys))
+
+    author_id = a.get("id") if a else None
+    author_name = (a.get("userName") or a.get("screen_name")) if a else None
     return {
         "id": str(t.get("id") or ""),
-        "author_id": str(a.get("id") or ""),
-        "author_name": a.get("userName") or a.get("screen_name") or "",
-        "created_ts": parse_ts(t.get("createdAt") or "") or 0,
-        "text": t.get("text") or "",
-        "lang": t.get("lang") or "",
-        "likes": int(t.get("likeCount") or 0),
-        "retweets": int(t.get("retweetCount") or 0),
-        "replies": int(t.get("replyCount") or 0),
-        "quotes": int(t.get("quoteCount") or 0),
-        "views": int(t.get("viewCount") or 0),
-        "is_reply": int(bool(t.get("isReply"))),
-        "is_quote": int(bool(t.get("quoted_tweet"))),
+        "author_id": str(author_id) if author_id not in (None, "") else None,
+        "author_name": author_name or None,
+        "created_ts": parse_ts(t.get("createdAt") or ""),
+        "text": text("text"),
+        "lang": text("lang"),
+        "likes": count("likeCount"),
+        "retweets": count("retweetCount"),
+        "replies": count("replyCount"),
+        "quotes": count("quoteCount"),
+        "views": count("viewCount"),
+        "is_reply": flag("isReply"),
+        "is_quote": flag("quoted_tweet"),
         # The API's isRetweet flag is documented as unreliable; corroborate it
         # with the presence of retweeted_tweet.
-        "is_retweet": int(bool(t.get("isRetweet") or t.get("retweeted_tweet"))),
-        "conversation_id": str(t.get("conversationId") or ""),
-        "in_reply_to": str(t.get("inReplyToId") or ""),
-        "media": extract_tweet_media(t),
+        "is_retweet": flag("isRetweet", "retweeted_tweet"),
+        "conversation_id": text("conversationId"),
+        "in_reply_to": text("inReplyToId"),
+        "media": extract_tweet_media(t) if carries_media(t) else None,
     }
 
 
@@ -306,25 +376,111 @@ class Store:
             self.db.executescript(SCHEMA)
             self.db.commit()
 
-        tweet_cols = [r["name"] for r in self.db.execute(
-            "PRAGMA table_info(tweets)")]
+        tweet_cols = {r["name"]: r for r in self.db.execute(
+            "PRAGMA table_info(tweets)")}
         if tweet_cols and "media" not in tweet_cols:
-            self.db.execute(
-                "ALTER TABLE tweets ADD COLUMN media TEXT NOT NULL DEFAULT '[]'")
+            self.db.execute("ALTER TABLE tweets ADD COLUMN media TEXT")
             # Existing paid corpora already contain media in raw JSON. Recover
             # it locally during migration instead of requiring a paid re-crawl.
+            # raw and the columns were written together by the old REPLACE, so
+            # raw is exactly the record the row came from: a raw with media
+            # keys gets its list (possibly []), one without stays NULL.
             updates = []
             for row in self.db.execute("SELECT id, raw FROM tweets"):
                 try:
                     raw = json.loads(row["raw"] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     raw = {}
-                media = extract_tweet_media(raw)
-                if media:
-                    updates.append((json.dumps(media), row["id"]))
+                if carries_media(raw):
+                    updates.append((json.dumps(extract_tweet_media(raw)),
+                                    row["id"]))
             if updates:
                 self.db.executemany(
                     "UPDATE tweets SET media=? WHERE id=?", updates)
+            self.db.commit()
+        elif tweet_cols and tweet_cols["media"]["notnull"]:
+            self._relax_tweet_media()
+        self._rekey_pages()
+
+    def _rekey_pages(self):
+        """Stores written before handle keys were case-folded hold paid pages
+        under mixed-case keys (measured: 210 followings pages for one handle)
+        that the folded key can no longer find. Re-key them in place; when two
+        casings of one request both exist, keep the newer page."""
+        rows = list(self.db.execute(
+            "SELECT key, path, params FROM pages WHERE params LIKE "
+            "'%\"userName\"%' OR params LIKE '%\"username\"%' "
+            "ORDER BY fetched_at"))
+        moves = []
+        for row in rows:
+            try:
+                params = json.loads(row["params"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            new = self._key(row["path"], params)
+            if new != row["key"]:
+                moves.append((row["key"], new))
+        if not moves:
+            return
+        # Oldest first: a later move to the same key replaces the earlier one.
+        for old, new in moves:
+            self.db.execute("DELETE FROM pages WHERE key=? AND fetched_at <= "
+                            "(SELECT fetched_at FROM pages WHERE key=?)",
+                            (new, old))
+            self.db.execute("UPDATE OR IGNORE pages SET key=? WHERE key=?",
+                            (new, old))
+            self.db.execute("DELETE FROM pages WHERE key=?", (old,))
+        self.db.commit()
+
+    def _relax_tweet_media(self):
+        """Stores created before 2026-10-23 declare media NOT NULL DEFAULT '[]',
+        which cannot hold "unknown". SQLite cannot drop a NOT NULL constraint
+        in place, so rebuild the table: copy every row by column NAME (the
+        production table has media appended after seen_at by an older ALTER),
+        swap, and recreate the indexes — all in one IMMEDIATE transaction, so
+        a crash leaves the old table intact and a second process opening the
+        same file concurrently waits, re-checks, and finds nothing to do.
+
+        Existing values are copied unchanged. A stored '[]' cannot be told
+        apart from "unknown" after the fact; measured on the production store,
+        every one of its 2,935 raw records carries extendedEntities, so its
+        '[]' values are genuine "no media" and nothing needs re-deriving."""
+        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            info = list(self.db.execute("PRAGMA table_info(tweets)"))
+            if not any(r["name"] == "media" and r["notnull"] for r in info):
+                self.db.rollback()          # another process got here first
+                return
+            cols = ", ".join(r["name"] for r in info)
+            self.db.execute("DROP TABLE IF EXISTS tweets_migrating")
+            self.db.execute(TWEETS_DDL.format(name="tweets_migrating"))
+            self.db.execute(f"INSERT INTO tweets_migrating ({cols}) "
+                            f"SELECT {cols} FROM tweets")
+            self.db.execute("DROP TABLE tweets")
+            self.db.execute("ALTER TABLE tweets_migrating RENAME TO tweets")
+            for statement in TWEETS_INDEXES.strip().split(";"):
+                if statement.strip():
+                    self.db.execute(statement)
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    @contextlib.contextmanager
+    def _write_txn(self):
+        """One write transaction that is atomic across THREADS (_wlock) and
+        across CONNECTIONS/processes (BEGIN IMMEDIATE takes SQLite's write
+        lock before the first read, so a read-then-write cannot interleave
+        with another process's; the 30 s connect timeout is the wait).
+        _wlock alone let two processes both allocate cohort version N."""
+        with self._wlock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.db
+            except BaseException:
+                self.db.rollback()
+                raise
             self.db.commit()
 
     # -- fetch cache ------------------------------------------------------
@@ -333,7 +489,12 @@ class Store:
         # Stringify values so cursor=1 (int) and cursor="1" (str) map to one
         # key — otherwise an equivalent request is a false cache miss and pays
         # to refetch. urlencode stringifies anyway, so this loses nothing.
-        norm = {str(k): str(v) for k, v in (params or {}).items()}
+        # X handles are case-insensitive, and follower_ids_for() matches them
+        # that way. A case-sensitive key let overlap("Stripe") count a cached
+        # "stripe" crawl as free and then pay to re-buy it.
+        norm = {str(k): (str(v).lstrip("@").casefold()
+                         if k in HANDLE_PARAMS else str(v))
+                for k, v in (params or {}).items()}
         return path + "?" + json.dumps(norm, sort_keys=True)
 
     def get_page(self, path, params, max_age=None):
@@ -394,10 +555,14 @@ class Store:
         wanted_name = ((user_name or "").lstrip("@").casefold()
                        if user_name is not None else None)
         pages = []
-        rows = self.db.execute(
-            "SELECT params, body, fetched_at FROM pages WHERE path=? "
-            "ORDER BY fetched_at, key",
-            ("/twitter/user/followers_ids",))
+        # Materialise under the lock: an unlocked cursor on the shared
+        # connection, iterated while other threads used it, silently returned
+        # 0 ids (16 threads) — and then a false PARTIAL warning.
+        with self._wlock:
+            rows = self.db.execute(
+                "SELECT params, body, fetched_at FROM pages WHERE path=? "
+                "ORDER BY fetched_at, key",
+                ("/twitter/user/followers_ids",)).fetchall()
         for row in rows:
             try:
                 params = json.loads(row["params"] or "{}")
@@ -417,7 +582,12 @@ class Store:
         # than invent an empty answer for data the caller paid for — but that
         # union spans unknown generations, so it is never provably complete.
         starts = [i for i, (is_start, _, _) in enumerate(pages) if is_start]
-        if starts:
+        if not pages:
+            # Nothing bought yet: unknown, not an empty follower set. No
+            # warning — there is no partial data to warn about.
+            complete = False
+            reason = "no follower_ids pages are cached for this account"
+        elif starts:
             pages = pages[starts[-1]:]
             # The crawl's own completeness bit sits in the cached body: the
             # FINAL page of an interrupted crawl (ceiling hit, SIGKILL, API
@@ -439,7 +609,7 @@ class Store:
                 if account_id not in seen:
                     seen.add(account_id)
                     out.append(account_id)
-        if not complete:
+        if not complete and pages:
             print(f"[store] PARTIAL: follower_ids_for returned {len(out):,} "
                   f"ids but {reason}.", file=sys.stderr)
         result = _FollowerIds(out)
@@ -472,22 +642,18 @@ class Store:
                        ON CONFLICT(id) DO UPDATE SET
                          user_name   = COALESCE(NULLIF(excluded.user_name,''), user_name),
                          name        = COALESCE(NULLIF(excluded.name,''), name),
-                         description = COALESCE(NULLIF(excluded.description,''), description),
-                         -- COALESCE, not MAX: an incoming count is authoritative
-                         -- when present (accounts genuinely lose followers and
-                         -- delete posts), and a thin record carries NULL rather
-                         -- than 0, so it cannot clobber a known value.
+                         -- COALESCE, not MAX / NULLIF: an incoming value is
+                         -- authoritative when present (accounts lose followers,
+                         -- let subscriptions lapse, clear their bio), and a
+                         -- thin record carries NULL rather than 0 / false / "",
+                         -- so it cannot clobber a known value. The normaliser
+                         -- owns the "hollow empty bio" case and emits NULL.
+                         description = COALESCE(excluded.description, description),
                          followers   = COALESCE(excluded.followers, followers),
                          following   = COALESCE(excluded.following, following),
                          statuses    = COALESCE(excluded.statuses, statuses),
-                         is_blue     = CASE
-                           WHEN excluded.is_blue IS NULL THEN is_blue
-                           WHEN is_blue IS NULL THEN excluded.is_blue
-                           ELSE MAX(excluded.is_blue, is_blue) END,
-                         is_verified = CASE
-                           WHEN excluded.is_verified IS NULL THEN is_verified
-                           WHEN is_verified IS NULL THEN excluded.is_verified
-                           ELSE MAX(excluded.is_verified, is_verified) END,
+                         is_blue     = COALESCE(excluded.is_blue, is_blue),
+                         is_verified = COALESCE(excluded.is_verified, is_verified),
                          created_at  = COALESCE(NULLIF(excluded.created_at,''), created_at),
                          location    = COALESCE(NULLIF(excluded.location,''), location),
                          raw         = CASE WHEN LENGTH(excluded.raw) > LENGTH(raw)
@@ -497,29 +663,52 @@ class Store:
         return len(rows)
 
     def put_tweets(self, tweets):
-        rows, authors = [], []
+        """Upsert tweets. A PRESENT field wins; an ABSENT one (NULL from the
+        normaliser) keeps the stored value. INSERT OR REPLACE used to rewrite
+        the whole row, so a thin refetch erased views, media and flags.
+
+        `raw` follows the same rule at its top level: the stored record is
+        merged with the incoming one, incoming keys winning. Fields that live
+        only in raw (bookmarkCount, inReplyToUserId) survive a thin refetch,
+        and raw keeps agreeing with the columns derived from it."""
+        parsed, authors = [], []
         for t in tweets:
             n = normalize_tweet(t)
             if not n.get("id"):
                 continue
-            rows.append((n["id"], n["author_id"], n["author_name"], n["created_ts"],
-                         n["text"], n["lang"], n["likes"], n["retweets"], n["replies"],
-                         n["quotes"], n["views"], n["is_reply"], n["is_quote"],
-                         n["is_retweet"], n["conversation_id"], n["in_reply_to"],
-                         json.dumps(n["media"]), json.dumps(t), time.time()))
+            parsed.append((n, t))
             if isinstance(t.get("author"), dict):
                 authors.append(t["author"])
-        if rows:
-            with self._wlock:
-                self.db.executemany(
-                    """INSERT OR REPLACE INTO tweets
-                       (id, author_id, author_name, created_ts, text, lang,
-                        likes, retweets, replies, quotes, views, is_reply,
-                        is_quote, is_retweet, conversation_id, in_reply_to,
-                        media, raw, seen_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    rows)
-                self.db.commit()
+        if parsed:
+            cols = TWEET_COLUMNS + ("raw", "seen_at")
+            keep = ",\n".join(f"{c} = COALESCE(excluded.{c}, {c})"
+                              for c in TWEET_COLUMNS if c != "id")
+            sql = (f"INSERT INTO tweets ({', '.join(cols)}) "
+                   f"VALUES ({','.join('?' * len(cols))}) "
+                   f"ON CONFLICT(id) DO UPDATE SET {keep}, "
+                   f"raw = excluded.raw, seen_at = excluded.seen_at")
+            with self._write_txn() as db:
+                ids = sorted({n["id"] for n, _ in parsed})
+                stored = {}
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    for r in db.execute(
+                            "SELECT id, raw FROM tweets WHERE id IN "
+                            f"({','.join('?' * len(chunk))})", chunk):
+                        try:
+                            old = json.loads(r["raw"] or "{}")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            old = {}
+                        stored[r["id"]] = old if isinstance(old, dict) else {}
+                rows = []
+                for n, t in parsed:
+                    merged = {**stored.get(n["id"], {}), **t}
+                    stored[n["id"]] = merged        # duplicates within a batch
+                    media = None if n["media"] is None else json.dumps(n["media"])
+                    rows.append(tuple(media if c == "media" else n[c]
+                                      for c in TWEET_COLUMNS)
+                                + (json.dumps(merged), time.time()))
+                db.executemany(sql, rows)
         if authors:
             # A tweet-embedded author object reports description="" even for
             # accounts that plainly have a bio. Measured against user_info:
@@ -533,7 +722,7 @@ class Store:
             authors = [{k: v for k, v in a.items() if k != "description"}
                        if isinstance(a, dict) else a for a in authors]
             self.put_accounts(authors)      # takes _wlock itself; must be OUTSIDE
-        return len(rows)
+        return len(parsed)
 
     # -- cohorts ----------------------------------------------------------
     @staticmethod
@@ -548,8 +737,10 @@ class Store:
         """members: iterable of (account_id, user_name, weight, provenance).
         Versioned so Cohort Drift can diff two resolutions of the same name."""
         materialized = list(members)
-        with self._wlock:                       # version read + writes atomic,
-            if version is None:                 # else two savers race on MAX+1
+        # Version read + writes in ONE write transaction, else two savers race
+        # on MAX+1 — across processes too, which _wlock alone cannot see.
+        with self._write_txn():
+            if version is None:
                 r = self.db.execute(
                     "SELECT COALESCE(MAX(version),0)+1 v FROM cohort_meta WHERE name=?",
                     (name,)).fetchone()
@@ -560,8 +751,11 @@ class Store:
                 if not mk or mk == "@" or mk in keys:
                     continue
                 keys.add(mk)
+                # Only an ABSENT weight defaults to 1.0. `w or 1.0` turned an
+                # authority weight of 0 into 1.0 and inverted the ranking.
                 rows.append((name, version, mk, str(aid or ""), un or "",
-                             float(w or 1.0), prov or "", time.time()))
+                             1.0 if w is None else float(w), prov or "",
+                             time.time()))
             # Clear the version before writing it. INSERT OR REPLACE only
             # touches supplied keys, so replacing a version with FEWER members
             # left the omitted ones behind as ghosts — metadata said 1 member,
@@ -574,10 +768,15 @@ class Store:
                 "INSERT OR REPLACE INTO cohorts VALUES (?,?,?,?,?,?,?,?)", rows)
             self.db.execute("INSERT OR REPLACE INTO cohort_meta VALUES (?,?,?,?,?)",
                             (name, version, json.dumps(spec or {}), time.time(), len(rows)))
-            self.db.commit()
         return version
 
     def load_cohort(self, name, version=None):
+        """Members of a saved cohort version (latest when version is None).
+
+        Raises KeyError when that name/version was never saved. Returning []
+        made a typo'd name indistinguishable from a saved empty cohort, so an
+        intersect with it silently reported zero overlap. A saved empty
+        cohort (cohort_meta row, size 0) still loads as []."""
         with self._wlock:               # see get_page: reads need it too
             if version is None:
                 r = self.db.execute(
@@ -585,7 +784,11 @@ class Store:
                     (name,)).fetchone()
                 version = r["v"]
                 if version is None:
-                    return []
+                    raise KeyError(f"no saved cohort named {name!r}")
+            elif self.db.execute(
+                    "SELECT 1 FROM cohort_meta WHERE name=? AND version=?",
+                    (name, version)).fetchone() is None:
+                raise KeyError(f"cohort {name!r} has no saved version {version}")
             return [dict(r) for r in self.db.execute(
                 "SELECT * FROM cohorts WHERE name=? AND version=? ORDER BY weight DESC",
                 (name, version))]
@@ -601,6 +804,14 @@ class Store:
             return [r["version"] for r in self.db.execute(
                 "SELECT version FROM cohort_meta WHERE name=? ORDER BY version",
                 (name,))]
+
+    def cohort_spec(self, name, version):
+        """The spec dict saved with one cohort version ({} when none)."""
+        with self._wlock:
+            row = self.db.execute(
+                "SELECT spec FROM cohort_meta WHERE name=? AND version=?",
+                (name, version)).fetchone()
+        return json.loads(row["spec"] or "{}") if row else {}
 
     def delete_cohort(self, name, version=None):
         """Delete one saved version, or all versions when version is omitted.
@@ -626,25 +837,37 @@ class Store:
 
     # -- queries ----------------------------------------------------------
     def tweets_for(self, account_ids=None, user_names=None, since=None, until=None):
+        """Stored tweets, newest first. A filter of None is "no filter"; an
+        EMPTY list is a filter that matches nothing (an empty cohort has no
+        tweets — `if account_ids:` used to return the whole corpus).
+
+        Fact columns are None when the source never carried them, and
+        `media` is None when no record of the tweet carried media keys —
+        unknown, not zero / no media."""
         q = "SELECT * FROM tweets WHERE 1=1"
         p = []
-        if account_ids:
+        if account_ids is not None:
+            account_ids = list(account_ids)
             q += f" AND author_id IN ({','.join('?' * len(account_ids))})"
             p += [str(a) for a in account_ids]
-        if user_names:
+        if user_names is not None:
+            user_names = list(user_names)
             q += f" AND lower(author_name) IN ({','.join('?' * len(user_names))})"
             p += [u.lower().lstrip("@") for u in user_names]
-        if since:
+        if since is not None:
             q += " AND created_ts >= ?"; p.append(int(since))
-        if until:
+        if until is not None:
             q += " AND created_ts < ?"; p.append(int(until))
+        with self._wlock:               # see get_page: reads need it too
+            records = self.db.execute(q + " ORDER BY created_ts DESC", p).fetchall()
         rows = []
-        for record in self.db.execute(q + " ORDER BY created_ts DESC", p):
+        for record in records:
             row = dict(record)
             try:
-                row["media"] = json.loads(row.get("media") or "[]")
+                row["media"] = (None if row.get("media") is None
+                                else json.loads(row["media"]))
             except (TypeError, ValueError, json.JSONDecodeError):
-                row["media"] = []
+                row["media"] = None
             rows.append(row)
         return rows
 
@@ -666,17 +889,20 @@ class Store:
 
     def stats(self):
         n = lambda t: self.db.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-        cached = self.db.execute("SELECT COALESCE(SUM(credits),0) s FROM pages").fetchone()["s"]
-        # "cohorts" counts SAVED VERSIONS (cohort_meta). The rows that make a
-        # store big live in the members table: a real store reported
-        # cohorts=2 while holding 421,578 member rows, so growth was
-        # invisible to the only diagnostic a user has. Report both, plus the
-        # file size, which is what "is my store getting big" actually asks.
-        db_bytes = (self.db.execute("PRAGMA page_count").fetchone()[0]
-                    * self.db.execute("PRAGMA page_size").fetchone()[0])
-        return {"pages": n("pages"), "accounts": n("accounts"), "tweets": n("tweets"),
-                "cohorts": n("cohort_meta"), "cohort_members": n("cohorts"),
-                "db_bytes": db_bytes, "credits_cached": cached,
+        with self._wlock:               # see get_page: reads need it too
+            cached = self.db.execute(
+                "SELECT COALESCE(SUM(credits),0) s FROM pages").fetchone()["s"]
+            # "cohorts" counts SAVED VERSIONS (cohort_meta). The rows that make
+            # a store big live in the members table: a real store reported
+            # cohorts=2 while holding 421,578 member rows, so growth was
+            # invisible to the only diagnostic a user has. Report both, plus
+            # the file size, which is what "is my store getting big" asks.
+            db_bytes = (self.db.execute("PRAGMA page_count").fetchone()[0]
+                        * self.db.execute("PRAGMA page_size").fetchone()[0])
+            counts = {"pages": n("pages"), "accounts": n("accounts"),
+                      "tweets": n("tweets"), "cohorts": n("cohort_meta"),
+                      "cohort_members": n("cohorts")}
+        return {**counts, "db_bytes": db_bytes, "credits_cached": cached,
                 "usd_saved_on_rerun": round(cached / 100_000, 4)}
 
 

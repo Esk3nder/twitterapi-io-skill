@@ -18,31 +18,18 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import (Client, CostLimitExceeded, IncompleteDataError,
-                        credits_to_usd)  # noqa: E402
+from twitterapi import (APIError, Client, CostLimitExceeded,
+                        IncompleteDataError, credits_to_usd)  # noqa: E402
 from store import Store  # noqa: E402
 
 AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
-
-
-def _drain_complete(stream, what):
-    """Consume a PaginationStream and refuse to build on a silent partial.
-
-    A later page can fail AFTER earlier records were retrieved and billed;
-    the stream then ends with complete=False rather than raising, and only
-    callers that check notice. jobs.py grew this guard in 727f17a; the
-    cohort resolvers did not — so a 500-storm mid-crawl yielded a partial
-    cohort that every downstream set operation treated as the full
-    population. Same contract as jobs._materialize_complete.
-    """
-    rows = list(stream)
-    if getattr(stream, "complete", True) is False:
-        raise IncompleteDataError(
-            getattr(stream, "_warning", None) or
-            f"{what} ended before completeness was proven; rows are partial")
-    return rows
+# A request that failed for this account or this resource. Programming errors
+# are deliberately absent: they must propagate, not become "partial".
+_REQUEST_FAILURES = (APIError, IncompleteDataError, urllib.error.URLError,
+                     TimeoutError)
 
 
 class Cohort:
@@ -51,23 +38,80 @@ class Cohort:
     Backed by dict {account_id or user_name -> member}. Members carry whatever
     identity we have; some resolvers yield only ids (cheap), some yield full
     profiles. `hydrate()` fills profiles on demand.
+
+    ``complete`` is False when the member set is known to be a sample of the
+    population it names (a resolver stopped at its limit, an engager leg
+    failed, a filter could not judge some members). ``incomplete_reasons``
+    says why. Set operations, save() and load() carry the flag forward.
     """
 
     def __init__(self, members=None, client=None, store=None, label=""):
-        self.c = client or Client(verbose=False)
-        client_store = getattr(self.c, "store", None)
+        # The Client is created on first paid use, not here: loading, set
+        # algebra and drift are local and must work without an API key.
+        self._client = client
+        self._store_injected = store is not None
+        client_store = getattr(client, "store", None)
         self.s = (store if store is not None else
                   client_store if client_store is not None else Store())
-        # A caller who explicitly injects a Store into the cohort expects paid
-        # hydration pages to use it too. Keep the Client's cache path aligned
-        # when it has not already selected another store.
-        if (store is not None and hasattr(self.c, "store")
-                and self.c.store is None):
-            self.c.store = store
+        self._align_client_store()
         self.label = label
         # Deep-copy member dicts so set ops can't mutate an operand's members
         # in place (union() shared dict objects before this).
         self.members = {k: dict(v) for k, v in (members or {}).items()}
+        self.complete = True
+        self.incomplete_reasons = []
+
+    @property
+    def c(self):
+        if self._client is None:
+            self._client = Client(verbose=False)
+            self._align_client_store()
+        return self._client
+
+    def _align_client_store(self):
+        # A caller who explicitly injects a Store into the cohort expects paid
+        # hydration pages to use it too. Keep the Client's cache path aligned
+        # when it has not already selected another store.
+        if (self._store_injected and self._client is not None
+                and hasattr(self._client, "store") and self._client.store is None):
+            self._client.store = self.s
+
+    def _mark_partial(self, reason):
+        self.complete = False
+        self.incomplete_reasons.append(reason)
+        print(f"[cohort] PARTIAL: {self.label}: {reason}", file=sys.stderr)
+
+    def _inherit_completeness(self, *sources):
+        for source in sources:
+            if getattr(source, "complete", True) is False:
+                self.complete = False
+                self.incomplete_reasons.extend(
+                    getattr(source, "incomplete_reasons", []) or
+                    [f"{source.label} is partial"])
+
+    def _drain(self, stream, what, limit):
+        """Consume a PaginationStream; refuse a failed walk, label a sample.
+
+        A later page can fail AFTER earlier records were retrieved and billed;
+        the stream then ends with complete=False rather than raising, and only
+        callers that check notice — a 500-storm mid-crawl once yielded a
+        partial cohort that every set operation treated as the population.
+        That stays an IncompleteDataError. A walk stopped by ``limit`` while
+        the API had more is a different, legitimate result: the first N
+        members. The cohort keeps them and is marked partial, so it is never
+        saved or compared as the whole population.
+        """
+        rows = list(stream)
+        if getattr(stream, "complete", True) is False:
+            raise IncompleteDataError(
+                getattr(stream, "_warning", None) or
+                f"{what} ended before completeness was proven; rows are partial")
+        if getattr(stream, "truncated_by_limit", False):
+            self._mark_partial(
+                f"{what} stopped at limit={limit:,} while more existed; the "
+                f"cohort is the first {len(rows):,}, not the population. "
+                f"Raise limit for the whole set.")
+        return rows
 
     # -- construction -----------------------------------------------------
     @staticmethod
@@ -132,8 +176,8 @@ class Cohort:
         """Authors of tweets matching a query — the people talking about X."""
         co = cls(label=f"search:{query}", **kw)
         batch = []
-        for t in _drain_complete(co.c.paginate("search", query, limit=limit),
-                                 f"search {query!r}"):
+        for t in co._drain(co.c.paginate("search", query, limit=limit),
+                           f"search {query!r}", limit):
             a = t.get("author") or {}
             co._add(a.get("id"), a.get("userName"), 1.0, "search_author")
             batch.append(t)
@@ -150,31 +194,32 @@ class Cohort:
                 ("quote", "quotes", lambda t: t.get("author") or {}),
                 ("retweet", "retweeters", lambda u: u)):
             try:
-                for rec in _drain_complete(
+                for rec in co._drain(
                         co.c.paginate(ep, str(tweet_id), limit=limit),
-                        f"{kind} fetch for {tweet_id}"):
+                        f"{kind} fetch for {tweet_id}", limit):
                     a = extract(rec)
                     co._add(a.get("id"), a.get("userName") or a.get("screen_name"),
                             1.0, f"engager_{kind}")
             except (CostLimitExceeded, IncompleteDataError):
-                # A partial leg must not be downgraded to the warning below —
+                # A leg that failed after paid pages must not be downgraded —
                 # an event cohort missing half its retweeters is not "fewer
                 # engagers", it is a different population.
                 raise
-            except Exception as e:
-                # An empty result does NOT raise, so an exception here is a real
-                # error (bad id, wrong param). Surface it — do not pass it off
-                # as "this post had no engagers".
-                print(f"[cohort] WARNING: {kind} fetch for {tweet_id} failed: "
-                      f"{type(e).__name__}: {e}", file=sys.stderr)
+            except _REQUEST_FAILURES as e:
+                # An empty result does NOT raise, so a failure here is real
+                # (bad id, wrong param, outage). The other legs' engagers are
+                # kept, but the cohort is NOT every engager: mark it partial.
+                co._mark_partial(
+                    f"{kind} fetch for {tweet_id} failed "
+                    f"({type(e).__name__}: {e}); {kind} engagers are missing")
         return co
 
     @classmethod
     def from_community(cls, community_id, role="members", limit=1000, **kw):
         ep = {"members": "community_members", "moderators": "community_moderators"}[role]
         co = cls(label=f"community:{community_id}:{role}", **kw)
-        for u in _drain_complete(co.c.paginate(ep, str(community_id), limit=limit),
-                                 f"community {community_id} {role}"):
+        for u in co._drain(co.c.paginate(ep, str(community_id), limit=limit),
+                           f"community {community_id} {role}", limit):
             co._add(u.get("id"), u.get("userName") or u.get("screen_name"),
                     1.0, f"community_{role}")
         return co
@@ -182,8 +227,8 @@ class Cohort:
     @classmethod
     def from_list(cls, list_id, limit=1000, **kw):
         co = cls(label=f"list:{list_id}", **kw)
-        for u in _drain_complete(co.c.paginate("list_members", str(list_id), limit=limit),
-                                 f"list {list_id}"):
+        for u in co._drain(co.c.paginate("list_members", str(list_id), limit=limit),
+                           f"list {list_id}", limit):
             co._add(u.get("id"), u.get("userName") or u.get("screen_name"),
                     1.0, "list_member")
         return co
@@ -212,7 +257,8 @@ class Cohort:
         return None
 
     def union(self, other):
-        out = Cohort(self.members, self.c, self.s, f"({self.label} u {other.label})")
+        out = Cohort(self.members, self._client, self.s, f"({self.label} u {other.label})")
+        out._inherit_completeness(self, other)
         ix = self._index(out)
         for m in other:
             hit = self._lookup(ix, m)
@@ -228,8 +274,9 @@ class Cohort:
 
     def intersect(self, other):
         oix = self._index(other)
-        out = Cohort(client=self.c, store=self.s,
+        out = Cohort(client=self._client, store=self.s,
                      label=f"({self.label} n {other.label})")
+        out._inherit_completeness(self, other)
         for m in self.members.values():
             hit = self._lookup(oix, m)
             if hit:
@@ -240,19 +287,76 @@ class Cohort:
 
     def minus(self, other):
         oix = self._index(other)
-        out = Cohort(client=self.c, store=self.s, label=f"({self.label} - {other.label})")
+        out = Cohort(client=self._client, store=self.s, label=f"({self.label} - {other.label})")
+        out._inherit_completeness(self, other)
         for m in self.members.values():
             if not self._lookup(oix, m):
                 out._add(m["account_id"], m["user_name"], m["weight"], m["provenance"])
         return out
 
     # -- enrichment -------------------------------------------------------
+    def _stored_profiles(self):
+        """Stored account rows, by id and by lower-case handle."""
+        rows = {r["id"]: r for r in (dict(x) for x in self.s.db.execute(
+            "SELECT * FROM accounts"))}
+        by_name = {r["user_name"].lower(): r for r in rows.values()
+                   if r["user_name"]}
+        return rows, by_name
+
+    @staticmethod
+    def _profiled(row):
+        """True when a stored row holds every field filter() reads."""
+        return (row["followers"] is not None and row["description"] is not None
+                and (row["is_blue"] is not None
+                     or row["is_verified"] is not None))
+
+    def _set_account_id(self, key, account_id):
+        """Give a handle-keyed member its id and re-key it under that id."""
+        member = self.members.pop(key)
+        member["account_id"] = str(account_id)
+        same = self.members.get(member["account_id"])
+        if same is None:
+            self.members[member["account_id"]] = member
+            return
+        same["weight"] += member["weight"]          # one account, two entries
+        if not same["user_name"]:
+            same["user_name"] = member["user_name"]
+
     def hydrate(self, max_usd=1.0):
-        """Fill full profiles for members we only have ids/handles for, via the
-        batch endpoint (100 ids/call). Return the purchased profiles and fill
-        member handles. Needed before filter() on profile fields."""
-        need_ids = [m["account_id"] for m in self.members.values() if m["account_id"]]
-        profiles = []
+        """Fill full profiles for members we only have ids/handles for.
+
+        A member whose stored profile already holds every field filter()
+        reads is not bought again. Id members go through the batch endpoint
+        (100 ids/call); handle-only members through user_info (one call each,
+        the same 18-credit profile price). Returns the profiles retrieved
+        (bought, or served from the page cache) and fills member handles and
+        ids. Members the API returned no profile for are listed in
+        ``self.unhydrated`` with a warning — never silently left behind."""
+        rows, by_name = self._stored_profiles()
+        need_ids, need_names, known = [], [], []
+        for key, m in self.members.items():
+            prof = (rows.get(m["account_id"]) if m["account_id"]
+                    else by_name.get(m["user_name"].lower()))
+            if prof and self._profiled(prof):
+                if not m["user_name"] and prof["user_name"]:
+                    m["user_name"] = prof["user_name"]
+                if not m["account_id"]:
+                    known.append((key, prof["id"]))
+                continue
+            if m["account_id"]:
+                need_ids.append(m["account_id"])
+            elif m["user_name"]:
+                need_names.append((key, m["user_name"]))
+        for key, account_id in known:       # re-keys members: after the walk
+            self._set_account_id(key, account_id)
+        profiles, unhydrated = [], []
+        self.unhydrated = unhydrated
+        if not (need_ids or need_names):
+            return profiles     # all profiled locally: no request, no Client
+        # Paid pages are persisted by the client into its own store. Write
+        # here only when this cohort reads a different store, and never for a
+        # page served from cache (an old snapshot must not overwrite newer rows).
+        client_persists = getattr(self.c, "store", None) is self.s
         prior = self.c.max_usd
         method_ceiling = (self.c.spent_usd + max_usd
                           if max_usd is not None else None)
@@ -261,65 +365,101 @@ class Cohort:
         try:
             for i in range(0, len(need_ids), 100):
                 chunk = need_ids[i:i + 100]
-                users = list(self.c.paginate(
-                    "batch_users", ",".join(chunk), page_size=len(chunk)))
+                stream = self.c.paginate(
+                    "batch_users", ",".join(chunk), page_size=len(chunk))
+                users = [u for u in stream if isinstance(u, dict)]
                 profiles.extend(users)
                 names = {
                     str(u.get("id") or u.get("user_id") or ""):
                     (u.get("userName") or u.get("screen_name") or "").lstrip("@")
-                    for u in users if isinstance(u, dict)
+                    for u in users
                 }
-                for member in self.members.values():
-                    if member["account_id"] in names and names[member["account_id"]]:
-                        member["user_name"] = names[member["account_id"]]
-                self.s.put_accounts(users)
+                for account_id in chunk:
+                    if account_id not in names:
+                        unhydrated.append(account_id)
+                    elif names[account_id] and account_id in self.members:
+                        self.members[account_id]["user_name"] = names[account_id]
+                if (not client_persists
+                        and not getattr(stream, "cached_pages", 0)):
+                    self.s.put_accounts(users)
+            for key, handle in need_names:
+                try:
+                    profile = self.c.user_info(handle)
+                except APIError as e:
+                    unhydrated.append("@" + handle)
+                    print(f"[cohort] WARNING: no profile for @{handle}: "
+                          f"{e}", file=sys.stderr)
+                    continue
+                profiles.append(profile)
+                self.s.put_accounts([profile])
+                if profile.get("id"):
+                    self._set_account_id(key, profile["id"])
         finally:
             self.c.max_usd = prior
+        if unhydrated:
+            print(f"[cohort] WARNING: hydrate got no profile for "
+                  f"{len(unhydrated):,} members (suspended, deleted, or "
+                  f"renamed): {unhydrated[:10]}", file=sys.stderr)
         return profiles
 
     def filter(self, bio_matches=None, min_followers=None, verified=None):
         """Keep members whose STORED profile matches. Call hydrate() first, or
-        this only sees members already in the accounts table. The returned
-        cohort exposes skipped_unhydrated and skipped_unknown_verification."""
+        this only sees members already in the accounts table.
+
+        A member whose profile lacks a field the filter needs is unknown, not
+        a mismatch: it is counted (skipped_unhydrated, skipped_unknown_bio,
+        skipped_unknown_followers, skipped_unknown_verification), warned
+        about, and the returned cohort is marked partial."""
         import re
         pat = re.compile(bio_matches, re.I) if bio_matches else None
-        out = Cohort(client=self.c, store=self.s, label=f"filter({self.label})")
-        skipped_unhydrated = 0
-        skipped_unknown_verification = 0
-        rows = {r["id"]: r for r in (dict(x) for x in self.s.db.execute(
-            "SELECT * FROM accounts"))}
-        by_name = {r["user_name"].lower(): r for r in rows.values() if r["user_name"]}
+        out = Cohort(client=self._client, store=self.s, label=f"filter({self.label})")
+        out._inherit_completeness(self)
+        skipped = {"unhydrated": 0, "unknown_bio": 0, "unknown_followers": 0,
+                   "unknown_verification": 0}
+        rows, by_name = self._stored_profiles()
         for m in self.members.values():
             prof = rows.get(m["account_id"]) or by_name.get(m["user_name"].lower())
             if not prof:
-                skipped_unhydrated += 1
+                skipped["unhydrated"] += 1
                 continue
-            if pat and not (pat.search(prof["description"] or "")
-                            or pat.search(prof["name"] or "")):
-                continue
-            if min_followers and (prof["followers"] or 0) < min_followers:
-                continue
+            if pat:
+                text_hit = any(pat.search(prof[field] or "")
+                               for field in ("description", "name"))
+                if not text_hit and prof["description"] is None:
+                    skipped["unknown_bio"] += 1
+                    continue
+                if not text_hit:
+                    continue
+            if min_followers:
+                if prof["followers"] is None:
+                    skipped["unknown_followers"] += 1
+                    continue
+                if prof["followers"] < min_followers:
+                    continue
             if verified is not None:
                 verification = [prof["is_blue"], prof["is_verified"]]
                 known = [value for value in verification if value is not None]
                 if not known:
-                    skipped_unknown_verification += 1
+                    skipped["unknown_verification"] += 1
                     continue
                 if bool(any(known)) != verified:
                     continue
             out._add(prof["id"], prof["user_name"], m["weight"], m["provenance"])
-        out.skipped_unhydrated = skipped_unhydrated
-        out.skipped_unknown_verification = skipped_unknown_verification
-        if skipped_unhydrated:
-            print(f"[cohort] WARNING: filter skipped {skipped_unhydrated:,} "
-                  f"of {len(self):,} members absent from stored profiles; "
-                  f"call hydrate() before filtering profile fields.",
-                  file=sys.stderr)
-        if skipped_unknown_verification:
-            print(f"[cohort] WARNING: filter skipped "
-                  f"{skipped_unknown_verification:,} members whose stored "
-                  f"profiles omit verification fields; hydrate() before "
-                  f"treating the result as complete.", file=sys.stderr)
+        for kind, count in skipped.items():
+            setattr(out, f"skipped_{kind}", count)
+        if skipped["unhydrated"]:
+            out._mark_partial(
+                f"filter skipped {skipped['unhydrated']:,} of {len(self):,} "
+                f"members absent from stored profiles; call hydrate() before "
+                f"filtering profile fields.")
+        for kind, field in (("unknown_bio", "bio"),
+                            ("unknown_followers", "follower count"),
+                            ("unknown_verification", "verification fields")):
+            if skipped[kind]:
+                out._mark_partial(
+                    f"filter skipped {skipped[kind]:,} members whose stored "
+                    f"profiles omit the {field}; hydrate() before treating "
+                    f"the result as complete.")
         return out
 
     # -- ranking ----------------------------------------------------------
@@ -333,6 +473,12 @@ class Cohort:
         this reads at most ~(members x avg_following) records. Estimates first
         and refuses past max_usd; a follow-graph crawl is the one primitive
         that can quietly cost real money.
+
+        ``authority_complete`` is True only when EVERY member's followings
+        were walked to the end. Any member left out — no resolvable handle, a
+        failed or partial walk, the ceiling — sets it False and adds to
+        ``authority_incomplete_reason``. One member's API failure is recorded
+        and the walk continues, so the paid frontier is never thrown away.
         """
         members = [m for m in self.members.values() if m["account_id"] or m["user_name"]]
         # A 127-member measured crawl cost $0.0188/member, nearly 1.9x the old
@@ -356,28 +502,38 @@ class Cohort:
         prior = self.c.max_usd
         self.c.max_usd = min(x for x in (prior, self.c.spent_usd + max_usd)
                              if x is not None)
-        self.authority_complete = True      # flips false if the ceiling truncates
+        reasons = []
         crawled = 0
+        indeg = {self._key(m["account_id"], m["user_name"]): 0.0 for m in members}
         try:
             # id-only members can't have their followings fetched (the endpoint
             # takes a handle), so they'd be invisible as edge SOURCES and undercount
-            # everyone's in-degree. Resolve their handles first — batch is cheap.
+            # everyone's in-degree. Resolve their handles first through the
+            # batch endpoint, which reserves the whole batch's cost up front.
             missing = [m for m in members if not m["user_name"] and m["account_id"]]
             for i in range(0, len(missing), 100):
-                ids = [m["account_id"] for m in missing[i:i + 100]]
+                chunk = missing[i:i + 100]
                 try:
-                    resp = self.c._raw("GET", "/twitter/user/batch_info_by_ids",
-                                       {"userIds": ",".join(ids)})
-                    self.c._charge("batch_users", len(ids), 100)
-                    for u in resp.get("users") or []:
-                        for m in missing:
-                            if m["account_id"] == str(u.get("id")):
-                                m["user_name"] = u.get("userName") or ""
-                except CostLimitExceeded:
+                    users = list(self.c.paginate(
+                        "batch_users", ",".join(m["account_id"] for m in chunk)))
+                except CostLimitExceeded as e:
+                    reasons.append(f"spend ceiling hit while resolving handles "
+                                   f"of id-only members: {e}")
                     break
+                except _REQUEST_FAILURES as e:
+                    reasons.append(f"handle resolution failed for {len(chunk)} "
+                                   f"id-only members ({type(e).__name__}: {e})")
+                    continue
+                names = {str(u.get("id")): u.get("userName") or ""
+                         for u in users if isinstance(u, dict)}
+                for m in chunk:
+                    m["user_name"] = names.get(m["account_id"], "")
             member_ids = {m["account_id"] for m in members if m["account_id"]}
             member_by_name = {m["user_name"].lower(): m for m in members if m["user_name"]}
-            indeg = {self._key(m["account_id"], m["user_name"]): 0.0 for m in members}
+            unresolved = sum(1 for m in members if not m["user_name"])
+            if unresolved:
+                reasons.append(f"{unresolved:,} members have no resolvable "
+                               f"handle; their follows were not counted")
             total = len(members)
             for position, m in enumerate(members, 1):
                 handle = m["user_name"] or None
@@ -401,12 +557,9 @@ class Cohort:
                     if getattr(walk, "complete", True) is False:
                         # The member's out-edges were cut short by an API
                         # failure, not the ceiling. Edges already paid for
-                        # stay counted, but this member is NOT fully crawled
-                        # and the ranking as a whole is no longer provable.
-                        self.authority_complete = False
-                        self.authority_incomplete_reason = (
-                            getattr(walk, "_warning", None) or
-                            f"followings walk for @{handle} ended partial")
+                        # stay counted, but this member is NOT fully crawled.
+                        reasons.append(getattr(walk, "_warning", None) or
+                                       f"followings walk for @{handle} ended partial")
                         continue
                     crawled += 1
                     if progress:
@@ -415,16 +568,30 @@ class Cohort:
                               flush=True)
                 except CostLimitExceeded:
                     # Ceiling hit mid-crawl: later members never contributed
-                    # their out-edges, so the ranking is PARTIAL. Mark it.
-                    self.authority_complete = False
-                    self.authority_incomplete_reason = (
+                    # their out-edges, so the ranking is PARTIAL.
+                    reasons.append(
                         "spend ceiling hit mid-crawl; later members' follows "
                         "were not counted. Raise max_usd for a complete "
                         "frontier.")
                     break
+                except _REQUEST_FAILURES as e:
+                    # One member's failure (a 403 on a protected account) must
+                    # not discard every other member's paid edges, and a rerun
+                    # must not die on the same member forever.
+                    reasons.append(f"followings walk for @{handle} failed "
+                                   f"({type(e).__name__}: {e}); its follows "
+                                   f"were not counted")
+                    print(f"[authority] {position}/{total} @{handle}: failed: "
+                          f"{e}", file=sys.stderr, flush=True)
+                    continue
         finally:
             self.c.max_usd = prior      # never leave the ceiling tightened
         self.authority_crawled = crawled
+        self.authority_complete = crawled == len(members)
+        self.authority_incomplete_reason = (
+            None if self.authority_complete else
+            "; ".join(reasons) or
+            f"{len(members) - crawled:,} of {len(members):,} members not crawled")
         for k, deg in indeg.items():
             if k in self.members:
                 self.members[k]["weight"] = deg
@@ -433,16 +600,37 @@ class Cohort:
 
     # -- persistence ------------------------------------------------------
     def save(self, name):
+        """Save a new version. Completeness is saved with it: a partial
+        cohort stays labelled partial when loaded back."""
         members = [(m["account_id"], m["user_name"], m["weight"], m["provenance"])
                    for m in self.members.values()]
-        v = self.s.save_cohort(name, members, spec={"label": self.label})
+        if not self.complete:
+            print(f"[cohort] WARNING: saving '{name}' as a PARTIAL cohort: "
+                  f"{'; '.join(self.incomplete_reasons)}", file=sys.stderr)
+        v = self.s.save_cohort(name, members, spec={
+            "label": self.label, "complete": self.complete,
+            "incomplete_reasons": list(self.incomplete_reasons)})
         return v
 
     @classmethod
     def load(cls, name, version=None, **kw):
+        """Load a saved version (latest by default).
+
+        Raises KeyError (from Store.load_cohort) when the name or version was
+        never saved: an empty cohort would let intersect() report "overlap 0"
+        for a typo."""
         co = cls(label=f"saved:{name}", **kw)
-        for row in co.s.load_cohort(name, version):
+        if version is None:
+            versions = co.s.cohort_versions(name)
+            version = versions[-1] if versions else None
+        rows = co.s.load_cohort(name, version)
+        spec = co.s.cohort_spec(name, version)
+        for row in rows:
             co._add(row["account_id"], row["user_name"], row["weight"], row["provenance"])
+        if spec.get("complete") is False:
+            co._mark_partial(
+                f"saved version {version} was partial: "
+                f"{'; '.join(spec.get('incomplete_reasons') or []) or 'no reason recorded'}")
         return co
 
 

@@ -93,39 +93,6 @@ class TestArgumentParser(unittest.TestCase):
         self.assertIn("--state", body["help"][0])
 
 
-class TestHookSetup(unittest.TestCase):
-    def test_project_setup_is_explicit_idempotent_and_repairs_path(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            (root / ".codex").mkdir()
-            (root / ".codex/config.toml").write_text(
-                "model = \"gpt-5\"\n\n[features]\nhooks = false\nweb = true\n")
-            first = axi.setup_hooks(root, agents=["claude", "codex", "opencode"],
-                                    command="/old/jobs.py session-context")
-            second = axi.setup_hooks(root, agents=["claude", "codex", "opencode"],
-                                     command="/new/jobs.py session-context")
-
-            self.assertEqual(set(first["installed"]), {"claude", "codex", "opencode"})
-            self.assertEqual(set(second["repaired"]), {"claude", "codex", "opencode"})
-            claude = json.loads((root / ".claude/settings.json").read_text())
-            codex = json.loads((root / ".codex/hooks.json").read_text())
-            self.assertIn("/new/jobs.py", json.dumps(claude))
-            self.assertIn("/new/jobs.py", json.dumps(codex))
-            self.assertTrue((root / ".opencode/plugins/twitterapi-io.js").exists())
-            config = (root / ".codex/config.toml").read_text()
-            self.assertEqual(config.count("[features]"), 1)
-            self.assertIn("hooks = true", config)
-            self.assertIn("web = true", config)
-
-            third = axi.setup_hooks(root, agents=["claude", "codex", "opencode"],
-                                    command="/new/jobs.py session-context")
-            self.assertEqual(set(third["unchanged"]), {"claude", "codex", "opencode"})
-            checked = axi.check_hooks(
-                root, agents=["claude", "codex", "opencode"],
-                command="/new/jobs.py session-context")
-            self.assertTrue(checked["ok"])
-
-
 class TestFastPaths(unittest.TestCase):
     def test_all_entry_points_accept_version_aliases(self):
         import subprocess
@@ -168,7 +135,7 @@ class TestFastPaths(unittest.TestCase):
 
         commands = [
             ("jobs.py", "brief"), ("jobs.py", "authority"),
-            ("jobs.py", "drift"), ("jobs.py", "setup"),
+            ("jobs.py", "drift"), ("jobs.py", "diffusion"),
             ("workflows.py", "audience"), ("workflows.py", "history"),
             ("workflows.py", "monitor"), ("realtime.py", "stream"),
         ]
@@ -227,24 +194,17 @@ class TestJobsPresentation(unittest.TestCase):
 
     def test_drift_totals_survive_sixty_row_display_cap(self):
         import jobs
+        from store import Store
 
-        class FakeCohort:
-            def __init__(self, rows): self.rows = rows
-            def __len__(self): return len(self.rows)
-            def __iter__(self): return iter(self.rows)
-            def minus(self, other):
-                other_ids = {row["account_id"] for row in other.rows}
-                return FakeCohort([row for row in self.rows
-                                   if row["account_id"] not in other_ids])
-
-        old = FakeCohort([{"account_id": str(i), "user_name": f"old{i}"}
-                          for i in range(70)])
-        new = FakeCohort([{"account_id": str(i + 100), "user_name": f"new{i}"}
-                          for i in range(75)])
-        client = SimpleNamespace(store=SimpleNamespace(
-            cohort_versions=lambda _name: [1, 2]))
-        with mock.patch.object(jobs.Cohort, "load", side_effect=[old, new]):
-            body = jobs.cohort_drift("scene", client=client)
+        # drift is a local job now: it reads saved versions from the store
+        # and needs no Client (contract change, see test_07_review_jobs).
+        path = os.path.join(tempfile.mkdtemp(prefix="axi-drift-"), "s.db")
+        with Store(path) as store:
+            store.save_cohort("scene", [(str(i), f"old{i}", 1.0, "t")
+                                        for i in range(70)])
+            store.save_cohort("scene", [(str(i + 100), f"new{i}", 1.0, "t")
+                                        for i in range(75)])
+            body = jobs.cohort_drift("scene", store=store)
 
         self.assertEqual(len(body["joined"]), 60)
         self.assertEqual(body["joined_total"], 75)
