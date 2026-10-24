@@ -1,0 +1,26 @@
+# Offline suite: no API key, no network, no spend. Runs on every push and PR.
+#
+# The live tests skip without TWITTERAPI_IO_KEY (a notice, not a failure), so
+# this job never touches the paid API; e2e.yml owns the paid canary.
+name: offline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]   # README floor and a current release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}   # stdlib only — no pip install step
+
+      - name: Offline unit and contract tests
+        run: python3 -m unittest discover -s tests -t .

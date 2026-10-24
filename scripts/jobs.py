@@ -31,13 +31,13 @@ from datetime import datetime, timezone
 from statistics import median
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import (APIError, Client, CostLimitExceeded,
+from twitterapi import (Client, CostLimitExceeded,
                         IncompleteDataError)  # noqa: E402
-from store import Store  # noqa: E402
+from store import DEFAULT_DB, Store  # noqa: E402
 from workflows import search_window  # noqa: E402
-from cohort import Cohort  # noqa: E402
+from cohort import ENGAGEMENT_LEGS, Cohort  # noqa: E402
 from axi import (MEDIA_FIELDS, TWEET_FIELDS, ArgumentParser,
-                 HelpFormatter, UsageError, add_common_output_flags, dashboard, emit, error,
+                 HelpFormatter, UsageError, add_common_output_flags, dashboard, emit,
                  display_path, fast_version, parse_fields, prepare_output,
                  run_cli, success)  # noqa: E402
 
@@ -47,22 +47,10 @@ DEFAULT_RESUME = ("Rerun (cached pages are free); if the reason names the "
                   "requested scope")
 
 
-class SetupError(RuntimeError):
-    """Missing configuration. The CLI contract maps this to exit 2."""
-
-
 def _client(max_usd=DEFAULT_MAX_USD, store_path=None):
-    # Validate configuration before opening sqlite, so a missing key cannot
-    # leak a connection while the first-run error crosses the CLI boundary.
-    if not os.environ.get("TWITTERAPI_IO_KEY"):
-        raise SetupError(
-            "TWITTERAPI_IO_KEY not set. Add it to ~/.zshenv; never hardcode it.")
-    store = Store(store_path) if store_path else Store()
-    try:
-        return Client(verbose=False, store=store, max_usd=max_usd)
-    except Exception:
-        store.close()
-        raise
+    """Client checks the key before it opens the store, so a missing key
+    raises SetupError without leaking a sqlite connection."""
+    return Client(verbose=False, store=store_path or DEFAULT_DB, max_usd=max_usd)
 
 
 def _days_ago(days):
@@ -611,7 +599,7 @@ def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
 
 
 # ------------------------------------------------------------- overlap ------
-def overlap(handle_a, handle_b, *, ids_only=True, max_usd=5.0, client=None):
+def overlap(handle_a, handle_b, *, max_usd=5.0, client=None):
     """Shared followers of two accounts. Cheap after first crawl — the whole
     point of caching. Returns counts + a sample of overlapping ids."""
     c = client or _client(max_usd)
@@ -749,10 +737,7 @@ def diffusion_trace(tweet_id, *, limit=500, client=None):
     from store import parse_ts
     c = client or _client()
     timed, retweeters, reasons, limited = [], 0, [], False
-    legs = (("reply", "replies_v2", {"queryType": "Latest"}),
-            ("quote", "quotes", None),
-            ("retweet", "retweeters", None))
-    for kind, ep, extra in legs:
+    for kind, ep, extra in ENGAGEMENT_LEGS:
         stream = c.paginate(ep, str(tweet_id), limit=limit, extra=extra)
         records, stop = _drain(c, stream, f"{kind}s for {tweet_id}")
         if stop:
@@ -798,7 +783,7 @@ def cohort_drift(name, v_old=None, v_new=None, *, store):
     Pure local computation over the store: no API key, no Client, $0."""
     versions = store.cohort_versions(name)
     if len(versions) < 2:
-        raise ValueError(
+        raise UsageError(
             f"cohort '{name}' has versions {versions or '[]'} — drift needs at "
             f"least 2 resolutions of the same name. Re-resolve and save it again.")
     # Default = the LAST STEP, not the whole history. versions[0] here made a
@@ -811,10 +796,10 @@ def cohort_drift(name, v_old=None, v_new=None, *, store):
     if missing:
         # Named here with the available versions; Cohort.load would also
         # refuse, but with a bare KeyError.
-        raise ValueError(f"version(s) {missing} not saved for '{name}'; "
+        raise UsageError(f"version(s) {missing} not saved for '{name}'; "
                          f"available: {versions}")
     if v_old == v_new:
-        raise ValueError(f"v_old and v_new are both {v_old}; pick two different "
+        raise UsageError(f"v_old and v_new are both {v_old}; pick two different "
                          f"versions from {versions}.")
     # No client: Cohort creates one only for paid calls, and drift makes none.
     old = Cohort.load(name, v_old, store=store)
@@ -1022,70 +1007,38 @@ def _main(argv=None):
     for flag in ("days", "sample", "limit"):
         value = getattr(a, flag, None)
         if value is not None and value < 1:
-            emit(error("usage", f"--{flag} must be at least 1, got {value}",
-                       command, f"Run `jobs.py {a.job} <target> --help` for options"))
-            return 2
+            raise UsageError(f"--{flag} must be at least 1, got {value}")
     if getattr(a, "fields", None):
-        schema = next(iter(COLLECTIONS[a.job].values()))
-        try:
-            parse_fields(a.fields, schema, command)
-        except UsageError as exc:
-            emit(error("usage", str(exc), command,
-                       f"Run `jobs.py {a.job} <target> --help` for valid fields"))
-            return 2
+        parse_fields(a.fields, next(iter(COLLECTIONS[a.job].values())), command)
     if a.job in LOCAL_JOBS:
         if hasattr(a, "max_usd"):
-            emit(error("usage", f"--max-usd does not apply to `{a.job}`: it reads "
-                       "only the local store and spends $0", command,
-                       f"Run `jobs.py {a.job} <target> --help` for options"))
-            return 2
+            raise UsageError(f"--max-usd does not apply to `{a.job}`: it reads "
+                             "only the local store and spends $0")
         s = Store(store_path) if store_path else Store()
         try:
             emit(_format_job(a, LOCAL_JOBS[a.job](a, s)))
-        except ValueError as exc:
-            emit(error("usage", str(exc), command,
-                       f"Run `jobs.py {a.job} <target> --help` for options"))
-            return 2
         finally:
             s.close()
         return 0
 
     a.max_usd = getattr(a, "max_usd", DEFAULT_MAX_USD)
-    c = None
+    c = _client(a.max_usd, store_path=store_path)  # one ceiling + chosen cache
     try:
-        c = _client(a.max_usd, store_path=store_path)  # one ceiling + chosen cache
         emit(_format_job(a, JOBS[a.job](a, c)))
-    except SetupError as e:
-        emit(error("setup", str(e), command,
-                   "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
-        return 2
-    except UsageError as e:
-        emit(error("usage", str(e), command,
-                   f"Run `jobs.py {a.job} <target> --help` for options"))
-        return 2
-    except (CostLimitExceeded, ValueError) as e:
+    except CostLimitExceeded as e:
         # Jobs turn a mid-gather stop into a partial payload themselves, so a
         # CostLimitExceeded here is an up-front refusal. Lookups bought while
-        # estimating are still disclosed.
-        body = error("refusal", str(e), command,
-                     f"Run `jobs.py {a.job} <target> --help` for valid limits")
-        if c is not None and getattr(c, "requests_made", 0):
-            body["spend"] = c.spend_report()
-        emit(body)
-        return 2
-    except APIError as e:
-        emit(error("api", str(e), command,
-                   "Check the handle or ID and verify `TWITTERAPI_IO_KEY`"))
-        return 1
+        # estimating are still disclosed (run_cli reports e.spend).
+        if c.requests_made:
+            e.spend = c.spend_report()
+        raise
     finally:
-        close = getattr(getattr(c, "store", None), "close", None)
-        if close:
-            close()
+        c.store.close()
     return 0
 
 
 def main(argv=None):
-    return run_cli("jobs.py", _main, argv)
+    return run_cli("jobs.py", _main, argv, parser=_job_parser, dest="job")
 
 
 if __name__ == "__main__":

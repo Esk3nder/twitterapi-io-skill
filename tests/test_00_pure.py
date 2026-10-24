@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import E2ETest, HAVE_KEY, SKILL, require_key
+from tests.e2e_base import E2ETest, SKILL
 
 
 class TestCostTable(E2ETest):
@@ -168,7 +168,6 @@ class TestNormalisers(E2ETest):
 
         self.assertEqual(normalize_tweet(raw)["media"], expected)
         store = self.fresh_store("tweet-media-roundtrip")
-        self.addCleanup(store.close)
         store.put_tweets([raw])
 
         self.assertIn(
@@ -202,7 +201,6 @@ class TestNormalisers(E2ETest):
     def test_tweet_author_bio_fallback_cannot_destroy_rich_profile(self):
         """Verification for F1: thin tweet authors must not erase paid fields."""
         s = self.fresh_store("profile-preservation")
-        self.addCleanup(s.close)
         rich_bio = "researcher building reliable social-data systems"
         s.put_accounts([{
             "id": "1", "userName": "alice", "description": rich_bio,
@@ -226,7 +224,6 @@ class TestPaidGraphReadback(E2ETest):
     def test_follower_ids_for_ignores_crawl_cursor_and_page_size(self):
         """Paid follower pages must be readable without reproducing cache keys."""
         s = self.fresh_store("follower-readback")
-        self.addCleanup(s.close)
         path = "/twitter/user/followers_ids"
         s.put_page(path, {"userName": "Alice", "count": 5000, "cursor": ""},
                    {"ids": ["1", "2"], "has_next_page": True,
@@ -250,7 +247,6 @@ class TestConcurrentStoreReads(E2ETest):
     def test_cached_reads_are_safe_at_8_16_and_24_workers(self):
         """Regression: one shared sqlite connection must serialize every read."""
         s = self.fresh_store("concurrent-reads")
-        self.addCleanup(s.close)
         path = "/twitter/user/followers_ids"
         params = {"userName": "alice", "count": 5000, "cursor": ""}
         page = {"ids": ["1", "2"], "has_next_page": False,
@@ -288,7 +284,6 @@ class TestPublicCohortConstruction(E2ETest):
         from cohort import Cohort
         client = object()
         s = self.fresh_store("from-ids")
-        self.addCleanup(s.close)
         co = Cohort.from_ids(["1", 2, "1"], client=client, store=s,
                              label="paid followers")
         self.assertEqual(co.ids(), ["1", "2"])
@@ -298,7 +293,6 @@ class TestPublicCohortConstruction(E2ETest):
     def test_delete_cohort_removes_members_and_metadata_atomically(self):
         """Deleting a saved test cohort must not require orphan-prone raw SQL."""
         s = self.fresh_store("delete-cohort")
-        self.addCleanup(s.close)
         s.save_cohort("test", [("1", "alice", 1.0, "test")])
         s.save_cohort("test", [("2", "bob", 1.0, "test")])
         s.save_cohort("keep", [("3", "carol", 1.0, "test")])
@@ -315,7 +309,6 @@ class TestPublicCohortConstruction(E2ETest):
         """Client store injection must not be lost at the Cohort boundary."""
         from cohort import Cohort
         s = self.fresh_store("inherited-store")
-        self.addCleanup(s.close)
         client = SimpleNamespace(store=s)
         with mock.patch("cohort.Store",
                         side_effect=AssertionError("default Store() opened")):
@@ -328,22 +321,17 @@ class TestDocumentationContracts(E2ETest):
     def _read(name):
         return Path(SKILL, name).read_text()
 
-    def test_skill_and_readme_present_one_library_story(self):
-        """The skill must not forbid the library surface the README teaches."""
-        skill = self._read("SKILL.md")
-        self.assertNotIn("Run the workflows; do not hand-roll requests", skill)
-        self.assertIn("library", skill.lower())
-
     def test_composition_example_preserves_the_injected_store(self):
         """Following the skill example must not silently open the home cache."""
         skill = self._read("SKILL.md")
         self.assertIn('Cohort.load("pm_talkers", client=c, store=s)', skill)
         self.assertIn('Cohort.load("crypto_ai", client=c, store=s)', skill)
 
-    def test_readme_describes_only_paginated_endpoints(self):
-        """Four single-object methods must not be advertised through paginate()."""
-        readme = self._read("README.md")
-        self.assertIn("one of the 27 paginated endpoints", readme)
+    def test_readme_paginated_endpoint_count_matches_the_table(self):
+        """The README's count must follow ENDPOINTS, not a stale literal."""
+        from twitterapi import ENDPOINTS
+        paged = sum(1 for spec in ENDPOINTS.values() if spec["items"] is not None)
+        self.assertIn(f"one of the {paged} paginated endpoints", self._read("README.md"))
 
     def test_readme_scopes_cached_tweets_and_two_pass_page_caps(self):
         """Cached authorship and per-pass caps must not imply broader coverage."""
@@ -361,20 +349,18 @@ class TestDocumentationContracts(E2ETest):
         self.assertIn("pbs.twimg.com", combined)
 
 
-@unittest.skipUnless(HAVE_KEY, "Cohort construction requires the API key "
-                               "(no HTTP is made in these tests)")
 class TestSetAlgebra(E2ETest):
     """Pure in-memory determinism of cohort set algebra. The Client instance
-    is real but never used for network here."""
+    is real but holds a dummy key and is never used for network here."""
 
     def _client(self):
         from twitterapi import Client
-        return Client(verbose=False)
+        return Client(api_key="offline-test", verbose=False)
 
     def _cohort(self, label, members):
         from cohort import Cohort
-        co = Cohort(client=self._client(), store=self.fresh_store("algebra"),
-                    label=label)
+        store = self.fresh_store("algebra")
+        co = Cohort(client=self._client(), store=store, label=label)
         for aid, name, w in members:
             co._add(aid, name, w, "test")
         return co

@@ -25,5 +25,23 @@ class TestSkillSurvivesArgumentSubstitution(unittest.TestCase):
                          "replaced by the user's slash-command arguments")
 
 
+class TestReadmeCountsMatchCode(unittest.TestCase):
+    """Codex review 2026-10-23: removing an endpoint left the README claiming
+    22 probeable and 10 unprobeable endpoints when verify probes 21 and
+    skips 9."""
+
+    def test_verify_coverage_counts(self):
+        import sys
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import twitterapi
+        import verify
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        probed = len(verify.probe_endpoint_names())
+        self.assertIn(f"{len(twitterapi.ENDPOINTS)} endpoints", text)
+        self.assertIn(f"re-checks the {probed} probeable endpoints", text)
+        self.assertIn(f"the other {len(verify.UNPROBEABLE)} need", text)
+
+
 if __name__ == "__main__":
     unittest.main()

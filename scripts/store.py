@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser("~/.twitterapi-cache/store.db")
 # Request params that carry an X handle. Handles are case-insensitive, so the
@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS cohort_meta (
   name TEXT, version INTEGER, spec TEXT, created_at REAL, size INTEGER,
   PRIMARY KEY (name, version));
 """
+
+
+def handle_key(handle) -> str:
+    """The comparison form of an X handle. Handles are case-insensitive, and
+    callers pass them with or without the leading @."""
+    return str(handle or "").strip().lstrip("@").casefold()
 
 
 def parse_ts(s):
@@ -492,8 +498,7 @@ class Store:
         # X handles are case-insensitive, and follower_ids_for() matches them
         # that way. A case-sensitive key let overlap("Stripe") count a cached
         # "stripe" crawl as free and then pay to re-buy it.
-        norm = {str(k): (str(v).lstrip("@").casefold()
-                         if k in HANDLE_PARAMS else str(v))
+        norm = {str(k): (handle_key(v) if k in HANDLE_PARAMS else str(v))
                 for k, v in (params or {}).items()}
         return path + "?" + json.dumps(norm, sort_keys=True)
 
@@ -552,8 +557,7 @@ class Store:
         if not (user_name or user_id):
             raise ValueError("pass user_name or user_id")
         wanted_id = str(user_id) if user_id is not None else None
-        wanted_name = ((user_name or "").lstrip("@").casefold()
-                       if user_name is not None else None)
+        wanted_name = handle_key(user_name) if user_name is not None else None
         pages = []
         # Materialise under the lock: an unlocked cursor on the shared
         # connection, iterated while other threads used it, silently returned
@@ -571,8 +575,7 @@ class Store:
                 continue
             matches = (str(params.get("userId")) == wanted_id
                        if wanted_id is not None else
-                       str(params.get("userName") or "").lstrip("@").casefold()
-                       == wanted_name)
+                       handle_key(params.get("userName")) == wanted_name)
             if not matches or not isinstance(body.get("ids"), list):
                 continue
             pages.append((not params.get("cursor"), body["ids"],
@@ -730,8 +733,7 @@ class Store:
         """Stable identity for a cohort member. account_id when known, else the
         handle — so two handle-only members don't collide on an empty id and
         silently overwrite each other (that lost members before this fix)."""
-        return (str(account_id) if account_id
-                else "@" + (user_name or "").lower().lstrip("@"))
+        return str(account_id) if account_id else "@" + handle_key(user_name)
 
     def save_cohort(self, name, members, spec=None, version=None):
         """members: iterable of (account_id, user_name, weight, provenance).
@@ -888,22 +890,35 @@ class Store:
         return False
 
     def stats(self):
-        n = lambda t: self.db.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
         with self._wlock:               # see get_page: reads need it too
-            cached = self.db.execute(
-                "SELECT COALESCE(SUM(credits),0) s FROM pages").fetchone()["s"]
-            # "cohorts" counts SAVED VERSIONS (cohort_meta). The rows that make
-            # a store big live in the members table: a real store reported
-            # cohorts=2 while holding 421,578 member rows, so growth was
-            # invisible to the only diagnostic a user has. Report both, plus
-            # the file size, which is what "is my store getting big" asks.
-            db_bytes = (self.db.execute("PRAGMA page_count").fetchone()[0]
-                        * self.db.execute("PRAGMA page_size").fetchone()[0])
-            counts = {"pages": n("pages"), "accounts": n("accounts"),
-                      "tweets": n("tweets"), "cohorts": n("cohort_meta"),
-                      "cohort_members": n("cohorts")}
-        return {**counts, "db_bytes": db_bytes, "credits_cached": cached,
-                "usd_saved_on_rerun": round(cached / 100_000, 4)}
+            return table_stats(self.db)
+
+
+def table_stats(db):
+    """Row counts, file size, and cached credits for a store connection.
+
+    Shared by Store.stats and the read-only CLI dashboard, which must not
+    create or migrate the file, so a missing table counts as 0 rows.
+    "cohorts" counts SAVED VERSIONS (cohort_meta). The rows that make a store
+    big live in the members table: a real store reported cohorts=2 while
+    holding 421,578 member rows, so growth was invisible to the only
+    diagnostic a user has. Report both, plus the file size, which is what
+    "is my store getting big" asks."""
+    tables = {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    def count(table):
+        return (db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                if table in tables else 0)
+    cached = (db.execute("SELECT COALESCE(SUM(credits),0) FROM pages").fetchone()[0]
+              if "pages" in tables else 0)
+    return {"pages": count("pages"), "accounts": count("accounts"),
+            "tweets": count("tweets"), "cohorts": count("cohort_meta"),
+            "cohort_members": count("cohorts"),
+            "db_bytes": (db.execute("PRAGMA page_count").fetchone()[0]
+                         * db.execute("PRAGMA page_size").fetchone()[0]),
+            "credits_cached": cached,
+            "usd_saved_on_rerun": round(cached / 100_000, 4)}
 
 
 def main(argv=None):
@@ -912,8 +927,8 @@ def main(argv=None):
 
 
 def _main(argv=None):
-    from axi import (ArgumentParser, UsageError, dashboard, emit, error,
-                     fast_version, parse_fields, prepare_output)
+    from axi import (ArgumentParser, dashboard, emit, fast_version,
+                     parse_fields, prepare_output)
     if fast_version(argv):
         return 0
     p = ArgumentParser(description="Inspect the local twitterapi.io cache and cohorts")
@@ -922,11 +937,7 @@ def _main(argv=None):
     args = p.parse_args(argv)
     if args.fields:
         schema = {field: (field,) for field in ("name", "version", "size", "created_at")}
-        try:
-            parse_fields(args.fields, schema, "store.py")
-        except UsageError as exc:
-            emit(error("usage", str(exc), "store.py",
-                       "Run `store.py --help` for valid fields")); return 2
+        parse_fields(args.fields, schema, "store.py")
     body = dashboard(__file__, "Inspect the local twitterapi.io cache and saved cohorts",
                      store_path=args.store)
     if args.fields:

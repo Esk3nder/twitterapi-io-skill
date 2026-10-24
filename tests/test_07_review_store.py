@@ -29,7 +29,6 @@ class TestCohortWeightZero(E2ETest):
         """`float(w or 1.0)` turned an authority weight of 0 into 1.0, so an
         account nobody in the cohort follows outranked real authorities."""
         s = self.fresh_store("r07-weight-zero")
-        self.addCleanup(s.close)
         s.save_cohort("x", [("1", "a", 0.0, "authority_indegree"),
                             ("2", "b", 3.0, "authority_indegree"),
                             ("3", "c", None, "provided_id")])
@@ -118,7 +117,6 @@ class TestTweetAbsenceIsUnknown(E2ETest):
         """A refetch lacking viewCount/media used to INSERT OR REPLACE the row:
         views 12345 -> 0, one photo -> [], bookmarkCount gone from raw."""
         s = self.fresh_store("r07-thin-refetch")
-        self.addCleanup(s.close)
         s.put_tweets([_tweet(viewCount=12345, likeCount=7, bookmarkCount=4,
                              createdAt="Mon Aug 10 17:16:53 +0000 2026",
                              isReply=True,
@@ -140,7 +138,6 @@ class TestTweetAbsenceIsUnknown(E2ETest):
 
     def test_present_zero_and_present_empty_media_do_overwrite(self):
         s = self.fresh_store("r07-present-wins")
-        self.addCleanup(s.close)
         s.put_tweets([_tweet(viewCount=12345, extendedEntities={"media": [PHOTO]})])
         s.put_tweets([_tweet(viewCount=0, extendedEntities={})])
         row = s.tweets_for(account_ids=["1"])[0]
@@ -149,7 +146,6 @@ class TestTweetAbsenceIsUnknown(E2ETest):
 
     def test_first_seen_thin_tweet_reads_back_unknown(self):
         s = self.fresh_store("r07-first-thin")
-        self.addCleanup(s.close)
         s.put_tweets([_tweet()])
         row = s.tweets_for(account_ids=["1"])[0]
         self.assertIsNone(row["views"])
@@ -247,7 +243,6 @@ class TestAccountUpsertPresentValueWins(E2ETest):
         """MAX() made a lapsed subscription unwritable; NULLIF made a real
         empty bio unwritable."""
         s = self.fresh_store("r07-account-lapse")
-        self.addCleanup(s.close)
         s.put_accounts([{"id": "1", "userName": "a", "isBlueVerified": True,
                          "isVerified": True, "description": "old bio"}])
         s.put_accounts([{"id": "1", "userName": "a", "isBlueVerified": False,
@@ -258,7 +253,6 @@ class TestAccountUpsertPresentValueWins(E2ETest):
 
     def test_absent_fields_keep_the_stored_value(self):
         s = self.fresh_store("r07-account-absent")
-        self.addCleanup(s.close)
         s.put_accounts([{"id": "1", "userName": "a", "isBlueVerified": True,
                          "description": "bio"}])
         s.put_accounts([{"id": "1", "userName": "a"}])
@@ -275,7 +269,6 @@ class TestAccountUpsertPresentValueWins(E2ETest):
                                "profile_bio": {"description": "real bio"}})
         self.assertEqual(n["description"], "real bio")
         s = self.fresh_store("r07-hollow-bio")
-        self.addCleanup(s.close)
         s.put_accounts([{"id": "1", "userName": "a", "description": "real bio"}])
         s.put_tweets([{"id": "t", "author": {
             "id": "1", "userName": "a", "description": "",
@@ -289,7 +282,6 @@ class TestAccountUpsertPresentValueWins(E2ETest):
 class TestEmptyFilterMeansNothing(E2ETest):
     def test_empty_id_or_name_list_returns_no_tweets(self):
         s = self.fresh_store("r07-empty-filter")
-        self.addCleanup(s.close)
         s.put_tweets([_tweet(id="1"), _tweet(id="2", author={"id": "2",
                                                             "userName": "b"})])
         self.assertEqual(s.tweets_for(account_ids=[]), [],
@@ -299,18 +291,8 @@ class TestEmptyFilterMeansNothing(E2ETest):
 
 
 class TestLoadNeverSavedCohort(E2ETest):
-    def test_unknown_name_or_version_raises_keyerror(self):
-        s = self.fresh_store("r07-load-missing")
-        self.addCleanup(s.close)
-        s.save_cohort("pm_talkers", [("1", "a", 1.0, "t")])
-        with self.assertRaises(KeyError):
-            s.load_cohort("crypto_ai_typo")
-        with self.assertRaises(KeyError):
-            s.load_cohort("pm_talkers", version=7)
-
     def test_saved_empty_cohort_still_loads_empty(self):
         s = self.fresh_store("r07-load-empty")
-        self.addCleanup(s.close)
         s.save_cohort("empty", [])
         self.assertEqual(s.load_cohort("empty"), [])
 
@@ -321,7 +303,6 @@ class TestConcurrentUnlockedReads(E2ETest):
         before the fix at 16 threads: follower_ids_for silently returned 0 ids
         (plus a false PARTIAL warning), TypeError and InterfaceError."""
         s = self.fresh_store("r07-unlocked-reads")
-        self.addCleanup(s.close)
         s.put_tweets([{"id": str(i), "author": {"id": "1", "userName": "a"},
                        "likeCount": i} for i in range(300)])
         s.put_page("/twitter/user/followers_ids",

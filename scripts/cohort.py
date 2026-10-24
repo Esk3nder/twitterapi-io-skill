@@ -26,6 +26,12 @@ from twitterapi import (APIError, Client, CostLimitExceeded,
 from store import Store  # noqa: E402
 
 AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
+# The three ways to engage a post: (kind, endpoint, extra params). Replies and
+# quotes return tweets; retweeters return profiles. Shared by from_engagers and
+# jobs.diffusion_trace so both walk the same legs in the same order.
+ENGAGEMENT_LEGS = (("reply", "replies_v2", {"queryType": "Latest"}),
+                   ("quote", "quotes", None),
+                   ("retweet", "retweeters", None))
 # A request that failed for this account or this resource. Programming errors
 # are deliberately absent: they must propagate, not become "partial".
 _REQUEST_FAILURES = (APIError, IncompleteDataError, urllib.error.URLError,
@@ -114,9 +120,7 @@ class Cohort:
         return rows
 
     # -- construction -----------------------------------------------------
-    @staticmethod
-    def _key(account_id, user_name):
-        return str(account_id) if account_id else "@" + (user_name or "").lower().lstrip("@")
+    _key = staticmethod(Store.member_key)   # one member identity, owned by Store
 
     def _add(self, account_id=None, user_name=None, weight=1.0, provenance="", raw=None):
         k = self._key(account_id, user_name)
@@ -189,15 +193,13 @@ class Cohort:
     def from_engagers(cls, tweet_id, limit=500, **kw):
         """Everyone who replied, quoted or retweeted a post — an event cohort."""
         co = cls(label=f"engagers:{tweet_id}", **kw)
-        for kind, ep, extract in (
-                ("reply", "replies_v2", lambda t: t.get("author") or {}),
-                ("quote", "quotes", lambda t: t.get("author") or {}),
-                ("retweet", "retweeters", lambda u: u)):
+        for kind, ep, extra in ENGAGEMENT_LEGS:
             try:
                 for rec in co._drain(
-                        co.c.paginate(ep, str(tweet_id), limit=limit),
+                        co.c.paginate(ep, str(tweet_id), limit=limit, extra=extra),
                         f"{kind} fetch for {tweet_id}", limit):
-                    a = extract(rec)
+                    # Replies and quotes are tweets; retweeters are profiles.
+                    a = rec if kind == "retweet" else (rec.get("author") or {})
                     co._add(a.get("id"), a.get("userName") or a.get("screen_name"),
                             1.0, f"engager_{kind}")
             except (CostLimitExceeded, IncompleteDataError):
