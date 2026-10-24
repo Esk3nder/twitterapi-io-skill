@@ -168,7 +168,6 @@ class TestNormalisers(E2ETest):
 
         self.assertEqual(normalize_tweet(raw)["media"], expected)
         store = self.fresh_store("tweet-media-roundtrip")
-        self.addCleanup(store.close)
         store.put_tweets([raw])
 
         self.assertIn(
@@ -202,7 +201,6 @@ class TestNormalisers(E2ETest):
     def test_tweet_author_bio_fallback_cannot_destroy_rich_profile(self):
         """Verification for F1: thin tweet authors must not erase paid fields."""
         s = self.fresh_store("profile-preservation")
-        self.addCleanup(s.close)
         rich_bio = "researcher building reliable social-data systems"
         s.put_accounts([{
             "id": "1", "userName": "alice", "description": rich_bio,
@@ -226,7 +224,6 @@ class TestPaidGraphReadback(E2ETest):
     def test_follower_ids_for_ignores_crawl_cursor_and_page_size(self):
         """Paid follower pages must be readable without reproducing cache keys."""
         s = self.fresh_store("follower-readback")
-        self.addCleanup(s.close)
         path = "/twitter/user/followers_ids"
         s.put_page(path, {"userName": "Alice", "count": 5000, "cursor": ""},
                    {"ids": ["1", "2"], "has_next_page": True,
@@ -250,7 +247,6 @@ class TestConcurrentStoreReads(E2ETest):
     def test_cached_reads_are_safe_at_8_16_and_24_workers(self):
         """Regression: one shared sqlite connection must serialize every read."""
         s = self.fresh_store("concurrent-reads")
-        self.addCleanup(s.close)
         path = "/twitter/user/followers_ids"
         params = {"userName": "alice", "count": 5000, "cursor": ""}
         page = {"ids": ["1", "2"], "has_next_page": False,
@@ -288,7 +284,6 @@ class TestPublicCohortConstruction(E2ETest):
         from cohort import Cohort
         client = object()
         s = self.fresh_store("from-ids")
-        self.addCleanup(s.close)
         co = Cohort.from_ids(["1", 2, "1"], client=client, store=s,
                              label="paid followers")
         self.assertEqual(co.ids(), ["1", "2"])
@@ -298,7 +293,6 @@ class TestPublicCohortConstruction(E2ETest):
     def test_delete_cohort_removes_members_and_metadata_atomically(self):
         """Deleting a saved test cohort must not require orphan-prone raw SQL."""
         s = self.fresh_store("delete-cohort")
-        self.addCleanup(s.close)
         s.save_cohort("test", [("1", "alice", 1.0, "test")])
         s.save_cohort("test", [("2", "bob", 1.0, "test")])
         s.save_cohort("keep", [("3", "carol", 1.0, "test")])
@@ -315,7 +309,6 @@ class TestPublicCohortConstruction(E2ETest):
         """Client store injection must not be lost at the Cohort boundary."""
         from cohort import Cohort
         s = self.fresh_store("inherited-store")
-        self.addCleanup(s.close)
         client = SimpleNamespace(store=s)
         with mock.patch("cohort.Store",
                         side_effect=AssertionError("default Store() opened")):
@@ -366,8 +359,8 @@ class TestSetAlgebra(E2ETest):
 
     def _cohort(self, label, members):
         from cohort import Cohort
-        co = Cohort(client=self._client(), store=self.fresh_store("algebra"),
-                    label=label)
+        store = self.fresh_store("algebra")
+        co = Cohort(client=self._client(), store=store, label=label)
         for aid, name, w in members:
             co._add(aid, name, w, "test")
         return co

@@ -144,8 +144,11 @@ class E2ETest(unittest.TestCase):
         return os.path.join(STORE_DIR, f"{name}.db")
 
     def fresh_store(self, name):
+        """A Store on an isolated path, closed when the test ends."""
         from store import Store
-        return Store(self.store_path(name))
+        store = Store(self.store_path(name))
+        self.addCleanup(store.close)
+        return store
 
     # -- subprocess helper ---------------------------------------------------
     def run_cli(self, args, timeout=300):

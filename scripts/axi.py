@@ -78,7 +78,10 @@ def classify(exc, command: str):
     from twitterapi import (APIError, CostLimitExceeded, IncompleteDataError,
                             SetupError)
     if isinstance(exc, SetupError):
-        return "setup", 2, "Set `TWITTERAPI_IO_KEY` in the environment and rerun"
+        # The message names the cause: missing or invalid key, bad
+        # `TWITTERAPI_IO_QPS`, no credits, rate limit, or an outage.
+        return ("setup", 2,
+                "Fix the key, QPS, or account problem the message names, then rerun")
     if isinstance(exc, UsageError):
         return "usage", 2, f"Run `{command} --help` for valid arguments"
     if isinstance(exc, CostLimitExceeded):

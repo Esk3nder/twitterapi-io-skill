@@ -520,7 +520,8 @@ class Client:
                                    path) from None
             except urllib.error.HTTPError as e:
                 self._release_to_floor(0.0 if free else worst)
-                raw = e.read().decode("utf-8", "replace")
+                with e:                     # releases the error response's socket
+                    raw = e.read().decode("utf-8", "replace")
                 try:
                     j = json.loads(raw)
                     detail = j.get("detail") or j.get("message") or j.get("msg") or raw

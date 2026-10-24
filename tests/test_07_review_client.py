@@ -118,15 +118,21 @@ class TestBudgetReservation(E2ETest):
         import urllib.error
         from twitterapi import APIError
         c = _live_client(max_usd=1.0)
+        responses = []
 
         def fake_urlopen(req, timeout=None):
-            raise urllib.error.HTTPError(req.full_url, 400, "bad", {},
-                                         io.BytesIO(b'{"detail": "bad"}'))
+            responses.append(urllib.error.HTTPError(
+                req.full_url, 400, "bad", {}, io.BytesIO(b'{"detail": "bad"}')))
+            raise responses[-1]
 
         with mock.patch("urllib.request.urlopen", fake_urlopen):
             with self.assertRaises(APIError):
                 list(c.paginate("search", "from:alpha"))
         self.assertEqual(c.spent_credits, 15.0)
+        # `responses` keeps each error alive, so only the client can have
+        # closed it; garbage collection would hide a leaked socket.
+        self.assertTrue(responses and all(r.fp.closed for r in responses),
+                        "the error response must be closed")
 
     def test_full_page_estimate_is_not_the_spend_bound(self):
         """#7: short pages cost more than estimate(); max_usd still binds."""
@@ -189,7 +195,6 @@ class TestPaginationMetadata(E2ETest):
     def test_cache_hit_does_not_repersist_stale_records(self):
         """#8: a year-old cached batch page must not overwrite newer rows."""
         store = self.fresh_store("stale-cache-repersist")
-        self.addCleanup(store.close)
         path = "/twitter/user/batch_info_by_ids"
         store.put_page(path, {"userIds": "1", "cursor": ""},
                        {"users": [{"id": "1", "userName": "alice",
@@ -295,7 +300,6 @@ class TestCohortPopulationHonesty(E2ETest):
         with contextlib.redirect_stderr(io.StringIO()):
             co = Cohort.from_community("77", limit=2, client=c,
                                        store=self.fresh_store("co-limit"))
-        self.addCleanup(co.s.close)
         self.assertEqual(len(co), 2)
         self.assertFalse(co.complete)
         self.assertIn("limit=2", co.incomplete_reasons[0])
@@ -303,7 +307,6 @@ class TestCohortPopulationHonesty(E2ETest):
     def test_partial_cohort_stays_partial_through_save_load_and_algebra(self):
         from cohort import Cohort
         store = self.fresh_store("co-partial-roundtrip")
-        self.addCleanup(store.close)
         co = Cohort.from_ids(["1", "2"], client=object(), store=store)
         with contextlib.redirect_stderr(io.StringIO()):
             co._mark_partial("stopped at limit")
@@ -325,7 +328,6 @@ class TestCohortPopulationHonesty(E2ETest):
         with contextlib.redirect_stderr(io.StringIO()):
             co = Cohort.from_engagers("9", client=c,
                                       store=self.fresh_store("co-engagers"))
-        self.addCleanup(co.s.close)
         self.assertEqual(len(co), 1)
         self.assertFalse(co.complete)
         self.assertIn("quote", co.incomplete_reasons[0])
@@ -334,7 +336,6 @@ class TestCohortPopulationHonesty(E2ETest):
         """#15: a typo must not load as an empty cohort with overlap 0."""
         from cohort import Cohort
         store = self.fresh_store("co-load-missing")
-        self.addCleanup(store.close)
         Cohort.from_ids(["1"], client=object(), store=store).save("real")
         with self.assertRaises(KeyError):
             Cohort.load("rael", client=object(), store=store)
@@ -345,7 +346,6 @@ class TestCohortPopulationHonesty(E2ETest):
         """#14: NULL followers / NULL bio are unknown, not 0 / empty."""
         from cohort import Cohort
         store = self.fresh_store("co-filter-unknown")
-        self.addCleanup(store.close)
         store.put_accounts([
             {"id": "1", "userName": "known", "followers": 1000,
              "description": "ai founder"},
@@ -371,7 +371,6 @@ class TestAuthorityCompleteness(E2ETest):
             ("followings", "alice"): _Stream([{"id": "3", "userName": "carol"}]),
         })
         co = Cohort(client=c, store=self.fresh_store("auth-unresolved"))
-        self.addCleanup(co.s.close)
         co._add("1", "alice")
         co._add("2", None)
         co._add("3", "carol")
@@ -388,7 +387,6 @@ class TestAuthorityCompleteness(E2ETest):
             max_usd=None)
         co = Cohort.from_ids([str(i) for i in range(100)], client=c,
                              store=self.fresh_store("auth-resolution-budget"))
-        self.addCleanup(co.s.close)
         co.authority(max_usd=0.001, confirm=False)
         self.assertEqual(c.raw_calls, [], "the batch must be refused up front")
         self.assertLessEqual(c.spent_usd, 0.001)
@@ -406,7 +404,6 @@ class TestAuthorityCompleteness(E2ETest):
             ("followings", "carol"): _Stream([{"id": "2", "userName": "bob"}]),
         })
         co = Cohort(client=c, store=self.fresh_store("auth-member-error"))
-        self.addCleanup(co.s.close)
         for aid, name in (("1", "alice"), ("2", "bob"), ("3", "carol")):
             co._add(aid, name)
         with contextlib.redirect_stderr(io.StringIO()):
@@ -447,7 +444,6 @@ class TestHydrateMatchesItsContract(E2ETest):
         """#16: a profiled member costs nothing to hydrate."""
         from cohort import Cohort
         store = self.fresh_store("hydrate-skip-cached")
-        self.addCleanup(store.close)
         store.put_accounts([{"id": "1", "userName": "alice", "followers": 5,
                              "description": "bio", "isBlueVerified": False}])
         c = ScriptedClient(raw=[], max_usd=None, store=store)
@@ -461,7 +457,6 @@ class TestHydrateMatchesItsContract(E2ETest):
         from cohort import Cohort
         from twitterapi import APIError
         store = self.fresh_store("hydrate-handles")
-        self.addCleanup(store.close)
         c = ScriptedClient(raw=[
             {"data": {"id": "7", "userName": "alice", "followers": 9,
                       "description": "", "isBlueVerified": True},
@@ -484,7 +479,6 @@ class TestHydrateMatchesItsContract(E2ETest):
         import os
         from cohort import Cohort
         store = self.fresh_store("hydrate-no-client")
-        self.addCleanup(store.close)
         store.put_accounts([
             {"id": "7", "userName": "a", "description": "bio", "followers": 3,
              "isBlueVerified": False},

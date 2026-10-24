@@ -204,9 +204,6 @@ class TestVerifyFailures(unittest.TestCase):
         self.assertIn("spent $0.00120", payload["error"]["message"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class TestArgparseExitsAreNotSilent(unittest.TestCase):
     """argparse --help and usage errors raised SystemExit inside the stdout
     redirect, skipping the flush — measured: --help answered with exit 0 and
@@ -272,3 +269,7 @@ class TestVerifyExitContract(unittest.TestCase):
         message = json.loads(out.getvalue())["error"]["message"]
         self.assertIn("followers", message)
         self.assertIn("top-level key set changed", message)
+
+
+if __name__ == "__main__":
+    unittest.main()

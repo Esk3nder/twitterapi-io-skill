@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -54,7 +55,6 @@ class TestVerifiedFollowerSemantics(E2ETest):
         from cohort import Cohort
 
         store = self.fresh_store("verified-follower-semantics")
-        self.addCleanup(store.close)
         client = ScriptedClient(raw=[{
             "followers": [
                 {"id": "1", "userName": "alice"},
@@ -82,7 +82,6 @@ class TestVerifiedFollowerSemantics(E2ETest):
         from store import normalize_account
 
         store = self.fresh_store("unknown-verification")
-        self.addCleanup(store.close)
         store.put_accounts([{"id": "1", "userName": "alice"}])
         cohort = Cohort.from_ids(["1"], client=object(), store=store)
 
@@ -98,7 +97,6 @@ class TestCohortFilterHonesty(E2ETest):
         from cohort import Cohort
 
         store = self.fresh_store("filter-unhydrated-warning")
-        self.addCleanup(store.close)
         store.put_accounts([{
             "id": "1", "userName": "alice", "followers": 1_000,
         }])
@@ -139,7 +137,6 @@ class TestCohortHydrationMoney(E2ETest):
         c = ScriptedClient(
             raw=[self._page(0, 100), self._page(100, 100)],
             max_usd=None, store=self.fresh_store("hydrate-ceiling"))
-        self.addCleanup(c.store.close)
         co = Cohort(self._members(200), client=c, store=c.store)
 
         with self.assertRaises(CostLimitExceeded):
@@ -155,7 +152,6 @@ class TestCohortHydrationMoney(E2ETest):
         pages = [self._page(0, 100), self._page(100, 100)]
         c = ScriptedClient(raw=pages + pages, max_usd=None,
                             store=self.fresh_store("hydrate-cache"))
-        self.addCleanup(c.store.close)
         co = Cohort(self._members(200), client=c, store=c.store)
 
         co.hydrate(max_usd=1.0)
@@ -173,7 +169,6 @@ class TestCohortHydrationMoney(E2ETest):
 
         c = ScriptedClient(raw=[self._page(0, 100)], max_usd=None,
                             store=self.fresh_store("hydrate-zero-cache"))
-        self.addCleanup(c.store.close)
         co = Cohort(self._members(100), client=c, store=c.store)
         co.hydrate(max_usd=1.0)
         first_spend = c.spent_credits
@@ -191,7 +186,6 @@ class TestCohortHydrationMoney(E2ETest):
 
         c = ScriptedClient(raw=[self._page(0, 2)], max_usd=None,
                             store=self.fresh_store("hydrate-result"))
-        self.addCleanup(c.store.close)
         co = Cohort(self._members(2), client=c, store=c.store)
 
         profiles = co.hydrate(max_usd=1.0)
@@ -725,7 +719,6 @@ class TestHistoryHonesty(E2ETest):
             tweet("three", 1_700_000_001, "alpha"),
         ]
         store = self.fresh_store("history-to-catalogue")
-        self.addCleanup(store.close)
         client = ScriptedClient(raw=[{
             "tweets": records,
             "has_next_page": False,
@@ -744,12 +737,12 @@ class TestHistoryHonesty(E2ETest):
         )
 
     def test_history_cli_attaches_selected_store_for_local_consumers(self):
-        """The documented CLI must not leave history persistence disabled."""
+        """The documented CLI must not leave history persistence disabled,
+        and must close the store it opened."""
         import workflows
         from jobs import catalogue
+        from store import Store
 
-        store = self.fresh_store("history-cli-store")
-        self.addCleanup(store.close)
         scripted = client_class(raw=[{
             "tweets": [tweet("paid", 1_700_000_001, "alpha")],
             "has_next_page": False,
@@ -758,17 +751,24 @@ class TestHistoryHonesty(E2ETest):
         output = tempfile.NamedTemporaryFile()
         self.addCleanup(output.close)
         store_path = self.store_path("history-cli-store")
+        opened = []
+
+        def store_type(*args):
+            opened.append(Store(*args))
+            return opened[-1]
 
         with mock.patch.object(workflows, "Client", scripted), \
-             mock.patch.object(workflows, "Store", return_value=store,
-                               create=True) as store_type, \
+             mock.patch.object(workflows, "Store", side_effect=store_type), \
              contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(io.StringIO()):
             rc = workflows._history_cli(
                 self._args(out=output.name, store=store_path))
 
         self.assertEqual(rc, 0)
-        store_type.assert_called_once_with(store_path)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].db.execute("SELECT 1")     # closed by the CLI
+        store = self.fresh_store("history-cli-store")
         self.assertEqual(catalogue("alpha", store=store)["counts"]["total"], 1)
 
     def test_history_declares_scope_and_include_retweets_runs_second_pass(self):

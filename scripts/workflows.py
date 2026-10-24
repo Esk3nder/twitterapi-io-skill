@@ -398,9 +398,16 @@ def _history_cli(a):
         q += " -filter:replies"
     prepare_search_query(q)     # refuses unsafe min_faves forms before any spend
     c = Client(max_usd=a.max_usd)
-    if c.store is None:
-        store_path = getattr(a, "store", None)
-        c.store = Store(store_path) if store_path else Store()
+    if c.store is not None:
+        return _history_walk(a, c, q)
+    # History persists every paid page, so the CLI opens the store it writes
+    # and closes it on every exit path.
+    store_path = getattr(a, "store", None)
+    with (Store(store_path) if store_path else Store()) as c.store:
+        return _history_walk(a, c, q)
+
+
+def _history_walk(a, c, q):
     if not a.user:
         scope = ("raw query results; composition depends on the query and "
                  "native retweets are not added automatically")
