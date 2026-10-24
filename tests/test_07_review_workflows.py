@@ -151,6 +151,18 @@ class TestHistoryArgumentRefusals(CliCase):
         self.assertEqual(json.loads(out)["error"]["type"], "usage")
         self.assertEqual(self.clients, [], "refusal must precede client and spend")
 
+    def test_missing_user_and_query_names_the_subcommand(self):
+        """Codex review of PR 3: this post-parse refusal went through the
+        top-level parser, which named `workflows.py` and pointed to its help
+        rather than `workflows.py history --help`."""
+        rc, out, _ = self.run_cli(workflows, ["history"])
+        self.assertEqual(rc, 2, out)
+        body = json.loads(out)
+        self.assertEqual(body["error"]["type"], "usage")
+        self.assertEqual(body["error"]["command"], "workflows.py history")
+        self.assertIn("workflows.py history --help", body["help"][0])
+        self.assertEqual(self.clients, [], "refusal must precede client and spend")
+
     def test_inverted_window_refused(self):
         self.assert_usage_before_client(
             ["history", "alpha", "--since", "2026-03-01", "--until", "2026-01-01"])

@@ -245,6 +245,7 @@ class TestVerifyExitContract(unittest.TestCase):
         self.assertIn("usage", help_run.stdout.lower())
         bogus = self._run("--bogus-flag")
         self.assertEqual(bogus.returncode, 2)
+        self.assertEqual(bogus.stdout.count("\n"), 1, "one JSON line")
         self.assertEqual(json.loads(bogus.stdout)["error"]["type"], "usage")
 
     def test_update_refuses_a_partial_sweep(self):
