@@ -162,6 +162,7 @@ class TestArgumentParser(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 parser.parse_args(["--stat", "closed"])
         self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
         body = json.loads(output.getvalue())
         self.assertEqual(body["error"]["type"], "usage")
         self.assertIn("--stat", body["error"]["message"])

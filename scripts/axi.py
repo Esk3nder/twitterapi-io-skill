@@ -263,40 +263,18 @@ class ArgumentParser(argparse.ArgumentParser):
         ArgumentParser._current_args = list(sys.argv[1:] if args is None else args)
         return super().parse_args(args, namespace)
 
-    @classmethod
-    def _active_chain(cls, parser):
-        chain = [parser]
-        remaining = cls._current_args
-        current = parser
-        while True:
-            action = next((item for item in current._actions
-                           if isinstance(item, argparse._SubParsersAction)), None)
-            if not action:
-                break
-            choice = next((token for token in remaining if token in action.choices), None)
-            if not choice:
-                break
-            current = action.choices[choice]
-            chain.append(current)
-            remaining = remaining[remaining.index(choice) + 1:]
-        return chain
-
     def error(self, message):
-        token = None
+        # argparse calls this on the parser that failed, so `self` is the
+        # subcommand's parser when the subcommand's own arguments are wrong.
         if "unrecognized arguments:" in message:
             token = message.split("unrecognized arguments:", 1)[1].strip().split()[0]
             message = f"unknown flag {token}" if token.startswith("-") else \
                 f"unknown argument {token}"
-        chain = self._active_chain(self)
-        active = chain[-1]
-        flags = []
-        for parser in chain:
-            for action in parser._actions:
-                flags.extend(action.option_strings)
-        valid = ", ".join(dict.fromkeys(flags)) or "no optional flags"
-        emit(error("usage", message, active.prog,
-                   f"Valid flags for `{active.prog}`: {valid}",
-                   f"Run `{active.prog} --help` for examples"))
+        # format_usage() is argparse's public usage line; it lists this
+        # parser's own valid flags.
+        emit_line(error("usage", message, self.prog,
+                        self.format_usage().strip(),
+                        f"Run `{self.prog} --help` for examples"))
         raise SystemExit(2)
 
 

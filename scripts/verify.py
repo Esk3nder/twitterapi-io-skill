@@ -337,7 +337,7 @@ def check_pricing(c, facts):
 
 
 def _main(argv=None):
-    from axi import ArgumentParser, emit, error, fast_version, success
+    from axi import ArgumentParser, emit, emit_line, error, fast_version, success
     if fast_version(argv):
         return 0
     p = ArgumentParser(description=__doc__,
@@ -408,7 +408,7 @@ def _main(argv=None):
             _say(f"  {name}: {kind} — {detail}")
         # Name every failed check in the JSON itself; stderr is not something
         # a caller parsing stdout ever sees.
-        emit(error("runtime", f"{coverage}; drift: " + "; ".join(
+        emit_line(error("runtime", f"{coverage}; drift: " + "; ".join(
             f"{name}: {kind} — {detail}" for name, kind, detail in drift),
             "verify.py",
             "Investigate each failure before trusting downstream results; update "
