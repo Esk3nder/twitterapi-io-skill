@@ -383,9 +383,7 @@ def _print_event(evt, *, fields=None, full=False, state=None):
 
 
 # -------------------------------------------------------------------- cli --
-def _main(argv=None):
-    if fast_version(argv):
-        return 0
+def _parser():
     p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -429,8 +427,13 @@ def _main(argv=None):
                        epilog="Examples:\n  realtime.py stream --seconds <seconds>\n  realtime.py stream --fields id,created_at,text,rule")
     s.add_argument("--seconds", type=int, help="stop after this many seconds")
     add_common_output_flags(s)
+    return p
 
-    a = p.parse_args(argv)
+
+def _main(argv=None):
+    if fast_version(argv):
+        return 0
+    a = _parser().parse_args(argv)
     if a.cmd == "rules" and a.action == "list":
         parse_fields(a.fields, RULE_FIELDS, "realtime.py rules list")
     if a.cmd == "stream":
@@ -565,7 +568,7 @@ def _stream_cli(c, a):
 
 
 def main(argv=None):
-    return run_cli("realtime.py", _main, argv)
+    return run_cli("realtime.py", _main, argv, parser=_parser)
 
 
 if __name__ == "__main__":

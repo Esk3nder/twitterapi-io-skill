@@ -1038,7 +1038,7 @@ def _main(argv=None):
 
 
 def main(argv=None):
-    return run_cli("jobs.py", _main, argv)
+    return run_cli("jobs.py", _main, argv, parser=_job_parser)
 
 
 if __name__ == "__main__":

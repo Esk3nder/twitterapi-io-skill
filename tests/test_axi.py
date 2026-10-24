@@ -58,7 +58,6 @@ class TestJsonBoundary(unittest.TestCase):
         self.assertIn("valid fields", str(cm.exception))
 
 
-
 class TestExitContract(unittest.TestCase):
     """The one CLI boundary: 2 = usage, refusal, or setup; 1 = API, runtime,
     or internal. Every failure is ONE JSON line on stdout with a help line."""
@@ -79,13 +78,37 @@ class TestExitContract(unittest.TestCase):
             output = io.StringIO()
             with self.subTest(kind=kind, exc=type(exc).__name__), \
                     contextlib.redirect_stdout(output):
-                rc = axi.run_cli("tool.py", fail, ["sub"])
+                rc = axi.run_cli("tool.py", fail, ["sub"], parser=self._parser)
             self.assertEqual(rc, code)
             self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
             body = json.loads(output.getvalue())
             self.assertEqual(body["error"]["type"], kind)
             self.assertEqual(body["error"]["command"], "tool.py sub")
             self.assertTrue(body["help"])
+
+    @staticmethod
+    def _parser():
+        p = axi.ArgumentParser(prog="tool.py")
+        p.add_argument("--max-usd", type=float)
+        p.add_argument("--quiet", action="store_true")
+        p.add_subparsers(dest="cmd").add_parser("sub")
+        return p
+
+    def test_error_names_the_subcommand_after_global_flags(self):
+        """`jobs.py --max-usd 5 brief` was reported as plain `jobs.py`; a
+        flag's value must not be read as the subcommand either."""
+        def fail(_argv):
+            raise axi.UsageError("bad")
+        cases = {("--max-usd", "5", "sub"): "tool.py sub",
+                 ("--max-usd=5", "--quiet", "sub", "x"): "tool.py sub",
+                 ("--quiet",): "tool.py",
+                 ("--max-usd", "5"): "tool.py"}
+        for argv, command in cases.items():
+            output = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stdout(output):
+                axi.run_cli("tool.py", fail, list(argv), parser=self._parser)
+            self.assertEqual(json.loads(output.getvalue())["error"]["command"],
+                             command)
 
     def test_missing_key_is_setup_exit_2_for_every_paid_command(self):
         """Run as real scripts: a class raised from a script's own __main__

@@ -763,6 +763,17 @@ def _main(argv=None):
     if not argv:
         emit(dashboard(__file__, "Run streaming twitterapi.io audience, history, and monitor workflows"))
         return 0
+    p = _parser()
+    args = p.parse_args(argv)
+    if args.cmd == "history" and not (args.user or args.query):
+        p.error("history needs a USER or --query")
+    parse_fields(args.fields,
+                 ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
+                 f"workflows.py {args.cmd}")
+    return args.func(args)
+
+
+def _parser():
     p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     p.add_argument("--max-usd", type=float, default=5.0,
                    help="hard spend ceiling for this run (default 5.00)")
@@ -819,18 +830,11 @@ def _main(argv=None):
                    help="hard spend ceiling (default 5.00)")
     add_common_output_flags(m)
     m.set_defaults(func=_monitor_cli)
-
-    args = p.parse_args(argv)
-    if args.cmd == "history" and not (args.user or args.query):
-        p.error("history needs a USER or --query")
-    parse_fields(args.fields,
-                 ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
-                 f"workflows.py {args.cmd}")
-    return args.func(args)
+    return p
 
 
 def main(argv=None):
-    return run_cli("workflows.py", _main, argv)
+    return run_cli("workflows.py", _main, argv, parser=_parser)
 
 
 if __name__ == "__main__":
