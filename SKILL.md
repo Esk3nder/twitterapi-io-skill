@@ -174,13 +174,10 @@ timestamps rather than dropping them silently.
 **`from:USER` excludes native retweets.** Default `history` is originals +
 replies + quote tweets and prints that scope. Pass `--include-retweets` for a
 second `filter:nativeretweets` pass under the same ceiling. The two passes are
-deduplicated by id. For the USER shorthand, `--exclude-retweets` is retained
-only as an explicit no-op.
+deduplicated by id. `--include-retweets` needs the USER shorthand; a raw
+`--query` states its own retweet scope.
 `--max-pages N` applies separately to each search pass even if the first pass
 hits its cap, so including native retweets can fetch up to `2N` pages total.
-With a raw `--query`,
-`--exclude-retweets` is refused before spending because the query itself may
-explicitly select native retweets.
 
 **Search-index depth is not account age.** For an open-ended handle history,
 the workflow compares the oldest reached tweet with the author's profile
@@ -194,8 +191,8 @@ unsplittable timestamp, page cap, or equivalent). Propagate it or label the
 result partial; never convert it to an empty list or confident count.
 
 **Communities and lists do not provide general ID discovery.**
-`community_tweets_all` returns tweets across communities, not communities;
-`community_search` is a warning compatibility alias. Obtain IDs from
+`community_tweets_all` returns tweets across communities, not communities.
+Obtain IDs from
 `x.com/i/communities/<id>` or `x.com/i/lists/<id>`. A null community identity
 raises. Empty list pages also raise because this API cannot distinguish empty,
 private, and nonexistent lists.

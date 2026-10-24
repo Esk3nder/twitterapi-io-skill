@@ -76,16 +76,6 @@ def require_key():
             "failure). Export the key (see ~/.zshenv) or set the CI secret.")
 
 
-def book_floor(client, path):
-    """What Client._send books for one attempt that a fake answers: the
-    15-credit floor, except the free `/oapi/my/info`. Fakes that replace
-    _raw/_raw_json call this so budget accounting stays real."""
-    import twitterapi
-    client._book_attempt(
-        path, 0.0 if path == "/oapi/my/info" else twitterapi.MIN_REQUEST_CREDITS,
-        f"{path} request")
-
-
 def record_charges(client):
     """Observe (not mock) every _charge call on a real client.
 
@@ -154,8 +144,11 @@ class E2ETest(unittest.TestCase):
         return os.path.join(STORE_DIR, f"{name}.db")
 
     def fresh_store(self, name):
+        """A Store on an isolated path, closed when the test ends."""
         from store import Store
-        return Store(self.store_path(name))
+        store = Store(self.store_path(name))
+        self.addCleanup(store.close)
+        return store
 
     # -- subprocess helper ---------------------------------------------------
     def run_cli(self, args, timeout=300):

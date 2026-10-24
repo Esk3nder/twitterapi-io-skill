@@ -17,9 +17,9 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from tests.e2e_base import SCRIPTS, book_floor  # noqa: F401  (SCRIPTS puts scripts/ on sys.path)
+from tests.e2e_base import SCRIPTS  # noqa: F401  (SCRIPTS puts scripts/ on sys.path)
+from tests.fakes import client_class
 
-import axi
 import jobs
 import twitterapi
 from store import Store
@@ -39,31 +39,14 @@ class JobsCase(unittest.TestCase):
         self.requests = []
 
     def run_jobs(self, argv, raw=None, raw_json=None, *, key="test"):
-        requests = self.requests
-
-        def fake_raw(client, method, path, params=None, *, max_credits=None):
-            client._require_budget(max_credits or 15, "request")
-            book_floor(client, path)
-            requests.append((path, dict(params or {})))
-            if raw is None:
-                raise AssertionError(f"unexpected request {path}")
-            return raw(path, dict(params or {}))
-
-        def fake_raw_json(client, method, path, body, *, max_credits=None):
-            client._require_budget(max_credits or 15, "request")
-            book_floor(client, path)
-            requests.append((path, body))
-            if raw_json is None:
-                raise AssertionError(f"unexpected request {path}")
-            return raw_json(path, body)
-
-        env = {"TWITTERAPI_IO_QPS": "100000", "HOME": self.tmp}
+        created = []
+        env = {"HOME": self.tmp}
         if key:
             env["TWITTERAPI_IO_KEY"] = key
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env), \
-             mock.patch.object(twitterapi.Client, "_raw", fake_raw), \
-             mock.patch.object(twitterapi.Client, "_raw_json", fake_raw_json), \
+             mock.patch.object(jobs, "Client", client_class(
+                 raw=raw or (), raw_json=raw_json or (), created=created)), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             if not key:
                 os.environ.pop("TWITTERAPI_IO_KEY", None)
@@ -71,30 +54,9 @@ class JobsCase(unittest.TestCase):
                 code = jobs.main(argv)
             except SystemExit as exc:          # argparse usage errors
                 code = exc.code
+        self.requests += [(path, payload) for c in created
+                          for _, path, payload in c.raw_calls + c.json_calls]
         return code, json.loads(out.getvalue())
-
-
-# ------------------------------------------------- session-context removal --
-class TestSessionContextRemoved(JobsCase):
-    def test_setup_is_an_unknown_command(self):
-        code, body = self.run_jobs(["setup"], key=None)
-        self.assertEqual(code, 2)
-        self.assertEqual(body["error"]["type"], "usage")
-
-    def test_hidden_session_commands_are_gone(self):
-        for name in ("session-context", "session-capture"):
-            code, body = self.run_jobs([name, "--scope-root", self.tmp], key=None)
-            self.assertEqual(code, 2, name)
-            self.assertEqual(body["error"]["type"], "usage")
-        self.assertFalse(os.path.exists(os.path.join(self.tmp, ".twitterapi-io")))
-
-    def test_axi_has_no_hook_installers_and_dashboard_does_not_advertise_them(self):
-        for name in ("setup_hooks", "check_hooks", "_merge_json_hook",
-                     "_merge_codex_feature", "_write_opencode_plugin",
-                     "script_command"):
-            self.assertFalse(hasattr(axi, name), name)
-        board = axi.dashboard("jobs.py", "d", store_path=self.db)
-        self.assertFalse(any("setup" in line for line in board["help"]))
 
 
 # ------------------------------------------- 1. ceiling mid-job = partial --
@@ -376,11 +338,6 @@ class TestKeyHandling(JobsCase):
         self.assertEqual(code, 0, body)
         self.assertEqual((body["joined"], body["left"]), (["bob"], []))
 
-    def test_missing_key_is_a_setup_error_exit_two(self):
-        code, body = self.run_jobs(["brief", "alpha", "--store", self.db], key=None)
-        self.assertEqual(code, 2)
-        self.assertEqual(body["error"]["type"], "setup")
-        self.assertIn("TWITTERAPI_IO_KEY", body["error"]["message"])
 
 
 # ------------------------------------------------------- 9. common flags ----

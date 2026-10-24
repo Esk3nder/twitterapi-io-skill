@@ -188,7 +188,7 @@ Since 20 QPS is a hard maximum, batching multiplies effective throughput by N.
 **`tweet/replies/v2` returns 31-38 replies per call; plain `tweet/replies`
 returns 20.** ~1.8x fewer requests for identical data, and it sorts
 (`queryType`: Relevance | Latest | Likes). Prefer v2. `replies/v1` also
-returns ~35.
+returns ~35; the client does not expose it because v2 covers the same data.
 
 **`user/articles`** is `data`-wrapped (`data.articles`) with pagination at the
 ROOT — the same trap as `last_tweets`. Param is all-lowercase **`username`**.

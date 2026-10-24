@@ -128,13 +128,11 @@ class TestVerifyFailures(unittest.TestCase):
         import tempfile
         env = dict(os.environ)
         env.pop("TWITTERAPI_IO_KEY", None)
-        # Own store dir: under run_e2e.sh the parent's E2E_STORE_DIR already
-        # holds the stores test_00_pure created, and fresh_store() names are
-        # deterministic, so the nested run would reopen them (cohort versions
-        # 3,4 instead of 1,2 — measured 2026-10-23).
+        # Own store dir: the parent's E2E_STORE_DIR already holds the stores
+        # earlier tests created, and fresh_store() names are deterministic.
         env["E2E_STORE_DIR"] = tempfile.mkdtemp(prefix="twapi-nested-")
-        run = subprocess.run(
-            [sys.executable, "-m", "unittest", "tests.test_00_pure"],
+        run = subprocess.run(           # a key-gated live module
+            [sys.executable, "-m", "unittest", "tests.test_20_envelopes"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env=env,
             capture_output=True,
@@ -172,7 +170,7 @@ class TestVerifyFailures(unittest.TestCase):
             "articles": APIError(401, "bad key", ENDPOINTS["articles"]["path"]),
         })
 
-        with self.assertRaises(EnvironmentError):
+        with self.assertRaises(verify.SetupError):
             verify.check_contracts(
                 client, {"response_contracts": {}}, ["articles"])
 
@@ -199,14 +197,12 @@ class TestVerifyFailures(unittest.TestCase):
         self.assertEqual(rc, 1)
         payload = json.loads(rendered)
         self.assertEqual(payload["error"]["type"], "runtime")
-        self.assertIn("probed 22/32", payload["error"]["message"])
-        self.assertIn("10 unprobeable", payload["error"]["message"])
+        probed = len(verify.probe_endpoint_names())
+        self.assertIn(f"probed {probed}/{len(ENDPOINTS)}", payload["error"]["message"])
+        self.assertIn(f"{len(verify.UNPROBEABLE)} unprobeable", payload["error"]["message"])
         self.assertIn("1 FAILING", payload["error"]["message"])
         self.assertIn("spent $0.00120", payload["error"]["message"])
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 class TestArgparseExitsAreNotSilent(unittest.TestCase):
     """argparse --help and usage errors raised SystemExit inside the stdout
@@ -227,7 +223,6 @@ class TestArgparseExitsAreNotSilent(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("unknown", p.stdout.lower(),
                       "the structured usage JSON must reach stdout")
-
 
 
 class TestVerifyExitContract(unittest.TestCase):
@@ -252,11 +247,6 @@ class TestVerifyExitContract(unittest.TestCase):
         self.assertEqual(bogus.returncode, 2)
         self.assertEqual(json.loads(bogus.stdout)["error"]["type"], "usage")
 
-    def test_missing_key_is_a_setup_failure_not_a_pass(self):
-        p = self._run()
-        self.assertEqual(p.returncode, 2)
-        self.assertEqual(json.loads(p.stdout)["error"]["type"], "setup")
-
     def test_update_refuses_a_partial_sweep(self):
         for argv in (("--quick", "--update"), ("--update",),
                      ("--quick", "--pricing", "--update")):
@@ -273,8 +263,33 @@ class TestVerifyExitContract(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                rc = verify._axi_main(["--quick"])
+                rc = verify.main(["--quick"])
         self.assertEqual(rc, 1)
         message = json.loads(out.getvalue())["error"]["message"]
         self.assertIn("followers", message)
         self.assertIn("top-level key set changed", message)
+
+    def test_network_failure_is_setup_not_drift(self):
+        """Codex review 2026-10-23: a DNS failure exited 1, which verify
+        defines as API drift, though no contract was ever observed."""
+        import urllib.error
+
+        def unreachable(*args):
+            raise urllib.error.URLError("DNS unavailable")
+
+        with mock.patch.dict(os.environ, {"TWITTERAPI_IO_KEY": "x"}), \
+                mock.patch.object(verify, "Client", lambda **kw: FakeClient({})), \
+                mock.patch.object(verify, "check_contracts", unreachable), \
+                mock.patch.object(verify, "check_internal_consistency", lambda f: []), \
+                contextlib.redirect_stderr(io.StringIO()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = verify.main(["--quick"])
+        self.assertEqual(rc, 2)
+        error = json.loads(out.getvalue())["error"]
+        self.assertEqual(error["type"], "setup")
+        self.assertIn("DNS unavailable", error["message"])
+
+
+if __name__ == "__main__":
+    unittest.main()

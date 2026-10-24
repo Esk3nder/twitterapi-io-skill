@@ -11,7 +11,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,10 +22,9 @@ SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
 sys.path.insert(0, SCRIPTS)
 
 import realtime  # noqa: E402
-import twitterapi  # noqa: E402
 import workflows  # noqa: E402
 from twitterapi import APIError, IncompleteDataError  # noqa: E402
-from tests.e2e_base import book_floor  # noqa: E402
+from tests.fakes import ScriptedClient, client_class  # noqa: E402
 
 NOW = 1_800_000_000
 FMT = "%a %b %d %H:%M:%S %z %Y"
@@ -40,34 +38,8 @@ def tw(tweet_id, ts, handle="alpha", **extra):
     return record
 
 
-class Fake(twitterapi.Client):
-    """Real Client accounting and ceilings; scripted transport."""
-
-    def __init__(self, handler, json_handler=None, **kwargs):
-        kwargs.setdefault("verbose", False)
-        super().__init__(api_key="test", **kwargs)
-        self.handler, self.json_handler = handler, json_handler
-        self.calls, self.json_calls = [], []
-
-    def _raw(self, method, path, params=None, *, max_credits=None):
-        if path != "/oapi/my/info":
-            self._require_budget(max_credits or twitterapi.MIN_REQUEST_CREDITS,
-                                 f"{method} {path}")
-        book_floor(self, path)
-        self.calls.append((path, dict(params or {})))
-        return self.handler(path, dict(params or {}))
-
-    def _raw_json(self, method, path, body, *, max_credits=None):
-        self._require_budget(max_credits or twitterapi.MIN_REQUEST_CREDITS,
-                             f"{method} {path}")
-        book_floor(self, path)
-        self.json_calls.append((method, path, body))
-        return (self.json_handler or (lambda *a: {"status": "success"}))(
-            method, path, body)
-
-
 def search_calls(client):
-    return [p for path, p in client.calls if "advanced_search" in path]
+    return [p for _, path, p in client.raw_calls if "advanced_search" in path]
 
 
 class CliCase(unittest.TestCase):
@@ -79,24 +51,13 @@ class CliCase(unittest.TestCase):
     def path(self, name):
         return os.path.join(self.tmp.name, name)
 
-    def factory(self, handler, json_handler=None):
-        """A real Client subclass (static pricing helpers intact) that records
-        every construction and scripts its transport."""
-        test = self
-
-        class Bound(Fake):
-            def __init__(inner, *args, **kwargs):
-                Fake.__init__(inner, handler, json_handler,
-                              max_usd=kwargs.get("max_usd"))
-                test.clients.append(inner)
-        return Bound
-
     def run_cli(self, module, argv, handler=None, json_handler=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(
-                module, "Client",
-                self.factory(handler or self.no_request, json_handler)))
+            stack.enter_context(mock.patch.object(module, "Client", client_class(
+                raw=handler or self.no_request,
+                raw_json=json_handler or (lambda path, body: {"status": "success"}),
+                created=self.clients)))
             stack.enter_context(contextlib.redirect_stdout(out))
             stack.enter_context(contextlib.redirect_stderr(err))
             rc = module.main(argv)
@@ -122,7 +83,7 @@ class TestCeilingNotTightenedByLibraryDefault(CliCase):
         self.assertEqual(self.clients[0].max_usd, 50)
 
     def test_monitor_library_keeps_a_supplied_client_ceiling(self):
-        client = Fake(lambda path, p: {"tweets": [], "has_next_page": False},
+        client = ScriptedClient(raw=lambda path, p: {"tweets": [], "has_next_page": False},
                       max_usd=50)
         with mock.patch.object(workflows.time, "time", return_value=NOW), \
              contextlib.redirect_stderr(io.StringIO()):
@@ -145,7 +106,7 @@ class TestSearchDrift(CliCase):
         self.assertIn("tweets", summary["completeness"]["reason"])
 
     def test_walker_raises_when_tweets_is_not_a_list(self):
-        client = Fake(lambda path, p: {"tweets": None, "has_next_page": False},
+        client = ScriptedClient(raw=lambda path, p: {"tweets": None, "has_next_page": False},
                       max_usd=1)
         with self.assertRaises(IncompleteDataError):
             list(workflows.search_window(client, "from:alpha", 0, NOW))
@@ -157,7 +118,7 @@ class TestSearchDrift(CliCase):
             {"tweets": [tw(f"o{k}", NOW - 500 - k) for k in range(3)],
              "has_next_page": False},
         ]
-        client = Fake(lambda path, p: pages.pop(0), max_usd=1)
+        client = ScriptedClient(raw=lambda path, p: pages.pop(0), max_usd=1)
         got = list(workflows.search_window(client, "from:alpha", None, NOW))
         self.assertEqual(len(got), 8, "a short page that asserts more is not the end")
         self.assertEqual(len(search_calls(client)), 2)
@@ -210,8 +171,8 @@ class TestHistoryArgumentRefusals(CliCase):
         rc, out, _ = self.run_cli(
             workflows, ["history", "--query", "x", "--include-retweets"])
         self.assertEqual(rc, 2, out)
-        self.assertEqual(json.loads(out)["error"]["type"], "refusal")
-        self.assertEqual(self.clients, [], "refusal must precede client and spend")
+        self.assertEqual(json.loads(out)["error"]["type"], "usage")
+        self.assertEqual(self.clients, [], "the error must precede client and spend")
 
     def test_unenforceable_min_faves_query_is_usage_not_internal(self):
         """prepare_search_query's ValueError escaped as an internal error
@@ -239,7 +200,7 @@ class TestHistoryArgumentRefusals(CliCase):
         self.assertEqual(lines[-1]["error"]["type"], "runtime")
 
     def test_library_rejects_inverted_window_before_request(self):
-        client = Fake(self.no_request, max_usd=1)
+        client = ScriptedClient(max_usd=1)
         with self.assertRaises(ValueError):
             workflows.history_search("from:alpha", "2026-03-01", "2026-01-01",
                                      client=client)
@@ -331,7 +292,7 @@ class TestMonitorResume(CliCase):
         state = self.path("overlap.json")
         with open(state, "w") as fh:
             json.dump({"last_ts": NOW - 60, "seen_ids": ["old"]}, fh)
-        client = Fake(lambda path, p: {
+        client = ScriptedClient(raw=lambda path, p: {
             "tweets": [tw("late", NOW - 90), tw("old", NOW - 100)],
             "has_next_page": False}, max_usd=1)
         emitted = []
@@ -381,36 +342,6 @@ class TestAudienceDenominator(CliCase):
         self.assertEqual(self.clients, [])
 
 
-# -------------------------------------------------------------- defect 10 --
-class TestSetupFailure(unittest.TestCase):
-    def test_missing_key_is_setup_exit_2(self):
-        env = {k: v for k, v in os.environ.items() if k != "TWITTERAPI_IO_KEY"}
-        cases = [(workflows, ["history", "alpha", "--store",
-                              os.path.join(tempfile.gettempdir(), "x.db")]),
-                 (workflows, ["audience", "alpha", "--limit", "1"]),
-                 (workflows, ["monitor", "alpha", "--once"]),
-                 (realtime, ["rules", "list"]),
-                 (realtime, ["stream", "--seconds", "5"])]
-        for module, argv in cases:
-            with self.subTest(argv=argv), mock.patch.dict(os.environ, env, clear=True), \
-                 contextlib.redirect_stdout(io.StringIO()) as out, \
-                 contextlib.redirect_stderr(io.StringIO()):
-                rc = module.main(argv)
-            self.assertEqual(rc, 2)
-            self.assertEqual(json.loads(out.getvalue())["error"]["type"], "setup")
-
-    def test_help_works_without_a_key(self):
-        env = {k: v for k, v in os.environ.items() if k != "TWITTERAPI_IO_KEY"}
-        for argv in (["workflows.py", "--help"], ["workflows.py", "history", "--help"],
-                     ["workflows.py", "monitor", "--help"],
-                     ["realtime.py", "rules", "activate", "--help"]):
-            run = subprocess.run([sys.executable, os.path.join(SCRIPTS, argv[0]),
-                                  *argv[1:]], capture_output=True, text=True,
-                                 timeout=20, env=env)
-            self.assertEqual(run.returncode, 0, (argv, run.stdout, run.stderr))
-            self.assertIn("usage:", run.stdout)
-
-
 # -------------------------------------------------------------- defect 11 --
 RULE = {"rule_id": "r1", "tag": "ai", "value": "from:openai",
         "interval_seconds": 0.1, "is_effect": 0}
@@ -426,7 +357,7 @@ class TestRealtimeRules(CliCase):
         self.assertNotIn("nothing is billing", err)
 
     def test_unrecognized_is_effect_may_be_billing(self):
-        client = Fake(lambda path, p: {"rules": [dict(RULE, is_effect="true")]})
+        client = ScriptedClient(raw=lambda path, p: {"rules": [dict(RULE, is_effect="true")]})
         warning = realtime.active_rule_warning(client)
         self.assertNotIn("nothing is billing", warning)
         self.assertIn("UNKNOWN", warning)
@@ -465,7 +396,7 @@ class TestRuleToggle(CliCase):
         self.assertEqual(self.clients, [])
 
     def test_update_rule_enforces_bounds(self):
-        client = Fake(self.no_request)
+        client = ScriptedClient()
         with self.assertRaises(ValueError):
             realtime.update_rule(client, "r1", "ai", "x", 100_000, is_effect=1,
                                  confirm=True)

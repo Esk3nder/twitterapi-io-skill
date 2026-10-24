@@ -5,7 +5,7 @@ Each workflow is a CLI entry point AND an importable function. They exist so an
 agent never has to re-derive parameter names, pagination strategy or cost — all
 three are where unaided agents measurably fail.
 
-    python3 workflows.py audience   elonmusk --ids-only --limit 50000
+    python3 workflows.py audience   elonmusk --limit 50000
     python3 workflows.py history    openai --since 2026-01-01 --until 2026-02-01
     python3 workflows.py monitor    elonmusk,openai --interval 60
 
@@ -26,21 +26,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from twitterapi import (APIError, Client, CostLimitExceeded, IncompleteDataError,
                         credits_to_usd, enrich_tweet_media, filter_search_tweets,
                         prepare_search_query)  # noqa: E402
-from store import Store  # noqa: E402
+from store import Store, parse_ts  # noqa: E402
 from axi import (ACCOUNT_FIELDS, TWEET_FIELDS, ArgumentParser, UsageError,
-                 HelpFormatter, add_common_output_flags, dashboard, emit, error, fast_version,
-                 format_record, parse_fields, run_cli, success)  # noqa: E402
+                 HelpFormatter, add_common_output_flags, dashboard, emit, emit_line,
+                 error, fast_version, format_record, parse_fields, run_cli,
+                 success)  # noqa: E402
 
-TW_FMT = "%a %b %d %H:%M:%S %z %Y"      # verified: "Mon Aug 10 17:16:53 +0000 2026"
 SEARCH_PAGE = 20                        # advanced_search returns at most 20 per call
 DEFAULT_MAX_USD = 5.0                   # ceiling for a Client this module creates itself
 MONITOR_SEEN_CAP = 5000                 # newest ids kept for monitor dedupe
 MONITOR_OVERLAP = 120                   # seconds each poll re-scans for late-indexed posts
 _HANDLE = re.compile(r"^[A-Za-z0-9_]+$")
-
-
-def parse_created_at(s):
-    return datetime.strptime(s, TW_FMT)
 
 
 def _strictest(*limits):
@@ -61,25 +57,6 @@ def _bounded_client(client, max_usd):
         return Client(max_usd=DEFAULT_MAX_USD if max_usd is None else max_usd)
     client.max_usd = _strictest(client.max_usd, max_usd)
     return client
-
-
-class SetupError(RuntimeError):
-    """The API client could not be configured (for example, no API key)."""
-
-
-def _cli_client(max_usd):
-    """Client for a CLI run. Construction sends no request, so any failure here
-    is configuration (missing TWITTERAPI_IO_KEY, invalid QPS), not runtime."""
-    try:
-        return Client(max_usd=max_usd)
-    except (RuntimeError, ValueError) as exc:
-        raise SetupError(str(exc)) from exc
-
-
-def _emit_line(doc):
-    """One single-line JSON document. Streaming commands print JSON Lines, so a
-    summary or error that follows records must not span several lines."""
-    print(json.dumps(doc, ensure_ascii=False))
 
 
 def _clean_handle(raw, flag="USER"):
@@ -116,17 +93,6 @@ def _int_or_none(value):
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _emit(records, out):
-    """JSONL to a file or stdout. JSONL so huge crawls stream without buffering."""
-    fh = open(out, "w") if out else sys.stdout
-    try:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-    finally:
-        if out:
-            fh.close()
 
 
 # ---------------------------------------------------------------- audience --
@@ -200,11 +166,8 @@ def audience(user, *, ids_only=True, limit=None, max_usd=None,
 
 def _audience_cli(a):
     if a.limit is not None and a.limit < 1:
-        emit(error("usage", f"--limit must be at least 1, got {a.limit}",
-                   "workflows.py audience",
-                   "Omit `--limit` for every follower, or pass a positive count"))
-        return 2
-    c = _cli_client(a.max_usd)
+        raise UsageError(f"--limit must be at least 1, got {a.limit}")
+    c = Client(max_usd=a.max_usd)
     got = 0
     fh = open(a.out, "w") if a.out else sys.stdout
     was_truncated = False
@@ -328,10 +291,9 @@ def search_window(client, query, since_ts=None, until_ts=None, *,
         qualifying_ids = {t.get("id") for t in qualifying}
         fresh, stamps = 0, []
         for t in batch:
-            try:
-                stamps.append(int(parse_created_at(t["createdAt"]).timestamp()))
-            except Exception:
-                pass
+            stamp = parse_ts(t.get("createdAt"))
+            if stamp is not None:
+                stamps.append(stamp)
             if t.get("id") in seen:
                 continue
             seen.add(t.get("id"))
@@ -420,50 +382,32 @@ def history_search(query, since=None, until=None, *, max_usd=None,
 
 
 def _history_cli(a):
-    try:
-        if a.user and a.query:
-            raise UsageError("pass a USER or --query, not both; a USER is the "
-                             "query `from:USER`, so --query would be ignored")
-        if a.user:
-            a.user = _clean_handle(a.user)
-        since_ts, _ = _window_ts(a.since, a.until)
-        if a.max_pages is not None and a.max_pages < 1:
-            raise UsageError(f"--max-pages must be at least 1, got {a.max_pages}")
-    except UsageError as exc:
-        emit(error("usage", str(exc), "workflows.py history",
-                   "Run `workflows.py history --help` for valid arguments"))
-        return 2
-    if a.exclude_retweets and not a.user:
-        emit(error("refusal", "--exclude-retweets cannot be combined with --query; "
-                   "a raw query may explicitly select native retweets",
-                   "workflows.py history",
-                   "Put `-filter:nativeretweets` in `<query>` explicitly"))
-        return 2
+    if a.user and a.query:
+        raise UsageError("pass a USER or --query, not both; a USER is the "
+                         "query `from:USER`, so --query would be ignored")
+    if a.user:
+        a.user = _clean_handle(a.user)
+    since_ts, _ = _window_ts(a.since, a.until)
+    if a.max_pages is not None and a.max_pages < 1:
+        raise UsageError(f"--max-pages must be at least 1, got {a.max_pages}")
     if a.include_retweets and not a.user:
-        emit(error("refusal", "--include-retweets needs the USER shorthand",
-                   "workflows.py history",
-                   "Put `filter:nativeretweets` in `<query>` explicitly"))
-        return 2
+        raise UsageError("--include-retweets needs the USER shorthand; put "
+                         "`filter:nativeretweets` in the query instead")
     q = f"from:{a.user}" if a.user else a.query
     if a.exclude_replies:
         q += " -filter:replies"
-    try:
-        prepare_search_query(q)     # refuses unsafe min_faves forms, $0
-    except ValueError as exc:
-        emit(error("usage", str(exc), "workflows.py history",
-                   "Rewrite `<query>` as the error describes"))
-        return 2
-    c = _cli_client(a.max_usd)
-    if c.store is None:
-        store_path = getattr(a, "store", None)
-        c.store = Store(store_path) if store_path else Store()
-    if a.exclude_retweets:
-        # No-op kept for compatibility: a `from:` query never returns native
-        # retweets in the first place, so this filter removes nothing. Say so
-        # rather than implying work is being done.
-        print("[history] note: --exclude-retweets is redundant — `from:` search "
-              "never returns native retweets. Use --include-retweets to fetch "
-              "them in a second pass.", file=sys.stderr)
+    prepare_search_query(q)     # refuses unsafe min_faves forms before any spend
+    c = Client(max_usd=a.max_usd)
+    if c.store is not None:
+        return _history_walk(a, c, q)
+    # History persists every paid page, so the CLI opens the store it writes
+    # and closes it on every exit path.
+    store_path = getattr(a, "store", None)
+    with (Store(store_path) if store_path else Store()) as c.store:
+        return _history_walk(a, c, q)
+
+
+def _history_walk(a, c, q):
     if not a.user:
         scope = ("raw query results; composition depends on the query and "
                  "native retweets are not added automatically")
@@ -525,25 +469,19 @@ def _history_cli(a):
                 # isRetweet is not 100% reliable per the vendor guide; corroborate
                 # it with retweeted_tweet, and dedupe across the two searches.
                 is_retweet = bool(t.get("isRetweet") or t.get("retweeted_tweet"))
-                if a.exclude_retweets and is_retweet:
-                    continue
                 tweet_id = t.get("id")
                 if tweet_id in seen:
                     continue
                 seen.add(tweet_id)
 
-                try:
-                    stamp = int(parse_created_at(t["createdAt"]).timestamp())
+                stamp = parse_ts(t.get("createdAt"))
+                if stamp is not None:
                     oldest_ts = stamp if oldest_ts is None else min(oldest_ts, stamp)
-                except Exception:
-                    pass
                 author = t.get("author") or {}
-                try:
-                    created = int(parse_created_at(author["createdAt"]).timestamp())
+                created = parse_ts(author.get("createdAt"))
+                if created is not None:
                     account_created_ts = (created if account_created_ts is None
                                           else min(account_created_ts, created))
-                except Exception:
-                    pass
                 try:
                     posts = int(author.get("statusesCount"))
                     stated_posts = max(stated_posts or 0, posts)
@@ -761,13 +699,8 @@ def _print_tweet(t):
 
 
 def _monitor_cli(a):
-    try:
-        users = _monitor_params(a.users, a.interval, a.lookback, a.overlap)
-    except UsageError as exc:
-        emit(error("usage", str(exc), "workflows.py monitor",
-                   "Run `workflows.py monitor --help` for valid arguments"))
-        return 2
-    c = _cli_client(a.max_usd)
+    users = _monitor_params(a.users, a.interval, a.lookback, a.overlap)
+    c = Client(max_usd=a.max_usd)
     print(f"monitoring {users} every {a.interval}s "
           f"(~${credits_to_usd(15) * (86400 / a.interval):.2f}/day at minimum billing)",
           file=sys.stderr)
@@ -775,14 +708,10 @@ def _monitor_cli(a):
     interrupted = False
 
     def output_tweet(tweet):
-        record = {
-            "id": tweet.get("id"),
-            "author": (tweet.get("author") or {}).get("userName", "?"),
-            "createdAt": tweet.get("createdAt"), "text": tweet.get("text"),
-            "likeCount": tweet.get("likeCount"),
-        }
+        # The whole tweet goes to format_record: a pre-trimmed copy made every
+        # --fields beyond the five kept here (views, quotes, ...) read null.
         rendered, clipped = format_record(
-            record, command="workflows.py monitor <users>", schema=TWEET_FIELDS,
+            tweet, command="workflows.py monitor <users>", schema=TWEET_FIELDS,
             fields=getattr(a, "fields", None), defaults=("id", "created_at", "text"),
             full=getattr(a, "full", False))
         state["text_truncated"] = state["text_truncated"] or clipped
@@ -802,15 +731,15 @@ def _monitor_cli(a):
         print(f"\nSTOPPED: {e}", file=sys.stderr)
         restart = ("restart from `--state <path>` to resume the same window"
                    if a.state else "rerun with `--state <path>` to make runs resumable")
-        _emit_line(success("workflows.py monitor", {
-                         "records_count": f"{state['records']} of unknown total",
-                         "records_state": (None if state["records"] else
-                                           "0 new posts emitted before the monitor stopped")},
-                     complete=False, reason=str(e),
-                     resume=(f"Raise `--max-usd <amount>` and {restart}"
-                             if isinstance(e, CostLimitExceeded)
-                             else restart[0].upper() + restart[1:]),
-                     records_returned=state["records"]))
+        emit_line(success("workflows.py monitor", {
+                        "records_count": f"{state['records']} of unknown total",
+                        "records_state": (None if state["records"] else
+                                          "0 new posts emitted before the monitor stopped")},
+                    complete=False, reason=str(e),
+                    resume=(f"Raise `--max-usd <amount>` and {restart}"
+                            if isinstance(e, CostLimitExceeded)
+                            else restart[0].upper() + restart[1:]),
+                    records_returned=state["records"]))
         return 0
     summary = success("workflows.py monitor", {
         "records_count": (f"{state['records']} of "
@@ -834,6 +763,17 @@ def _main(argv=None):
     if not argv:
         emit(dashboard(__file__, "Run streaming twitterapi.io audience, history, and monitor workflows"))
         return 0
+    p = _parser()
+    args = p.parse_args(argv)
+    if args.cmd == "history" and not (args.user or args.query):
+        p.error("history needs a USER or --query")
+    parse_fields(args.fields,
+                 ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
+                 f"workflows.py {args.cmd}")
+    return args.func(args)
+
+
+def _parser():
     p = ArgumentParser(description=__doc__, formatter_class=HelpFormatter)
     p.add_argument("--max-usd", type=float, default=5.0,
                    help="hard spend ceiling for this run (default 5.00)")
@@ -844,8 +784,6 @@ def _main(argv=None):
                        epilog="Examples:\n  workflows.py audience <user> --limit <count>\n  workflows.py audience <user> --profiles --fields id,user_name,name")
     a.add_argument("user", help="account handle")
     a.add_argument("--limit", type=int, help="maximum follower records")
-    a.add_argument("--ids-only", action="store_true", default=True,
-                   help="return only account IDs")
     a.add_argument("--profiles", dest="ids_only", action="store_false",
                    help="fetch full profiles (2.2x cost) instead of IDs")
     a.add_argument("--verified-only", action="store_true",
@@ -864,13 +802,9 @@ def _main(argv=None):
     h.add_argument("--since", help="YYYY-MM-DD")
     h.add_argument("--until", help="YYYY-MM-DD")
     h.add_argument("--exclude-replies", action="store_true")
-    retweets = h.add_mutually_exclusive_group()
-    retweets.add_argument("--exclude-retweets", action="store_true",
-                          help="explicit no-op for USER shorthand; refused with "
-                               "--query because raw queries may select retweets")
-    retweets.add_argument("--include-retweets", action="store_true",
-                          help="second pass with filter:nativeretweets to capture "
-                               "retweets, which `from:` alone omits entirely")
+    h.add_argument("--include-retweets", action="store_true",
+                   help="second pass with filter:nativeretweets to capture "
+                        "retweets, which `from:` alone omits entirely")
     h.add_argument("--max-pages", type=int, help="maximum pages per search pass")
     h.add_argument("--store", help="sqlite path for the persisted history corpus")
     h.add_argument("--out", help="write record JSONL to this path")
@@ -896,39 +830,11 @@ def _main(argv=None):
                    help="hard spend ceiling (default 5.00)")
     add_common_output_flags(m)
     m.set_defaults(func=_monitor_cli)
-
-    args = p.parse_args(argv)
-    if args.cmd == "history" and not (args.user or args.query):
-        p.error("history needs a USER or --query")
-    try:
-        parse_fields(args.fields,
-                     ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
-                     f"workflows.py {args.cmd}")
-    except UsageError as exc:
-        emit(error("usage", str(exc), f"workflows.py {args.cmd}",
-                   f"Run `workflows.py {args.cmd} --help` for valid fields"))
-        return 2
-    # Errors are single-line: a streaming command may already have printed
-    # JSON Lines records, and an indented document would break the stream.
-    command = f"workflows.py {args.cmd}"
-    try:
-        return args.func(args)
-    except SetupError as e:
-        _emit_line(error("setup", str(e), command,
-                         "Set `TWITTERAPI_IO_KEY` in the environment and rerun"))
-        return 2
-    except APIError as e:
-        _emit_line(error("api", str(e), command,
-                         f"Check the arguments, then rerun `{command}`"))
-        return 1
-    except RuntimeError as e:
-        _emit_line(error("runtime", str(e), command,
-                         "Check network access and the API status, then rerun"))
-        return 1
+    return p
 
 
 def main(argv=None):
-    return run_cli("workflows.py", _main, argv)
+    return run_cli("workflows.py", _main, argv, parser=_parser, dest="cmd")
 
 
 if __name__ == "__main__":

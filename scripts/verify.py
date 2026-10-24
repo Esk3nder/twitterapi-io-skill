@@ -14,6 +14,8 @@ WHY THIS EXISTS
     diffs reality against that record.
 
     Exit 0 = the recorded facts still hold.
+    Exit 2 = setup problem (no key, bad key, no credits, outage): nothing
+             about the recorded facts was called into question.
     Exit 1 = DRIFT. Something the skill asserts is no longer true; read the
              diff, re-probe, and update facts.json (and any prose that repeats
              the changed value) BEFORE trusting downstream results.
@@ -24,15 +26,13 @@ content changes daily, so a changed key set means a real API change.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, ENDPOINTS, APIError  # noqa: E402
+from twitterapi import Client, ENDPOINTS, APIError, SetupError  # noqa: E402
 
 FACTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "references", "facts.json")
@@ -45,7 +45,7 @@ TWEET_ID = "2084352161404920316"
 COMMUNITY_ID = "1493446837214187523"
 
 # The compatibility sample is intentionally frozen. It is useful for a cheap
-# smoke check, but its output must say that 23 endpoint names were not probed.
+# smoke check, but its output must say that the other 21 endpoint names were not probed.
 QUICK_ENDPOINTS = (
     "user_info", "follower_ids", "followers", "followings", "last_tweets",
     "search", "retweeters", "trends", "community_info",
@@ -60,9 +60,6 @@ UNPROBEABLE = {
     "community_moderators": (
         "needs a Community id; /twitter/user/communities returns a user-profile "
         "payload instead of community data, so there is no discovery route"),
-    "community_search": (
-        "community discovery is unavailable; /twitter/user/communities returns "
-        "a user-profile payload instead of community data"),
     "community_tweets": (
         "needs a Community id; /twitter/user/communities returns a user-profile "
         "payload instead of community data, so there is no discovery route"),
@@ -88,8 +85,11 @@ UNPROBEABLE = {
     "space_detail": "needs a Space id; none is available to the suite",
 }
 
-_LAST_SETUP_ERROR = None
-_LAST_DRIFT = []
+
+
+def _say(*parts, **kw):
+    """Progress and diagnostics: stderr. Stdout carries only the JSON result."""
+    print(*parts, file=sys.stderr, **kw)
 
 
 def probe_endpoint_names(*, quick=False):
@@ -145,7 +145,7 @@ def probe_params(name, fixtures):
             f"no safe read-only fixture rule for key parameter {key!r}")
 
     params = {key: value}
-    if name in ("search", "replies_v1", "replies_v2"):
+    if name in ("search", "replies_v2"):
         params["queryType"] = "Latest"
     if spec["page_param"]:
         # followers/followings clamp at 20; the other tunable endpoints accept 1.
@@ -199,7 +199,7 @@ def check_internal_consistency(facts):
         spec = ENDPOINTS.get(name)
         if not spec:
             drift.append((name, "in facts.json but not in ENDPOINTS", "-"))
-            print(f"  DRIFT  {name:16s} recorded but the client cannot call it")
+            _say(f"  DRIFT  {name:16s} recorded but the client cannot call it")
             continue
         for field in ("items_key", "items_in"):
             recorded = want.get(field)
@@ -207,15 +207,15 @@ def check_internal_consistency(facts):
             if recorded != actual:
                 drift.append((name, f"{field} disagrees with ENDPOINTS",
                               f"facts.json={recorded!r} code={actual!r}"))
-                print(f"  DRIFT  {name:16s} {field}: facts.json says {recorded!r}, "
+                _say(f"  DRIFT  {name:16s} {field}: facts.json says {recorded!r}, "
                       f"client code says {actual!r}")
         if want.get("page_max") and want["page_max"] != spec["page_max"]:
             drift.append((name, "page_max disagrees with ENDPOINTS",
                           f"facts.json={want['page_max']} code={spec['page_max']}"))
-            print(f"  DRIFT  {name:16s} page_max: facts.json "
+            _say(f"  DRIFT  {name:16s} page_max: facts.json "
                   f"{want['page_max']} vs code {spec['page_max']}")
     if not drift:
-        print(f"  ok     facts.json agrees with the client's endpoint table "
+        _say(f"  ok     facts.json agrees with the client's endpoint table "
               f"({len(facts['response_contracts'])} entries)")
     return drift
 
@@ -232,7 +232,7 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
             params = probe_params(name, fixtures)
         except Exception as e:
             failures.append((name, "probe configuration failed", str(e)[:90]))
-            print(f"  FAIL   {name:22s} probe configuration: {str(e)[:60]}")
+            _say(f"  FAIL   {name:22s} probe configuration: {str(e)[:60]}")
             continue
         try:
             if spec.get("key_resolver"):
@@ -245,7 +245,7 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
             # changed" when the real cause is a bad key sends a first-time
             # user off editing facts.json for nothing.
             if e.status in (401, 402, 403, 429) or e.status >= 500:
-                raise EnvironmentError(
+                raise SetupError(
                     {401: "TWITTERAPI_IO_KEY is invalid or expired.",
                      403: "TWITTERAPI_IO_KEY lacks access to this endpoint.",
                      402: "Account is out of credits — top up at "
@@ -255,7 +255,7 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
                                      f"likely a transient outage, retry later.")
                     + f"  (on {name} -> {spec['path']})") from None
             failures.append((name, "request failed", str(e)[:90]))
-            print(f"  FAIL   {name:22s} request failed: {str(e)[:60]}")
+            _say(f"  FAIL   {name:22s} request failed: {str(e)[:60]}")
             continue
 
         c._charge(name, _record_count(resp, spec), _page_size(name, params))
@@ -273,8 +273,8 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
             extra = set(got_keys) - set(want["top_level_keys"])
             failures.append((name, "key set changed",
                              f"missing={sorted(missing)} new={sorted(extra)}"))
-            print(f"  FAIL   {name:22s} keys {got_keys}")
-            print(f"         expected {sorted(want['top_level_keys'])}"
+            _say(f"  FAIL   {name:22s} keys {got_keys}")
+            _say(f"         expected {sorted(want['top_level_keys'])}"
                   f"  missing={sorted(missing)} new={sorted(extra)}")
             continue
 
@@ -283,16 +283,16 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
             items, has_next, cursor = Client._unpack(resp, spec)
         except Exception as e:
             failures.append((name, "response contract failed", str(e)[:90]))
-            print(f"  FAIL   {name:22s} response contract: {str(e)[:60]}")
+            _say(f"  FAIL   {name:22s} response contract: {str(e)[:60]}")
             continue
         if spec["items"] is not None and not isinstance(items, list):
             failures.append((name, "items not a list", type(items).__name__))
-            print(f"  FAIL   {name:22s} items_key '{spec['items']}' did not "
+            _say(f"  FAIL   {name:22s} items_key '{spec['items']}' did not "
                   "yield a list")
             continue
         n = len(items) if isinstance(items, list) else "-"
         contract = "exact keys + envelope" if want else "ENDPOINTS envelope"
-        print(f"  ok     {name:22s} {contract}, {n} records via "
+        _say(f"  ok     {name:22s} {contract}, {n} records via "
               f"{spec['items_in']}.{spec.get('items')}")
     return failures
 
@@ -300,7 +300,7 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
 def check_pricing(c, facts):
     """Balance-delta price check. Slow: server billing settles 20-60s late."""
     drift = []
-    print("\n  pricing (balance-delta; ~3 min of settle waits)")
+    _say("\n  pricing (balance-delta; ~3 min of settle waits)")
     settle = 75
 
     def bal():
@@ -316,9 +316,9 @@ def check_pricing(c, facts):
     want = facts["pricing"]["min_request_credits"] + facts["pricing"]["flat"]["profile"]
     if got != want:
         drift.append(("pricing", "credits per call changed", f"{got} vs {want}"))
-        print(f"  DRIFT  small page + profile billed {got} credits, expected {want}")
+        _say(f"  DRIFT  small page + profile billed {got} credits, expected {want}")
     else:
-        print(f"  ok     small page + profile billed exactly {got} credits")
+        _say(f"  ok     small page + profile billed exactly {got} credits")
 
     # /oapi/my/info must remain free or every qps lookup silently costs.
     time.sleep(settle)
@@ -330,19 +330,18 @@ def check_pricing(c, facts):
     if b2 - b3 != 0:
         drift.append(("pricing", "/oapi/my/info is no longer free",
                       f"{b2 - b3} credits over 11 calls"))
-        print(f"  DRIFT  /oapi/my/info now bills {b2 - b3} credits over 11 calls")
+        _say(f"  DRIFT  /oapi/my/info now bills {b2 - b3} credits over 11 calls")
     else:
-        print("  ok     /oapi/my/info still free (11 calls, 0 credits)")
+        _say("  ok     /oapi/my/info still free (11 calls, 0 credits)")
     return drift
 
 
-def _legacy_main(argv=None):
-    global _LAST_SETUP_ERROR, _LAST_DRIFT
-    _LAST_SETUP_ERROR = None
-    _LAST_DRIFT = []
-    from axi import ArgumentParser
+def _main(argv=None):
+    from axi import ArgumentParser, emit, error, fast_version, success
+    if fast_version(argv):
+        return 0
     p = ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pricing", action="store_true",
                    help="also re-measure prices by balance delta (~3 min)")
     p.add_argument("--quick", action="store_true",
@@ -363,68 +362,59 @@ def _legacy_main(argv=None):
     # callers that want to skip verification without a key decide that
     # themselves (see .github/workflows/e2e.yml).
     if not os.environ.get("TWITTERAPI_IO_KEY"):
-        _LAST_SETUP_ERROR = "TWITTERAPI_IO_KEY not set; verification was not run"
-        return 2
+        raise SetupError("TWITTERAPI_IO_KEY not set; verification was not run")
 
     facts = load_facts()
     age = days_since(facts.get("verified_at", ""))
-    print(f"facts.json verified_at {facts.get('verified_at')} "
-          f"({age} days ago)" if age is not None else "facts.json undated")
+    _say(f"facts.json verified_at {facts.get('verified_at')} "
+         f"({age} days ago)" if age is not None else "facts.json undated")
     endpoint_names = probe_endpoint_names(quick=a.quick)
     if not a.quick:
         check_coverage(endpoint_names)
-    print(f"re-probing {len(endpoint_names)} of {len(ENDPOINTS)} endpoints "
-          f"against {facts['verified_against']}"
-          + (" (--quick: partial sweep)" if a.quick else "") + "\n")
+    _say(f"re-probing {len(endpoint_names)} of {len(ENDPOINTS)} endpoints "
+         f"against {facts['verified_against']}"
+         + (" (--quick: partial sweep)" if a.quick else "") + "\n")
     if not a.quick:
         for name, reason in UNPROBEABLE.items():
-            print(f"  UNPROBEABLE  {name:22s} {reason}")
-        print()
+            _say(f"  UNPROBEABLE  {name:22s} {reason}")
+        _say()
 
     drift = check_internal_consistency(facts)   # offline, free, runs first
     c = Client(verbose=False)
     observed = {}
+    # A setup problem (bad key, no credits, outage, no network) exits 2, not
+    # 1: callers must be able to tell "fix your setup" from "the API moved".
     try:
         probe_failures = check_contracts(c, facts, endpoint_names, observed)
         if a.pricing:
             drift += check_pricing(c, facts)
-    except EnvironmentError as e:
-        # Setup/account problem, not a contract change. Exit 2 so callers and
-        # CI can tell "fix your key" apart from "the API moved" (exit 1).
-        print(f"\nCANNOT VERIFY — this is a setup problem, not API drift:\n  {e}\n"
-              f"\nNothing about the recorded facts has been called into question. "
-              f"Fix the above and re-run.", file=sys.stderr)
-        _LAST_SETUP_ERROR = str(e)
-        return 2
+    except OSError as e:                # DNS, refused connection, timeout
+        raise SetupError(f"network failure, verification was not completed: "
+                         f"{e}") from e
 
-    skipped_quick = len(ENDPOINTS) - len(endpoint_names) if a.quick else 0
     coverage = f"probed {len(endpoint_names)}/{len(ENDPOINTS)}"
     if a.quick:
-        coverage += f" · {skipped_quick} skipped by --quick"
+        coverage += f" · {len(ENDPOINTS) - len(endpoint_names)} skipped by --quick"
     else:
         coverage += (f" · {len(UNPROBEABLE)} unprobeable "
                      "(no discovery route)")
     coverage += f" · {len(probe_failures)} FAILING · spent ${c.spent_usd:.5f}"
-    print(f"\nCOVERAGE  {coverage}")
+    _say(f"\nCOVERAGE  {coverage}")
 
     drift += probe_failures
-
     if drift:
-        _LAST_DRIFT = drift
-        print(f"\nVERIFY FAILED — {len(drift)} check(s) failed:\n")
+        _say(f"\nVERIFY FAILED — {len(drift)} check(s) failed:\n")
         for name, kind, detail in drift:
-            print(f"  {name}: {kind} — {detail}")
-        print("\nThe probeable read surface is not fully healthy. Investigate each\n"
-              "failure before trusting downstream results; update recorded facts\n"
-              "only when the live contract, rather than the client, actually moved.")
+            _say(f"  {name}: {kind} — {detail}")
+        # Name every failed check in the JSON itself; stderr is not something
+        # a caller parsing stdout ever sees.
+        emit(error("runtime", f"{coverage}; drift: " + "; ".join(
+            f"{name}: {kind} — {detail}" for name, kind, detail in drift),
+            "verify.py",
+            "Investigate each failure before trusting downstream results; update "
+            "facts.json only when the live contract, not the client, moved"))
         return 1
 
-    if a.quick:
-        print(f"\nQuick sweep passed for {len(endpoint_names)}/{len(ENDPOINTS)} "
-              "endpoints; run without --quick for the full probeable surface.")
-    else:
-        print("\nAll probed endpoint contracts passed; endpoints marked "
-              "UNPROBEABLE were not tested.")
     if a.update:
         facts["verified_at"] = time.strftime("%Y-%m-%d")
         for name, obs in observed.items():
@@ -433,60 +423,21 @@ def _legacy_main(argv=None):
         with open(FACTS, "w") as f:
             json.dump(facts, f, indent=2)
             f.write("\n")
-        print(f"facts.json re-stamped {facts['verified_at']}")
-    elif age is not None and age >= facts.get("staleness_warn_days", 90):
-        print(f"NOTE: the stamp is {age} days old. Re-run with --update to refresh it.")
+        _say(f"facts.json re-stamped {facts['verified_at']}")
+    help_lines = (["Run `verify.py` without --quick for the full probeable surface"]
+                  if a.quick else
+                  ["Endpoints marked UNPROBEABLE on stderr were not tested"])
+    if not a.update and age is not None and age >= facts.get("staleness_warn_days", 90):
+        help_lines.append(f"The facts stamp is {age} days old; run "
+                          "`verify.py --pricing --update` to refresh it")
+    emit(success("verify.py", {"verification": "passed", "summary": coverage,
+                               "help": help_lines}))
     return 0
-
-
-def _axi_main(argv=None):
-    from axi import emit, error, fast_version, success
-    if fast_version(argv):
-        return 0
-    progress = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(progress):
-            rc = _legacy_main(argv)
-    except SystemExit:
-        # argparse --help and ArgumentParser.error write their output to the
-        # redirected stdout and then raise SystemExit, which skipped every
-        # line below — measured: `--help` answered with exit 0 and 0 bytes on
-        # both streams, and a typo'd flag exited 2 with its structured usage
-        # JSON silently discarded. Flush the captured text to the REAL stdout
-        # (it is agent-facing content, not progress) and let the exit code
-        # pass through run_cli untouched.
-        sys.stdout.write(progress.getvalue())
-        sys.stdout.flush()
-        raise
-    rendered = progress.getvalue()
-    if rendered:
-        print(rendered, file=sys.stderr, end="")
-    lines = [line.strip() for line in rendered.splitlines() if line.strip()]
-    coverage = next((line for line in lines if line.startswith("COVERAGE")), None)
-    if rc == 2 and _LAST_SETUP_ERROR:
-        detail = _LAST_SETUP_ERROR
-    elif rc == 1 and _LAST_DRIFT:
-        # Name every failed check in the JSON itself; the per-line detail on
-        # stderr is not something a caller parsing stdout ever sees.
-        detail = (f"{coverage}; " if coverage else "") + "drift: " + "; ".join(
-            f"{name}: {kind} — {info}" for name, kind, info in _LAST_DRIFT)
-    else:
-        detail = coverage or (lines[-1] if lines else "verification produced no summary")
-    if rc == 0:
-        emit(success("verify.py", {"verification": "passed", "summary": detail,
-                                   "help": ["Run `verify.py --quick` for a lower-cost smoke sweep"]}))
-    else:
-        kind = "setup" if rc == 2 else "runtime"
-        hint = ("Set `TWITTERAPI_IO_KEY` in the environment and rerun"
-                if _LAST_SETUP_ERROR and "TWITTERAPI_IO_KEY" in _LAST_SETUP_ERROR else
-                "Inspect stderr diagnostics, fix the reported condition, and rerun `verify.py`")
-        emit(error(kind, detail, "verify.py", hint))
-    return rc
 
 
 def main(argv=None):
     from axi import run_cli
-    return run_cli("verify.py", _axi_main, argv)
+    return run_cli("verify.py", _main, argv)
 
 
 if __name__ == "__main__":
