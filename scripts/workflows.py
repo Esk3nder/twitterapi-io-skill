@@ -766,7 +766,7 @@ def _main(argv=None):
     p = _parser()
     args = p.parse_args(argv)
     if args.cmd == "history" and not (args.user or args.query):
-        p.error("history needs a USER or --query")
+        raise UsageError("history needs a USER or --query")
     parse_fields(args.fields,
                  ACCOUNT_FIELDS if args.cmd == "audience" else TWEET_FIELDS,
                  f"workflows.py {args.cmd}")
@@ -834,7 +834,7 @@ def _parser():
 
 
 def main(argv=None):
-    return run_cli("workflows.py", _main, argv, parser=_parser, dest="cmd")
+    return run_cli("workflows.py", _main, argv, parser=_parser, dests=("cmd",))
 
 
 if __name__ == "__main__":

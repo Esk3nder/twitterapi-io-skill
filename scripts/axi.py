@@ -99,33 +99,37 @@ def classify(exc, command: str):
             f"Rerun `{command} --help`; if the failure persists, report this error")
 
 
-def subcommand(parser, args, dest):
-    """The subcommand the parser reads from `args`, or None. Uses only the
-    public parse_known_args. Only called after the command's own parse
-    succeeded, so a parse error here is a no-op: stderr is silenced and the
-    command name is left as it is."""
+def subcommand(parser, args, dests):
+    """The command path the parser reads from `args`, e.g. "rules add", or
+    None. `dests` names each subparser level's attribute, outermost first.
+    Uses only the public parse_known_args. Called from the error path, so a
+    parse error here is silenced: the parser's own error() writes to stdout,
+    and that must not add a second JSON line."""
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
             namespace, _ = parser.parse_known_args(args)
     except SystemExit:
         return None
-    return getattr(namespace, dest, None)
+    return " ".join(str(part) for part in
+                    (getattr(namespace, dest, None) for dest in dests)
+                    if part) or None
 
 
-def run_cli(command: str, function, argv=None, parser=None, dest=None) -> int:
+def run_cli(command: str, function, argv=None, parser=None, dests=()) -> int:
     """The one structured-output boundary for every CLI: any exception that
     escapes a command becomes a single-line JSON error with its contract exit
     code. A streaming command may already have printed JSON Lines records, so
     the error is one line. An exception carrying `spend` reports it.
 
-    `parser` builds the CLI's parser and `dest` names the attribute that holds
-    its subcommand; a CLI with subcommands passes both so the error names the
-    subcommand."""
+    `parser` builds the CLI's parser and `dests` names the attribute at each
+    subcommand level; a CLI with subcommands passes both so the error names
+    the subcommand path."""
     args = list(sys.argv[1:] if argv is None else argv)
     try:
         return function(argv)
     except Exception as exc:
-        name = parser and dest and subcommand(parser(), args, dest)
+        name = parser and dests and subcommand(parser(), args, dests)
         if name:
             command = f"{command} {name}"
         kind, code, help_line = classify(exc, command)
@@ -267,7 +271,9 @@ class ArgumentParser(argparse.ArgumentParser):
         # argparse calls this on the parser that failed, so `self` is the
         # subcommand's parser when the subcommand's own arguments are wrong.
         if "unrecognized arguments:" in message:
-            token = message.split("unrecognized arguments:", 1)[1].strip().split()[0]
+            # An empty argument ("") has no token to name.
+            tokens = message.split("unrecognized arguments:", 1)[1].split()
+            token = tokens[0] if tokens else "(empty)"
             message = f"unknown flag {token}" if token.startswith("-") else \
                 f"unknown argument {token}"
         # format_usage() is argparse's public usage line; it lists this
