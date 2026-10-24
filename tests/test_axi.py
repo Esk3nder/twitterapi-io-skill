@@ -78,7 +78,8 @@ class TestExitContract(unittest.TestCase):
             output = io.StringIO()
             with self.subTest(kind=kind, exc=type(exc).__name__), \
                     contextlib.redirect_stdout(output):
-                rc = axi.run_cli("tool.py", fail, ["sub"], parser=self._parser)
+                rc = axi.run_cli("tool.py", fail, ["sub"], parser=self._parser,
+                                    dest="cmd")
             self.assertEqual(rc, code)
             self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
             body = json.loads(output.getvalue())
@@ -106,7 +107,8 @@ class TestExitContract(unittest.TestCase):
         for argv, command in cases.items():
             output = io.StringIO()
             with self.subTest(argv=argv), contextlib.redirect_stdout(output):
-                axi.run_cli("tool.py", fail, list(argv), parser=self._parser)
+                axi.run_cli("tool.py", fail, list(argv), parser=self._parser,
+                            dest="cmd")
             self.assertEqual(json.loads(output.getvalue())["error"]["command"],
                              command)
 

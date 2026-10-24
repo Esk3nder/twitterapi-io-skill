@@ -7,6 +7,8 @@ text previews, completeness, structured usage errors, and home views.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import sys
@@ -97,34 +99,33 @@ def classify(exc, command: str):
             f"Rerun `{command} --help`; if the failure persists, report this error")
 
 
-def subcommand(parser, args):
-    """The first positional argument the parser would read: the subcommand.
-    Values of the parser's own options are skipped, so `--max-usd 5 brief`
-    names `brief`, not `5`."""
-    options = parser._option_string_actions
-    args = iter(args)
-    for arg in args:
-        if not arg.startswith("-"):
-            return arg
-        action = options.get(arg)
-        if action is not None and action.nargs != 0:
-            next(args, None)
-    return None
+def subcommand(parser, args, dest):
+    """The subcommand the parser reads from `args`, or None. Uses only the
+    public parse_known_args. Only called after the command's own parse
+    succeeded, so a parse error here is a no-op: stderr is silenced and the
+    command name is left as it is."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            namespace, _ = parser.parse_known_args(args)
+    except SystemExit:
+        return None
+    return getattr(namespace, dest, None)
 
 
-def run_cli(command: str, function, argv=None, parser=None) -> int:
+def run_cli(command: str, function, argv=None, parser=None, dest=None) -> int:
     """The one structured-output boundary for every CLI: any exception that
     escapes a command becomes a single-line JSON error with its contract exit
     code. A streaming command may already have printed JSON Lines records, so
     the error is one line. An exception carrying `spend` reports it.
 
-    `parser` builds the CLI's parser; a CLI with subcommands passes it so the
-    error names the subcommand."""
+    `parser` builds the CLI's parser and `dest` names the attribute that holds
+    its subcommand; a CLI with subcommands passes both so the error names the
+    subcommand."""
     args = list(sys.argv[1:] if argv is None else argv)
     try:
         return function(argv)
     except Exception as exc:
-        name = parser and subcommand(parser(), args)
+        name = parser and dest and subcommand(parser(), args, dest)
         if name:
             command = f"{command} {name}"
         kind, code, help_line = classify(exc, command)

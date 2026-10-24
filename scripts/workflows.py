@@ -834,7 +834,7 @@ def _parser():
 
 
 def main(argv=None):
-    return run_cli("workflows.py", _main, argv, parser=_parser)
+    return run_cli("workflows.py", _main, argv, parser=_parser, dest="cmd")
 
 
 if __name__ == "__main__":

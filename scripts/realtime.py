@@ -568,7 +568,7 @@ def _stream_cli(c, a):
 
 
 def main(argv=None):
-    return run_cli("realtime.py", _main, argv, parser=_parser)
+    return run_cli("realtime.py", _main, argv, parser=_parser, dest="cmd")
 
 
 if __name__ == "__main__":
