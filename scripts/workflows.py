@@ -850,6 +850,11 @@ def _print_tweet(t):
 def _monitor_cli(a):
     users = _monitor_params(a.users, a.interval, a.lookback, a.overlap)
     c, _ = _cli_session(a)
+    with c.store:
+        return _monitor_run(a, c, users)
+
+
+def _monitor_run(a, c, users):
     print(f"monitoring {users} every {a.interval}s "
           f"(~${credits_to_usd(15) * (86400 / a.interval):.2f}/day at minimum billing)",
           file=sys.stderr)
