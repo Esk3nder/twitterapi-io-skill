@@ -7,13 +7,15 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from unittest import mock
 
-from tests.e2e_base import SCRIPTS  # noqa: F401  (adds scripts/ to sys.path)
-
 import verify
-from twitterapi import APIError, ENDPOINTS
+from twitterapi import ENDPOINTS, APIError
+
+from tests.e2e_base import SCRIPTS
 
 
 class FakeClient:
@@ -37,7 +39,7 @@ class FakeClient:
         return result
 
     def _charge(self, name, records_in_page, page_size):
-        from twitterapi import Client, MIN_REQUEST_CREDITS
+        from twitterapi import MIN_REQUEST_CREDITS, Client
         self.spent_credits += max(
             0.0,
             Client.page_credits(name, records_in_page, page_size)
@@ -290,6 +292,59 @@ class TestVerifyExitContract(unittest.TestCase):
         error = json.loads(out.getvalue())["error"]
         self.assertEqual(error["type"], "setup")
         self.assertIn("DNS unavailable", error["message"])
+
+
+
+class TestLastCheckedStamp(unittest.TestCase):
+    """D8: the stale-facts notice printed on every run although the facts
+    were being re-checked; a passing full sweep now records its date."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stamp = os.path.join(self.tmp.name, "cache", "contracts-checked")
+
+    def _sweep(self, argv, drift=()):
+        with mock.patch.dict(os.environ, {"TWITTERAPI_IO_KEY": "x"}), \
+                mock.patch.object(verify, "Client", lambda **kw: FakeClient({})), \
+                mock.patch.object(verify, "check_contracts", lambda *a: list(drift)), \
+                mock.patch.object(verify, "check_internal_consistency", lambda f: []), \
+                mock.patch.object(verify.twitterapi, "CHECKED_PATH", self.stamp), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return verify.main(argv)
+
+    def test_only_a_passing_full_sweep_records_its_date(self):
+        self.assertEqual(self._sweep(["--quick"]), 0)
+        self.assertFalse(os.path.exists(self.stamp), "a sample is not a full check")
+        self.assertEqual(self._sweep([], drift=[("followers", "changed", "+x")]), 1)
+        self.assertFalse(os.path.exists(self.stamp), "a failed sweep proves nothing")
+        self.assertEqual(self._sweep([]), 0)
+        with open(self.stamp) as f:
+            self.assertEqual(f.read(), time.strftime("%Y-%m-%d"))
+
+    def _notice(self, facts_date, stamp_date=None):
+        import twitterapi
+        facts = os.path.join(self.tmp.name, "facts.json")
+        with open(facts, "w") as f:
+            json.dump({"verified_at": facts_date, "staleness_warn_days": 90}, f)
+        if stamp_date:
+            os.makedirs(os.path.dirname(self.stamp), exist_ok=True)
+            with open(self.stamp, "w") as f:
+                f.write(stamp_date)
+        err = io.StringIO()
+        with mock.patch.object(twitterapi, "_FACTS_PATH", facts), \
+                mock.patch.object(twitterapi, "CHECKED_PATH", self.stamp), \
+                mock.patch.object(twitterapi, "_stale_warned", False), \
+                contextlib.redirect_stderr(err):
+            twitterapi.Client(api_key="test", verbose=False)
+        return err.getvalue()
+
+    def test_the_notice_follows_the_later_of_the_two_dates(self):
+        today = time.strftime("%Y-%m-%d")
+        self.assertIn("last verified", self._notice("2020-01-01"))
+        self.assertEqual(self._notice("2020-01-01", stamp_date=today), "")
+        self.assertIn("last verified", self._notice("2020-01-01", stamp_date="2020-06-01"))
 
 
 if __name__ == "__main__":

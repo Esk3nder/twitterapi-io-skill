@@ -10,9 +10,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import SCRIPTS  # noqa: F401
-
 import axi
+
+from tests.e2e_base import SCRIPTS
 
 
 class TestJsonBoundary(unittest.TestCase):
@@ -63,8 +63,7 @@ class TestExitContract(unittest.TestCase):
     or internal. Every failure is ONE JSON line on stdout with a help line."""
 
     def test_every_failure_kind_maps_to_its_type_and_exit_code(self):
-        from twitterapi import (APIError, CostLimitExceeded,
-                                IncompleteDataError, SetupError)
+        from twitterapi import APIError, CostLimitExceeded, IncompleteDataError, SetupError
         cases = [(SetupError("no key"), "setup", 2),
                  (axi.UsageError("bad flag"), "usage", 2),
                  (CostLimitExceeded("over ceiling"), "refusal", 2),
@@ -199,9 +198,8 @@ class TestArgumentParser(unittest.TestCase):
         parser = axi.ArgumentParser(prog="tool")
         parser.add_argument("--state")
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            with self.assertRaises(SystemExit) as cm:
-                parser.parse_args(["--stat", "closed"])
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as cm:
+            parser.parse_args(["--stat", "closed"])
         self.assertEqual(cm.exception.code, 2)
         self.assertEqual(output.getvalue().count("\n"), 1, "one JSON line")
         body = json.loads(output.getvalue())
@@ -304,7 +302,7 @@ class TestJobsPresentation(unittest.TestCase):
 
         self.assertEqual(body["top_tweets_count"], "15 of 16 total")
         self.assertEqual(set(body["top_tweets"][0]),
-                         {"id", "created_at", "likes", "text"})
+                         {"id", "handle", "created_at", "likes", "views", "text"})
         self.assertTrue(body["top_tweets"][0]["text"].endswith(
             "... (truncated, 900 chars total)"))
         self.assertTrue(any("--full" in hint for hint in body["help"]))
@@ -314,7 +312,7 @@ class TestJobsPresentation(unittest.TestCase):
         from store import Store
 
         # drift is a local job now: it reads saved versions from the store
-        # and needs no Client (contract change, see test_07_review_jobs).
+        # and needs no Client (contract change, see test_07_jobs).
         path = os.path.join(tempfile.mkdtemp(prefix="axi-drift-"), "s.db")
         with Store(path) as store:
             store.save_cohort("scene", [(str(i), f"old{i}", 1.0, "t")
@@ -327,6 +325,51 @@ class TestJobsPresentation(unittest.TestCase):
         self.assertEqual(body["joined_total"], 75)
         self.assertEqual(len(body["left"]), 60)
         self.assertEqual(body["left_total"], 70)
+
+
+
+class TestStoppedFromOutside(unittest.TestCase):
+    """D2: a timeout, Ctrl-C or SIGTERM skipped the JSON boundary entirely."""
+
+    def _run(self, function):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = axi.run_cli("tool.py", function, [])
+        return rc, output.getvalue()
+
+    def test_an_unhandled_interrupt_is_one_json_error_line(self):
+        def interrupted(_argv):
+            raise KeyboardInterrupt
+        rc, out = self._run(interrupted)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.count("\n"), 1, "one JSON line")
+        self.assertIn("stopped", json.loads(out)["error"]["message"])
+
+    def test_sigterm_stops_a_command_the_way_ctrl_c_does(self):
+        import signal
+        import time
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        reached = []
+
+        def killed(_argv):
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)
+            reached.append("survived")      # only if the signal was ignored
+        rc, out = self._run(killed)
+        self.assertEqual((rc, reached), (1, []))
+        self.assertEqual(json.loads(out)["error"]["type"], "runtime")
+
+
+class TestSchemalessCollections(unittest.TestCase):
+    def test_fields_apply_to_the_collection_that_has_them_only(self):
+        payload = {"top_tweets": [{"id": "1", "text": "t", "likes": 2}],
+                   "top_authors": [{"handle": "a", "likes": 2}]}
+        out = axi.prepare_output(
+            payload, command="jobs.py narrative <target>", fields="id",
+            collections={"top_tweets": axi.TWEET_FIELDS, "top_authors": {}})
+        self.assertEqual(out["top_tweets"], [{"id": "1"}])
+        self.assertEqual(out["top_authors"], [{"handle": "a", "likes": 2}])
+        self.assertEqual(out["top_authors_count"], "1 of 1 total")
 
 
 if __name__ == "__main__":

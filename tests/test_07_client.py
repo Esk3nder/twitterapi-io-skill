@@ -51,7 +51,7 @@ class TestBudgetReservation(E2ETest):
         c = ScriptedClient(raw=[page], max_usd=0.00015)
 
         with self.assertRaises(CostLimitExceeded):
-            list(c.paginate("search", "from:alpha", page_size=1, limit=1))
+            list(c.paginate("mentions", "alpha", page_size=1, limit=1))
         self.assertEqual(c.raw_calls, [], "refusal must precede transport")
         self.assertEqual(c.spent_credits, 0.0)
 
@@ -71,13 +71,13 @@ class TestBudgetReservation(E2ETest):
 
         def search(query):
             try:
-                outcomes.append(len(list(c.paginate("search", query))))
+                outcomes.append(len(list(c.paginate("mentions", query))))
             except CostLimitExceeded:
                 outcomes.append("refused")
 
         with mock.patch("urllib.request.urlopen", fake_urlopen):
             threads = [threading.Thread(target=search, args=(q,))
-                       for q in ("from:alpha", "from:beta")]
+                       for q in ("alpha", "beta")]
             for t in threads:
                 t.start()
             for t in threads:
@@ -104,9 +104,8 @@ class TestBudgetReservation(E2ETest):
             return reply
 
         with mock.patch("urllib.request.urlopen", fake_urlopen), \
-                mock.patch("twitterapi.time.sleep"):
-            with self.assertRaises(CostLimitExceeded) as cm:
-                list(c.paginate("search", "from:alpha"))
+                mock.patch("twitterapi.time.sleep"), self.assertRaises(CostLimitExceeded) as cm:
+            list(c.paginate("mentions", "alpha"))
 
         self.assertEqual(len(calls), 1, "the retry must not be sent")
         self.assertIsInstance(cm.exception.__cause__, TimeoutError)
@@ -116,6 +115,7 @@ class TestBudgetReservation(E2ETest):
     def test_http_error_releases_the_reservation_to_the_floor(self):
         """#3 boundary: an answered error bills the floor, not a page."""
         import urllib.error
+
         from twitterapi import APIError
         c = _live_client(max_usd=1.0)
         responses = []
@@ -127,7 +127,7 @@ class TestBudgetReservation(E2ETest):
 
         with mock.patch("urllib.request.urlopen", fake_urlopen):
             with self.assertRaises(APIError):
-                list(c.paginate("search", "from:alpha"))
+                list(c.paginate("mentions", "alpha"))
         self.assertEqual(c.spent_credits, 15.0)
         # `responses` keeps each error alive, so only the client can have
         # closed it; garbage collection would hide a leaked socket.
@@ -158,12 +158,12 @@ class TestPaginationMetadata(E2ETest):
         first = {"tweets": [tweet("1", 104)], "next_cursor": "c2"}
         c = ScriptedClient(raw=[first])
         with self.assertRaises(IncompleteDataError):
-            list(c.paginate("search", "from:alpha"))
+            list(c.paginate("mentions", "alpha"))
 
         later = [_page([tweet("1", 104)], has_next=True, cursor="c2"),
                  {"tweets": [tweet("2", 103)], "next_cursor": "c3"}]
         c = ScriptedClient(raw=later)
-        stream = c.paginate("search", "from:alpha")
+        stream = c.paginate("mentions", "alpha")
         with contextlib.redirect_stderr(io.StringIO()):
             got = list(stream)
         self.assertEqual(len(got), 1, "only rows from readable pages are kept")
@@ -173,13 +173,13 @@ class TestPaginationMetadata(E2ETest):
         """#9: "first N" must be distinguishable from "the whole population"."""
         c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(3)],
                                        has_next=True, cursor="c2")])
-        stream = c.paginate("search", "from:alpha", limit=2)
+        stream = c.paginate("mentions", "alpha", limit=2)
         self.assertEqual(len(list(stream)), 2)
         self.assertTrue(stream.complete)
         self.assertTrue(stream.truncated_by_limit)
 
         c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(2)])])
-        stream = c.paginate("search", "from:alpha", limit=2)
+        stream = c.paginate("mentions", "alpha", limit=2)
         self.assertEqual(len(list(stream)), 2)
         self.assertFalse(stream.truncated_by_limit,
                          "an exact final page is the whole population")
@@ -187,7 +187,7 @@ class TestPaginationMetadata(E2ETest):
     def test_truncation_is_known_to_a_consumer_that_stops_at_n(self):
         """#9: the flag must not depend on resuming the generator past N."""
         c = ScriptedClient(raw=[_page([tweet(i, 200 - i) for i in range(3)])])
-        stream = c.paginate("search", "from:alpha", limit=2)
+        stream = c.paginate("mentions", "alpha", limit=2)
         it = iter(stream)
         next(it), next(it)
         self.assertTrue(stream.truncated_by_limit)
@@ -220,12 +220,12 @@ class TestSearchQueryRewrite(E2ETest):
                       "from:a min_faves:10 OR from:b",
                       "-(from:a min_faves:5)",
                       "(from:a min_faves:5 lang:en) OR from:b"):
-            with self.subTest(query=query):
-                with self.assertRaises(ValueError):
-                    prepare_search_query(query)
+            with self.subTest(query=query), self.assertRaises(ValueError):
+                prepare_search_query(query)
+        from workflows import search_window
         c = ScriptedClient(raw=[_page([])], max_usd=1.0)
         with self.assertRaises(ValueError):
-            list(c.paginate("search", "from:a min_faves:10 OR from:b min_faves:100"))
+            list(search_window(c, "from:a min_faves:10 OR from:b min_faves:100"))
         self.assertEqual(c.raw_calls, [])
 
     def test_top_level_conjunction_is_still_rewritten_exactly(self):
@@ -245,13 +245,6 @@ class TestProfileAbsence(E2ETest):
         c = ScriptedClient(raw=[{"data": None, "status": "success"}])
         with self.assertRaises(APIError):
             c.user_info("ghost")
-
-    def test_missing_follower_count_is_not_zero(self):
-        from twitterapi import IncompleteDataError
-        c = ScriptedClient(raw=[{"data": {"id": "1", "userName": "alice"},
-                                  "status": "success"}])
-        with self.assertRaises(IncompleteDataError):
-            c.follower_count("alice")
 
     def test_missing_relationship_is_unknown_not_unfollowed(self):
         """check_follow returned {} for a missing `data`, which reads as
@@ -477,6 +470,7 @@ class TestHydrateMatchesItsContract(E2ETest):
         a cohort profiled entirely from the local store still built a Client
         and failed without TWITTERAPI_IO_KEY."""
         import os
+
         from cohort import Cohort
         store = self.fresh_store("hydrate-no-client")
         store.put_accounts([
@@ -494,6 +488,129 @@ class TestHydrateMatchesItsContract(E2ETest):
         self.assertEqual(co.unhydrated, [])
 
 
+
+class TestTransportFailures(E2ETest):
+    """D6: a connection dropped while the body is read raises http.client
+    errors, not URLError. They were neither retried nor treated as a stop."""
+
+    @staticmethod
+    def _serve(replies, calls):
+        def fake_urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            reply = replies.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+        return fake_urlopen
+
+    def test_a_connection_dropped_mid_response_is_retried(self):
+        import http.client
+        for failure in (http.client.RemoteDisconnected("closed"),
+                        http.client.IncompleteRead(b"half"),
+                        ConnectionResetError("reset")):
+            with self.subTest(failure=type(failure).__name__):
+                c, calls = _live_client(max_usd=1.0), []
+                replies = [failure, _Response(_page([tweet(1, 1_700_000_000)]))]
+                with mock.patch("urllib.request.urlopen", self._serve(replies, calls)), \
+                        mock.patch("twitterapi.time.sleep"):
+                    got = list(c.paginate("mentions", "alpha"))
+                self.assertEqual(len(calls), 2, "one retry after the drop")
+                self.assertEqual(len(got), 1)
+
+    def test_a_drop_that_outlasts_the_retries_keeps_the_rows_already_bought(self):
+        import http.client
+        c, calls = _live_client(max_usd=1.0), []
+        replies = [_Response(_page([tweet(1, 1_700_000_000)], has_next=True, cursor="c1"))]
+        replies += [http.client.RemoteDisconnected("closed") for _ in range(5)]
+        with mock.patch("urllib.request.urlopen", self._serve(replies, calls)), \
+                mock.patch("twitterapi.time.sleep"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            stream = c.paginate("mentions", "alpha")
+            got = list(stream)
+        self.assertEqual([t["id"] for t in got], ["1"])
+        self.assertIs(stream.complete, False)
+        self.assertEqual(len(calls), 6)
+
+    def test_retry_after_is_honoured_and_capped(self):
+        import urllib.error
+        for asked, slept in (("7", 7.0), ("600", 60.0), ("soon", 1)):
+            with self.subTest(asked=asked):
+                c, calls = _live_client(max_usd=1.0), []
+                busy = urllib.error.HTTPError("u", 429, "slow", {"Retry-After": asked},
+                                              io.BytesIO(b"{}"))
+                replies = [busy, _Response(_page([]))]
+                with mock.patch("urllib.request.urlopen", self._serve(replies, calls)), \
+                        mock.patch("twitterapi.time.sleep") as sleep:
+                    list(c.paginate("mentions", "alpha"))
+                self.assertIn(mock.call(slept), sleep.call_args_list)
+
+
+class TestRateDiscipline(E2ETest):
+    @staticmethod
+    def _client():
+        from twitterapi import Client
+        return Client(api_key="test", verbose=False, max_usd=1.0)
+
+    def test_a_failed_balance_read_is_unknown_not_zero(self):
+        """D7: one failed read meant 0.2 requests a second for 500 requests."""
+        c, err = self._client(), io.StringIO()
+        with mock.patch.object(c, "balance", side_effect=OSError("down")), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(c.qps, 20, "no earlier rate: the ladder's top")
+        self.assertIn("balance read failed", err.getvalue())
+        c._qps, c._qps_checked_at = 6, -500
+        with mock.patch.object(c, "balance", side_effect=OSError("down")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(c.qps, 6, "the earlier rate is kept")
+
+    def test_a_rate_drop_is_reported_even_when_not_verbose(self):
+        c, err = self._client(), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with mock.patch.object(c, "balance", return_value=60_000):
+                self.assertEqual(c.qps, 20)
+            self.assertEqual(err.getvalue(), "", "the first rate is not news")
+            c._qps_checked_at = -500
+            with mock.patch.object(c, "balance", return_value=2_000):
+                self.assertEqual(c.qps, 3)
+        self.assertIn("-> 3 QPS", err.getvalue())
+
+    def test_the_throttle_does_not_sleep_holding_the_accounting_lock(self):
+        from twitterapi import Client
+        c = Client(api_key="test", verbose=False, max_usd=1.0, qps=1)
+        free_during_sleep = []
+
+        def sleep(_seconds):
+            free_during_sleep.append(c._lock.acquire(blocking=False))
+            c._lock.release()
+
+        with mock.patch("twitterapi.time.sleep", sleep):
+            c._throttle()
+            c._throttle()
+        self.assertEqual(free_during_sleep, [True])
+
+
+class TestPaidProfilesAndSpendAreKept(E2ETest):
+    def test_user_info_saves_the_profile_it_bought(self):
+        """D15: every looked-up profile was discarded."""
+        store = self.fresh_store("user-info-kept")
+        c = ScriptedClient(raw=[{"data": {"id": "7", "userName": "alpha",
+                                          "followers": 3}}], store=store)
+        c.user_info("alpha")
+        self.assertEqual(store.profiles()["7"]["followers"], 3)
+
+    def test_spend_is_in_the_store_before_the_process_reports(self):
+        """D24: a killed run left no record of what it spent."""
+        store = self.fresh_store("spend-ledger")
+        c = ScriptedClient(raw=[{"data": {"id": "7", "userName": "alpha"}},
+                                {"data": {"id": "8", "userName": "beta"}}], store=store)
+        c.user_info("alpha")
+        c.user_info("beta")
+        runs = store.stats()["recent_runs"]
+        self.assertEqual(len(runs), 1, "one row per process, updated in place")
+        self.assertEqual((runs[0]["requests"], runs[0]["usd"]), (2, 0.0004))
+        self.assertEqual(store.stats()["usd_spent_7d"], 0.0004)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -505,11 +622,11 @@ class TestSingleObjectEnvelopes(E2ETest):
     no pagination fields at all."""
 
     def test_single_object_endpoints_need_no_pagination_fields(self):
-        from twitterapi import Client, ENDPOINTS
+        from twitterapi import ENDPOINTS, Client
         single = [n for n, spec in ENDPOINTS.items() if spec["items"] is None]
         self.assertIn("user_info", single)
         for name in single:
-            items, has_next, cursor = Client._unpack(
+            _, has_next, cursor = Client._unpack(
                 {"data": {"id": "1"}, "status": "success", "msg": "success"},
                 ENDPOINTS[name])
             self.assertEqual((has_next, cursor), (False, ""), name)
@@ -517,21 +634,9 @@ class TestSingleObjectEnvelopes(E2ETest):
 
 class TestSearchPaginationAbsence(E2ETest):
     """Found by the diff review: _unpack refused a missing has_next_page, but
-    bulk_search and the search window walk still read it as "no more pages",
-    so a full first page with no pagination field made brief report a
-    complete 20-tweet window."""
-
-    def test_bulk_subresult_without_has_next_page_is_incomplete(self):
-        from twitterapi import IncompleteDataError
-        c = ScriptedClient(raw_json=[{"status": "success", "results": {
-            "query_0": {"tweets": [tweet(i, 1_700_000_000 - i) for i in range(20)]}}}])
-        with self.assertRaises(IncompleteDataError):
-            c.bulk_search(["from:alpha"])
-
-    def test_bulk_subresult_with_has_next_page_is_kept(self):
-        c = ScriptedClient(raw_json=[{"status": "success", "results": {
-            "query_0": {"tweets": [tweet(1, 1_700_000_000)], "has_next_page": False}}}])
-        self.assertFalse(c.bulk_search(["from:alpha"])[0]["has_next_page"])
+    the search window walk still read it as "no more pages", so a full first
+    page with no pagination field made brief report a complete 20-tweet
+    window."""
 
     def test_window_page_without_has_next_page_is_incomplete(self):
         from twitterapi import IncompleteDataError

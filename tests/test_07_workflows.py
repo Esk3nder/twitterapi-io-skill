@@ -13,8 +13,9 @@ import os
 import re
 import sys
 import tempfile
+import typing
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,7 @@ sys.path.insert(0, SCRIPTS)
 import realtime  # noqa: E402
 import workflows  # noqa: E402
 from twitterapi import APIError, IncompleteDataError  # noqa: E402
+
 from tests.fakes import ScriptedClient, client_class  # noqa: E402
 
 NOW = 1_800_000_000
@@ -32,7 +34,7 @@ FMT = "%a %b %d %H:%M:%S %z %Y"
 
 def tw(tweet_id, ts, handle="alpha", **extra):
     record = {"id": str(tweet_id),
-              "createdAt": datetime.fromtimestamp(ts, timezone.utc).strftime(FMT),
+              "createdAt": datetime.fromtimestamp(ts, UTC).strftime(FMT),
               "author": {"userName": handle}, "likeCount": 0, "text": "t"}
     record.update(extra)
     return record
@@ -58,6 +60,10 @@ class CliCase(unittest.TestCase):
                 raw=handler or self.no_request,
                 raw_json=json_handler or (lambda path, body: {"status": "success"}),
                 created=self.clients)))
+            # A fresh default store per test: cached pages must not carry
+            # one test's scripted responses into the next.
+            stack.enter_context(mock.patch.object(
+                module, "DEFAULT_DB", self.path("default-store.db"), create=True))
             stack.enter_context(contextlib.redirect_stdout(out))
             stack.enter_context(contextlib.redirect_stderr(err))
             rc = module.main(argv)
@@ -75,7 +81,7 @@ class CliCase(unittest.TestCase):
 class TestCeilingNotTightenedByLibraryDefault(CliCase):
     def test_history_cli_keeps_the_cli_ceiling(self):
         """`--max-usd 50` must not be clamped to the library's $5 default."""
-        rc, out, _ = self.run_cli(
+        rc, _, _ = self.run_cli(
             workflows, ["history", "alpha", "--max-usd", "50",
                         "--store", self.path("h.db")],
             lambda path, p: {"tweets": [tw(1, NOW)], "has_next_page": False})
@@ -227,7 +233,7 @@ class TestSinceCoverage(CliCase):
     gap is the ordinary case, not evidence of missing data."""
 
     def test_quiet_start_of_a_dated_window_is_not_partial(self):
-        oldest = int(datetime(2026, 3, 10, tzinfo=timezone.utc).timestamp())
+        oldest = int(datetime(2026, 3, 10, tzinfo=UTC).timestamp())
         rec = tw("only", oldest)
         rec["author"].update({"createdAt": "Mon Apr 06 16:54:47 +0000 2009",
                               "statusesCount": 20_000})
@@ -241,7 +247,7 @@ class TestSinceCoverage(CliCase):
         self.assertNotIn("index coverage: partial", err.lower())
 
     def test_open_ended_history_short_of_account_creation_is_partial(self):
-        oldest = int(datetime(2026, 3, 10, tzinfo=timezone.utc).timestamp())
+        oldest = int(datetime(2026, 3, 10, tzinfo=UTC).timestamp())
         rec = tw("only", oldest)
         rec["author"].update({"createdAt": "Mon Apr 06 16:54:47 +0000 2009",
                               "statusesCount": 20_000})
@@ -376,7 +382,9 @@ class TestRealtimeRules(CliCase):
         self.assertIn("may be billing", warning)
 
     def test_every_mutation_prints_the_active_rule_count(self):
-        rules = lambda path, p: {"rules": [dict(RULE, is_effect=1)]}
+        def rules(path, p):
+            return {"rules": [dict(RULE, is_effect=1)]}
+
         for argv in (["rules", "add", "--tag", "ai", "--value", "x", "--confirm"],
                      ["rules", "activate", "--rule-id", "r1", "--confirm"],
                      ["rules", "deactivate", "--rule-id", "r1", "--confirm"],
@@ -417,7 +425,7 @@ class TestRuleToggle(CliCase):
 
 # -------------------------------------------------------------- defect 12 --
 class FakeSocket:
-    script = []
+    script: typing.ClassVar[list] = []
 
     def __init__(self, *args, **kwargs):
         self.events = list(FakeSocket.script)
@@ -476,6 +484,128 @@ class TestRealtimeStream(CliCase):
         self.assertEqual(len(out.strip().splitlines()), len(rows))
         self.assertFalse(rows[-1]["complete"])
         self.assertEqual(rows[-1]["completeness"]["records_returned"], 1)
+
+
+
+class TestWorkflowsKeepWhatTheyBuy(CliCase):
+    """D5: audience and monitor built a Client with no store."""
+
+    @staticmethod
+    def handler(path, params):
+        if path == "/twitter/user/info":
+            return {"data": {"id": "42", "userName": "alpha", "followers": 2}}
+        if path == "/twitter/user/followers_ids":
+            return {"ids": ["1", "2"], "has_next_page": False}
+        raise AssertionError(path)
+
+    def test_audience_followers_reach_the_store_overlap_reads(self):
+        from store import Store
+        db = self.path("audience.db")
+        rc, out, _ = self.run_cli(workflows, ["audience", "alpha", "--store", db],
+                                  self.handler)
+        self.assertEqual(rc, 0, out)
+        with Store(db) as store:
+            cached = store.follower_ids_for("alpha")
+            self.assertEqual((list(cached), cached.complete), (["1", "2"], True))
+            self.assertEqual(store.profiles()["42"]["user_name"], "alpha")
+
+    def test_every_workflow_command_accepts_store_and_max_usd(self):
+        for command in ("audience", "history", "monitor"):
+            a = workflows._parser().parse_args(
+                [command, "alpha", "--store", "s.db", "--max-usd", "2"])
+            self.assertEqual((a.store, a.max_usd), ("s.db", 2.0))
+
+
+class TestMonitorQueryLength(CliCase):
+    def test_many_handles_become_several_bounded_queries(self):
+        """D22: one OR query for every handle had no length check."""
+        handles = [f"account_number_{i:03d}" for i in range(60)]
+        client = ScriptedClient(raw=lambda path, p: {
+            "tweets": [], "has_next_page": False}, max_usd=1)
+        with mock.patch.object(workflows.time, "time", return_value=NOW), \
+             contextlib.redirect_stderr(io.StringIO()):
+            workflows.monitor(handles, client=client, once=True,
+                              on_tweet=lambda t: None)
+        queries = [p["query"] for p in search_calls(client)]
+        self.assertGreater(len(queries), 1)
+        asked = [h for q in queries for h in re.findall(r"from:(\w+)", q)]
+        self.assertEqual(asked, handles, "each handle is asked for exactly once")
+        self.assertTrue(all(len(q.split(") since_time")[0]) <= workflows.MAX_QUERY_CHARS + 2
+                            for q in queries), queries)
+
+
+class TestShardedWalk(CliCase):
+    HOUR = 3600
+
+    def index(self, posts, fail_before=None):
+        def answer(path, params):
+            since = int(re.search(r"since_time:(\d+)", params["query"]).group(1))
+            until = int(re.search(r"until_time:(\d+)", params["query"]).group(1))
+            if fail_before is not None and until <= fail_before:
+                return {"tweets": [tw("drift", until - 1)]}     # no has_next_page
+            hits = sorted((p for p in posts if since <= p < until), reverse=True)
+            return {"tweets": [tw(f"t{p}", p) for p in hits[:20]],
+                    "has_next_page": len(hits) > 20}
+        return answer
+
+    def test_shards_cover_the_window_once_newest_first(self):
+        posts = [NOW - k * 600 for k in range(1, 6 * 16)]       # 16 hours, 10 min apart
+        c = ScriptedClient(raw=self.index(posts), max_usd=5)
+        with contextlib.redirect_stderr(io.StringIO()):
+            got = [t["id"] for t in workflows.search_shards(
+                c, "topic", NOW - 16 * self.HOUR, NOW)]
+        self.assertEqual(got, [f"t{p}" for p in posts if p >= NOW - 16 * self.HOUR])
+        windows = {tuple(re.findall(r"since_time:(\d+)", p["query"]))
+                   for p in search_calls(c)}
+        self.assertEqual(len(windows), 8)
+
+    def test_the_full_scan_warning_is_printed_once_not_once_per_shard(self):
+        c, err = ScriptedClient(raw=self.index([NOW - 5]), max_usd=5), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            list(workflows.search_shards(c, "topic min_faves:5",
+                                         NOW - 16 * self.HOUR, NOW))
+        self.assertEqual(err.getvalue().count("WARNING: min_faves:5"), 1)
+
+    def test_a_window_under_an_hour_per_shard_is_not_split(self):
+        c = ScriptedClient(raw=self.index([NOW - 5]), max_usd=5)
+        got = list(workflows.search_shards(c, "topic", NOW - 1800, NOW))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(len(search_calls(c)), 1)
+
+    def test_a_stop_in_one_shard_is_raised_after_every_shards_rows(self):
+        posts = [NOW - k * 600 for k in range(1, 6 * 16)]
+        c = ScriptedClient(raw=self.index(posts, fail_before=NOW - 14 * self.HOUR),
+                           max_usd=5)
+        got = []
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(IncompleteDataError):
+            for t in workflows.search_shards(c, "topic", NOW - 16 * self.HOUR, NOW):
+                got.append(t["id"])
+        healthy = [f"t{p}" for p in posts if p >= NOW - 14 * self.HOUR]
+        self.assertEqual(got[:len(healthy)], healthy)
+        self.assertIn("drift", got, "the failing shard's paid row is kept too")
+
+
+class TestAnchoredWalk(CliCase):
+    def test_an_unfinished_walk_gets_its_own_start_time_back(self):
+        from store import Store
+        with Store(self.path("anchor.db")) as store:
+            c = ScriptedClient(raw=[], store=store)
+            with mock.patch.object(workflows.time, "time", return_value=NOW):
+                first = workflows.anchored_now(c, "brief:alpha:7")
+            with mock.patch.object(workflows.time, "time", return_value=NOW + 900):
+                self.assertEqual(workflows.anchored_now(c, "brief:alpha:7"), first)
+                self.assertEqual(workflows.anchored_now(c, "brief:beta:7"), NOW + 900,
+                                 "another walk has its own clock")
+                workflows.finish_walk(c, "brief:alpha:7")
+                self.assertEqual(workflows.anchored_now(c, "brief:alpha:7"), NOW + 900,
+                                 "a finished walk starts from the present")
+
+    def test_without_a_store_now_is_now(self):
+        c = ScriptedClient(raw=[])
+        with mock.patch.object(workflows.time, "time", return_value=NOW):
+            self.assertEqual(workflows.anchored_now(c, "k"), NOW)
+        workflows.finish_walk(c, "k")
 
 
 if __name__ == "__main__":

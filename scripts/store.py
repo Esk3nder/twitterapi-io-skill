@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS cohorts (
 CREATE TABLE IF NOT EXISTS cohort_meta (
   name TEXT, version INTEGER, spec TEXT, created_at REAL, size INTEGER,
   PRIMARY KEY (name, version));
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY, command TEXT, started REAL, updated REAL,
+  requests INTEGER, credits REAL, start_balance INTEGER);
 """
 
 
@@ -117,7 +120,10 @@ def normalize_account(u: dict) -> dict:
     """
     if not isinstance(u, dict):
         return {}
-    g = lambda *ks: next((u[k] for k in ks if u.get(k) not in (None, "")), None)
+
+    def g(*ks):
+        return next((u[k] for k in ks if u.get(k) not in (None, "")), None)
+
     def optional_bool(*keys):
         values = [u[k] for k in keys if k in u and u[k] not in (None, "")]
         return None if not values else int(any(bool(value) for value in values))
@@ -519,6 +525,13 @@ class Store:
             return None
         return json.loads(r["body"])
 
+    def drop_pages(self, path, older_than):
+        """Delete this endpoint's cached pages older than `older_than` seconds."""
+        with self._wlock:
+            self.db.execute("DELETE FROM pages WHERE path=? AND fetched_at < ?",
+                            (path, time.time() - older_than))
+            self.db.commit()
+
     def page_age(self, path, params):
         """Seconds since this page was fetched, or None if absent.
 
@@ -558,6 +571,11 @@ class Store:
             raise ValueError("pass user_name or user_id")
         wanted_id = str(user_id) if user_id is not None else None
         wanted_name = handle_key(user_name) if user_name is not None else None
+        # Narrow in SQL first: parsing every account's pages to answer for
+        # one cost a full-table JSON decode per call. `_` in a handle is a
+        # LIKE wildcard, so the exact comparison below still decides.
+        needle = (f'%"userid": "{wanted_id}"%' if wanted_id is not None
+                  else f'%"username": "{wanted_name}"%')
         pages = []
         # Materialise under the lock: an unlocked cursor on the shared
         # connection, iterated while other threads used it, silently returned
@@ -565,8 +583,8 @@ class Store:
         with self._wlock:
             rows = self.db.execute(
                 "SELECT params, body, fetched_at FROM pages WHERE path=? "
-                "ORDER BY fetched_at, key",
-                ("/twitter/user/followers_ids",)).fetchall()
+                "AND lower(params) LIKE ? ORDER BY fetched_at, key",
+                ("/twitter/user/followers_ids", needle)).fetchall()
         for row in rows:
             try:
                 params = json.loads(row["params"] or "{}")
@@ -579,12 +597,12 @@ class Store:
             if not matches or not isinstance(body.get("ids"), list):
                 continue
             pages.append((not params.get("cursor"), body["ids"],
-                          bool(body.get("has_next_page"))))
+                          bool(body.get("has_next_page")), row["fetched_at"]))
         # Newest crawl = everything from the last cursorless start onward.
         # No start marker cached at all -> fall back to every page rather
         # than invent an empty answer for data the caller paid for — but that
         # union spans unknown generations, so it is never provably complete.
-        starts = [i for i, (is_start, _, _) in enumerate(pages) if is_start]
+        starts = [i for i, page in enumerate(pages) if page[0]]
         if not pages:
             # Nothing bought yet: unknown, not an empty follower set. No
             # warning — there is no partial data to warn about.
@@ -606,7 +624,7 @@ class Store:
                       "be distinguished; the union below is not provably "
                       "a single snapshot")
         seen, out = set(), []
-        for _, ids, _ in pages:
+        for _, ids, _, _ in pages:
             for account_id in ids:
                 account_id = str(account_id)
                 if account_id not in seen:
@@ -618,6 +636,7 @@ class Store:
         result = _FollowerIds(out)
         result.complete = complete
         result.reason = reason
+        result.fetched_at = pages[0][3] if pages else 0
         return result
 
     # -- records ----------------------------------------------------------
@@ -633,7 +652,10 @@ class Store:
                 rows.append((n["id"], n["user_name"], n["name"], n["description"],
                              n["followers"], n["following"], n["statuses"],
                              n["is_blue"], n["is_verified"], n["created_at"],
-                             n["location"], json.dumps(u), time.time()))
+                             # No raw copy: crawled profiles already sit in
+                             # `pages` and tweet authors in tweets.raw, and
+                             # nothing reads this column (it was 139 MB).
+                             n["location"], None, time.time()))
         if rows:
             with self._wlock:
                 # Never let a THIN record overwrite a richer one. Tweet-embedded
@@ -659,8 +681,6 @@ class Store:
                          is_verified = COALESCE(excluded.is_verified, is_verified),
                          created_at  = COALESCE(NULLIF(excluded.created_at,''), created_at),
                          location    = COALESCE(NULLIF(excluded.location,''), location),
-                         raw         = CASE WHEN LENGTH(excluded.raw) > LENGTH(raw)
-                                            THEN excluded.raw ELSE raw END,
                          seen_at     = excluded.seen_at""", rows)
                 self.db.commit()
         return len(rows)
@@ -683,7 +703,7 @@ class Store:
             if isinstance(t.get("author"), dict):
                 authors.append(t["author"])
         if parsed:
-            cols = TWEET_COLUMNS + ("raw", "seen_at")
+            cols = (*TWEET_COLUMNS, "raw", "seen_at")
             keep = ",\n".join(f"{c} = COALESCE(excluded.{c}, {c})"
                               for c in TWEET_COLUMNS if c != "id")
             sql = (f"INSERT INTO tweets ({', '.join(cols)}) "
@@ -708,9 +728,8 @@ class Store:
                     merged = {**stored.get(n["id"], {}), **t}
                     stored[n["id"]] = merged        # duplicates within a batch
                     media = None if n["media"] is None else json.dumps(n["media"])
-                    rows.append(tuple(media if c == "media" else n[c]
-                                      for c in TWEET_COLUMNS)
-                                + (json.dumps(merged), time.time()))
+                    rows.append((*(media if c == "media" else n[c] for c in TWEET_COLUMNS),
+                                 json.dumps(merged), time.time()))
                 db.executemany(sql, rows)
         if authors:
             # A tweet-embedded author object reports description="" even for
@@ -726,6 +745,54 @@ class Store:
                        if isinstance(a, dict) else a for a in authors]
             self.put_accounts(authors)      # takes _wlock itself; must be OUTSIDE
         return len(parsed)
+
+    def raw_tweets(self, ids):
+        """Stored wire records for these ids, in order, or None when any is
+        missing (the caller then fetches the page again)."""
+        if not ids:
+            return []
+        with self._wlock:
+            found = {r["id"]: r["raw"] for r in self.db.execute(
+                f"SELECT id, raw FROM tweets WHERE id IN ({','.join('?' * len(ids))})",
+                [str(i) for i in ids])}
+        if any(str(i) not in found for i in ids):
+            return None
+        return [json.loads(found[str(i)]) for i in ids]
+
+    def profiles(self):
+        """Stored accounts by id: only the fields cohort filtering reads."""
+        with self._wlock:
+            return {r["id"]: dict(r) for r in self.db.execute(
+                "SELECT id, user_name, name, description, followers, is_blue, "
+                "is_verified FROM accounts")}
+
+    # -- spend ledger -----------------------------------------------------
+    def record_run(self, run_id, requests, credits, start_balance=None):
+        """Upsert this process's spend after each paid request, so the record
+        survives a run that is killed before it can report."""
+        now = time.time()
+        command = " ".join([os.path.basename(sys.argv[0]), *sys.argv[1:]])[:300]
+        with self._wlock:
+            self.db.execute(
+                "INSERT INTO runs VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO "
+                "UPDATE SET updated=excluded.updated, requests=excluded.requests, "
+                "credits=excluded.credits, start_balance="
+                "COALESCE(start_balance, excluded.start_balance)",
+                (run_id, command, now, now, requests, credits, start_balance))
+            self.db.commit()
+
+    def compact(self):
+        """Drop the unread raw account copies and return the freed bytes."""
+        with self._wlock:
+            # Sizes are read from the main file, so pending write-ahead-log
+            # pages are folded in before each measurement.
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            before = os.path.getsize(self.path)
+            self.db.execute("UPDATE accounts SET raw=NULL WHERE raw IS NOT NULL")
+            self.db.commit()
+            self.db.execute("VACUUM")
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return before - os.path.getsize(self.path)
 
     # -- cohorts ----------------------------------------------------------
     @staticmethod
@@ -857,9 +924,11 @@ class Store:
             q += f" AND lower(author_name) IN ({','.join('?' * len(user_names))})"
             p += [u.lower().lstrip("@") for u in user_names]
         if since is not None:
-            q += " AND created_ts >= ?"; p.append(int(since))
+            q += " AND created_ts >= ?"
+            p.append(int(since))
         if until is not None:
-            q += " AND created_ts < ?"; p.append(int(until))
+            q += " AND created_ts < ?"
+            p.append(int(until))
         with self._wlock:               # see get_page: reads need it too
             records = self.db.execute(q + " ORDER BY created_ts DESC", p).fetchall()
         rows = []
@@ -877,10 +946,8 @@ class Store:
         """Close the sqlite connection. Optional in scripts (the OS reclaims it
         at exit) but required in tests and long-lived processes, which otherwise
         leak connections and emit ResourceWarning."""
-        try:
+        with contextlib.suppress(Exception):
             self.db.close()
-        except Exception:
-            pass
 
     def __enter__(self):
         return self
@@ -912,13 +979,23 @@ def table_stats(db):
                 if table in tables else 0)
     cached = (db.execute("SELECT COALESCE(SUM(credits),0) FROM pages").fetchone()[0]
               if "pages" in tables else 0)
+    runs = ([dict(zip(("command", "started", "requests", "usd"), row, strict=True))
+             for row in db.execute(
+                 "SELECT command, datetime(started,'unixepoch'), requests, "
+                 "round(credits/100000.0, 4) FROM runs ORDER BY started DESC LIMIT 5")]
+            if "runs" in tables else [])
+    spent_7d = (db.execute(
+        "SELECT COALESCE(SUM(credits),0) FROM runs WHERE started > ?",
+        (time.time() - 7 * 86400,)).fetchone()[0] if "runs" in tables else 0)
     return {"pages": count("pages"), "accounts": count("accounts"),
             "tweets": count("tweets"), "cohorts": count("cohort_meta"),
             "cohort_members": count("cohorts"),
             "db_bytes": (db.execute("PRAGMA page_count").fetchone()[0]
                          * db.execute("PRAGMA page_size").fetchone()[0]),
             "credits_cached": cached,
-            "usd_saved_on_rerun": round(cached / 100_000, 4)}
+            "usd_saved_on_rerun": round(cached / 100_000, 4),
+            "usd_spent_7d": round(spent_7d / 100_000, 4),
+            "recent_runs": runs}
 
 
 def main(argv=None):
@@ -927,14 +1004,19 @@ def main(argv=None):
 
 
 def _main(argv=None):
-    from axi import (ArgumentParser, dashboard, emit, fast_version,
-                     parse_fields, prepare_output)
+    from axi import ArgumentParser, dashboard, emit, fast_version, parse_fields, prepare_output
     if fast_version(argv):
         return 0
     p = ArgumentParser(description="Inspect the local twitterapi.io cache and cohorts")
     p.add_argument("--store", help="SQLite store path")
     p.add_argument("--fields", help="cohort fields: name,version,size,created_at")
+    p.add_argument("--compact", action="store_true",
+                   help="drop unread raw account copies and reclaim the space")
     args = p.parse_args(argv)
+    if args.compact:
+        with (Store(args.store) if args.store else Store()) as store:
+            emit({"command": "store.py --compact", "freed_bytes": store.compact()})
+        return 0
     if args.fields:
         schema = {field: (field,) for field in ("name", "version", "size", "created_at")}
         parse_fields(args.fields, schema, "store.py")

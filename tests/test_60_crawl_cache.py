@@ -10,6 +10,7 @@ The most expensive tier (~$0.055), so it runs last.
     the data.tweets-with-ROOT-pagination trap is handled (mis-reading
     pagination from inside `data` would stop at 20 and look successful).
 """
+import contextlib
 import sqlite3
 import unittest
 
@@ -44,7 +45,7 @@ class TestFollowerCrawlAndCache(E2ETest):
 
     def test_10k_ids_two_pages_accounting_then_cache_replay(self):
         require_key()
-        from twitterapi import Client, ENDPOINTS
+        from twitterapi import ENDPOINTS, Client
         db_path = self.store_path("jack_crawl")
         store = self.fresh_store("jack_crawl")
 
@@ -70,9 +71,10 @@ class TestFollowerCrawlAndCache(E2ETest):
         self.assertEqual(c1.spent_credits, 4500.0,
                          "2 pages x 5000 ids x 0.45cr = 4500 (the measured table)")
         path = ENDPOINTS["follower_ids"]["path"]
-        rows = sqlite3.connect(db_path).execute(
-            "SELECT COUNT(*), COALESCE(SUM(credits),0) FROM pages WHERE path=?",
-            (path,)).fetchone()
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(credits),0) FROM pages WHERE path=?",
+                (path,)).fetchone()
         self.log(f"store: {rows[0]} cached pages, {rows[1]} credits recorded")
         self.assertEqual(rows[0], 2, "both pages must be cached")
         self.assertEqual(rows[1], 4500.0, "store must record what each page cost")

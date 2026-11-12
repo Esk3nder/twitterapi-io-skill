@@ -7,6 +7,9 @@ drift, and store write concurrency. Cohort/Client construction needs the API
 key in the environment but performs no HTTP here.
 """
 import concurrent.futures
+import contextlib
+import io
+import re
 import threading
 import time
 import unittest
@@ -14,20 +17,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import E2ETest, SKILL
+from tests.e2e_base import SKILL, E2ETest
 
 
 class TestCostTable(E2ETest):
     """Client.credits_for is pure math — assert the measured table exactly."""
 
     def test_cost_identities(self):
-        from twitterapi import Client, MIN_REQUEST_CREDITS
+        from twitterapi import MIN_REQUEST_CREDITS
         self.repro("python3 -c \"from twitterapi import Client; "
                    "print(Client.credits_for('follower_ids', 5000))\"")
         cases = [
             # (endpoint, n_records, page_size, expected_credits, why)
             ("follower_ids", 5000, None, 2250.0, "one full ids page @0.45/rec"),
-            ("follower_ids", 3000, None, 2250.0, "whole-page billing: partial pages cannot be bought"),
+            ("follower_ids", 3000, None, 2250.0, "partial pages cannot be bought"),
             ("follower_ids", 10000, None, 4500.0, "two full ids pages"),
             ("followers", 201, 200, 400.0, "201 profiles @200/page = 2 pages x 200cr"),
             ("follower_ids", 0, None, MIN_REQUEST_CREDITS, "empty request bills the 15cr floor"),
@@ -61,7 +64,8 @@ class TestCostTable(E2ETest):
             self.assertEqual(c.qps, 5)
 
     def test_estimate_conversion(self):
-        from twitterapi import Client as C, credits_to_usd
+        from twitterapi import Client as C
+        from twitterapi import credits_to_usd
         self.assertAlmostEqual(credits_to_usd(C.credits_for("follower_ids", 200_000_000)),
                                900.0, places=6,
                                msg="200M ids must estimate $900 (verified-facts worked example)")
@@ -72,7 +76,7 @@ class TestEnvelopeUnpack(E2ETest):
     The live-envelope key sets are asserted separately in test_20."""
 
     def test_data_wrapped_with_root_pagination(self):
-        from twitterapi import Client, ENDPOINTS
+        from twitterapi import ENDPOINTS, Client
         resp = {"code": 0, "data": {"tweets": [{"id": "1"}, {"id": "2"}], "pin_tweet": None},
                 "has_next_page": True, "next_cursor": "abc", "msg": "success", "status": "success"}
         items, has_next, cur = Client._unpack(resp, ENDPOINTS["last_tweets"])
@@ -88,7 +92,7 @@ class TestEnvelopeUnpack(E2ETest):
         pages exist is unknown. Reading that as False marked cut-short walks
         complete, so it is now IncompleteDataError — still never the nested
         value."""
-        from twitterapi import Client, ENDPOINTS, IncompleteDataError
+        from twitterapi import ENDPOINTS, Client, IncompleteDataError
         resp = {"data": {"tweets": [{"id": "1"}], "has_next_page": True,
                          "next_cursor": "WRONG"}}
         with self.assertRaises(IncompleteDataError):
@@ -100,16 +104,16 @@ class TestEnvelopeUnpack(E2ETest):
         self.assertEqual(cur, "")
 
     def test_flat_root_envelope(self):
-        from twitterapi import Client, ENDPOINTS
+        from twitterapi import ENDPOINTS, Client
         resp = {"code": 0, "ids": ["9", "8"], "has_next_page": False,
                 "next_cursor": "", "msg": "success", "status": "success"}
-        items, has_next, cur = Client._unpack(resp, ENDPOINTS["follower_ids"])
+        items, has_next, _ = Client._unpack(resp, ENDPOINTS["follower_ids"])
         self.assertEqual(items, ["9", "8"])
         self.assertFalse(has_next)
 
     def test_missing_items_key_is_incomplete_not_empty(self):
         """An omitted required array is contract drift, not proof of zero rows."""
-        from twitterapi import Client, ENDPOINTS, IncompleteDataError
+        from twitterapi import ENDPOINTS, Client, IncompleteDataError
         with self.assertRaises(IncompleteDataError):
             Client._unpack({"status": "success"}, ENDPOINTS["search"])
 
@@ -145,7 +149,7 @@ class TestNormalisers(E2ETest):
 
     def test_tweet_media_is_first_class_and_round_trips_store(self):
         """Paid media metadata must survive without excavating opaque raw JSON."""
-        from store import Store, normalize_tweet
+        from store import normalize_tweet
 
         raw = {
             "id": "media-tweet",
@@ -323,7 +327,7 @@ class TestDocumentationContracts(E2ETest):
 
     def test_composition_example_preserves_the_injected_store(self):
         """Following the skill example must not silently open the home cache."""
-        skill = self._read("SKILL.md")
+        skill = self._read("references/traps.md")
         self.assertIn('Cohort.load("pm_talkers", client=c, store=s)', skill)
         self.assertIn('Cohort.load("crypto_ai", client=c, store=s)', skill)
 
@@ -407,7 +411,7 @@ class TestSetAlgebra(E2ETest):
         u = A.union(B)
         self.assertEqual(len(u), 2, f"got keys {sorted(u.members.keys())}")
         self.assertEqual(u.members["1"]["weight"], 6.0)
-        bob = [m for m in u if m["user_name"] == "bob"][0]
+        bob = next(m for m in u if m["user_name"] == "bob")
         self.assertEqual(bob["weight"], 3.0,
                          "bob must be ONE member with merged weight, not two")
         # NOTE (observed, deliberate non-assertion): union's merge branch keeps
@@ -421,7 +425,7 @@ class TestSetAlgebra(E2ETest):
         B = self._cohort("B", [(None, "ALICE", 9.0)])
         d = A.minus(B)
         self.assertEqual(len(d), 1)
-        self.assertEqual(list(d)[0]["user_name"], "bob")
+        self.assertEqual(next(iter(d))["user_name"], "bob")
 
     def test_determinism(self):
         A = self._cohort("A", [("1", "alice", 1.0), ("2", "bob", 1.0),
@@ -562,7 +566,7 @@ class TestStoreConcurrency(E2ETest):
                         "likeCount": i,
                         "author": {"id": f"a{tid}", "userName": f"user{tid}"},
                     }])
-            except Exception as e:      # noqa: BLE001 — collecting all failures
+            except Exception as e:
                 errors.append(f"thread {tid}: {type(e).__name__}: {e}")
 
         threads = [threading.Thread(target=worker, args=(t,)) for t in range(15)]
@@ -575,6 +579,47 @@ class TestStoreConcurrency(E2ETest):
         self.assertEqual(errors, [], "no thread may error")
         self.assertEqual(stats["tweets"], 750, "every row must survive")
         self.assertEqual(stats["accounts"], 15, "one author row per thread")
+
+
+class TestQueryRewriterProperties(unittest.TestCase):
+    """prepare_search_query is a small parser. Seeded random queries check
+    what must hold for every input, not only the examples someone thought of."""
+
+    TOKENS = ("ai", "from:alpha", '"x OR y"', "OR", "(", ")", "-", "min_faves:5",
+              "min_faves:40", "since:2026-01-02", "until:2026-02-03", "#tag",
+              "since_time:1700000000", '"min_faves:9"')
+
+    def queries(self):
+        import random
+        rng = random.Random(20261111)
+        for _ in range(3000):
+            yield " ".join(rng.choice(self.TOKENS) for _ in range(rng.randint(0, 7)))
+
+    def test_every_query_is_rewritten_exactly_or_refused(self):
+        from twitterapi import UsageError, _query_views, prepare_search_query
+        rewritten = refused = 0
+        for query in self.queries():
+            wanted = [int(n) for n in re.findall(r"min_faves:(\d+)", _query_views(query)[0])]
+            try:
+                wire, min_likes = prepare_search_query(query)
+            except UsageError:
+                refused += 1
+                self.assertTrue(wanted, f"refused a query with no min_faves: {query!r}")
+                continue
+            rewritten += 1
+            self.assertNotIn("min_faves", _query_views(wire)[0], query)
+            self.assertEqual(min_likes, max(wanted) if wanted else None, query)
+            self.assertIsNone(re.search(r"(since|until):\d{4}-\d\d-\d\d(?!_)", wire), query)
+            self.assertEqual(prepare_search_query(wire), (wire, None),
+                             f"rewriting is not idempotent for {query!r}")
+        self.assertGreater(min(rewritten, refused), 100, "both outcomes are exercised")
+
+    def test_index_mode_keeps_every_engagement_clause(self):
+        from twitterapi import prepare_search_query
+        for query in self.queries():
+            wire, min_likes = prepare_search_query(query, index_faves=True)
+            self.assertIsNone(min_likes)
+            self.assertEqual(wire.count("min_faves"), query.count("min_faves"), query)
 
 
 if __name__ == "__main__":
@@ -614,10 +659,33 @@ class TestCohortHonoursStreamCompleteness(E2ETest):
     def test_from_search_refuses_a_silent_partial(self):
         from cohort import Cohort
         from twitterapi import IncompleteDataError
-        c = _StubClient({("search", "ai"): _PartialStream(
-            [{"author": {"id": "1", "userName": "a"}}])})
+
+        from tests.fakes import ScriptedClient
+        c = ScriptedClient(raw=[{"tweets": [
+            {"id": "t1", "author": {"id": "1", "userName": "a"}}]}])
         with self.assertRaises(IncompleteDataError):
             Cohort.from_search("ai", client=c, store=self.fresh_store("cs1"))
+
+    def test_from_search_seeds_through_the_index_and_labels_its_limit(self):
+        """The seed walk sends min_faves to the index (it bounds what is
+        bought), and a cohort cut at `limit` is a sample, not the scene."""
+        from cohort import Cohort
+
+        from tests.fakes import ScriptedClient
+        page = {"tweets": [{"id": f"t{i}", "likeCount": 0,
+                            "author": {"id": str(i), "userName": f"u{i}"}}
+                           for i in range(3)], "has_next_page": False}
+        c = ScriptedClient(raw=[page, page])
+        store = self.fresh_store("cs-seed")
+        whole = Cohort.from_search("ai min_faves:50", client=c, store=store)
+        self.assertIn("min_faves:50", c.raw_calls[0][2]["query"])
+        self.assertEqual(len(whole), 3, "the index filtered; nothing is dropped locally")
+        self.assertTrue(whole.complete)
+        with contextlib.redirect_stderr(io.StringIO()):
+            sample = Cohort.from_search("ai", limit=2, client=c, store=store)
+        self.assertEqual(len(sample), 2)
+        self.assertFalse(sample.complete)
+        self.assertIn("limit=2", sample.incomplete_reasons[0])
 
     def test_authority_marks_partial_member_walks_and_keeps_paid_edges(self):
         from cohort import Cohort

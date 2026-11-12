@@ -12,9 +12,9 @@ a callable `(path, params_or_body) -> response`.
 """
 from __future__ import annotations
 
-from tests.e2e_base import SCRIPTS  # noqa: F401  (puts scripts/ on sys.path)
-
 import twitterapi
+
+from tests.e2e_base import SCRIPTS  # noqa: F401  (puts scripts/ on sys.path)
 
 
 def _answer(script, path, payload):
@@ -39,7 +39,9 @@ class ScriptedClient(twitterapi.Client):
         super().__init__(**kwargs)
         # A list is shared, not copied: instances built from one client_class
         # consume a single queue, as successive real requests would.
-        script = lambda s: s if callable(s) or isinstance(s, list) else list(s)
+        def script(s):
+            return s if callable(s) or isinstance(s, list) else list(s)
+
         self.raw_script, self.json_script = script(raw), script(raw_json)
         self.raw_calls, self.json_calls = [], []
 

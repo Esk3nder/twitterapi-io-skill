@@ -15,12 +15,13 @@ follower count, which is itself a priced lookup (18 credits/profile). The
 crawls are what refusal must prevent, and these tests pin the spend to
 exactly the identity lookups and nothing else.
 """
-import os
+import contextlib
 import json
+import os
 import sqlite3
 import unittest
 
-from tests.e2e_base import E2ETest, STORE_DIR, require_key
+from tests.e2e_base import STORE_DIR, E2ETest, require_key
 
 
 class TestOverlapRefusal(E2ETest):
@@ -39,9 +40,11 @@ class TestOverlapRefusal(E2ETest):
         db = os.path.join(STORE_DIR, ".twitterapi-cache", "store.db")
         pages = 0
         if os.path.exists(db):
-            pages = sqlite3.connect(db).execute(
-                "SELECT COUNT(*) FROM pages WHERE path LIKE '%followers%'"
-            ).fetchone()[0]
+            with contextlib.closing(sqlite3.connect(db)) as conn:
+                pages = conn.execute(
+                    "SELECT COUNT(*) FROM pages WHERE path LIKE '%followers%' AND "
+                    "(lower(params) LIKE '%elonmusk%' OR lower(params) LIKE '%sama%')"
+                ).fetchone()[0]
         self.log(f"follower pages cached after refusal: {pages} (db={db})")
         self.assertEqual(pages, 0, "refusal must happen BEFORE any follower crawl")
         # Spend: exactly 2 user_info lookups (18cr each), derived — the CLI's
@@ -74,8 +77,8 @@ class TestAudienceRefusal(E2ETest):
 class TestAuthorityRefusal(E2ETest):
     def test_authority_over_150_members_at_50_cents_refuses_with_zero_requests(self):
         require_key()
-        from twitterapi import Client, CostLimitExceeded
         from cohort import Cohort
+        from twitterapi import Client, CostLimitExceeded
         c = self.track(Client(verbose=False))
         co = Cohort(client=c, store=self.fresh_store("authority_refusal"),
                     label="synthetic:150")
@@ -98,8 +101,8 @@ class TestDiffusionCeilingRegression(E2ETest):
         tweet simply had no engagement. Zero network: the preflight refuses
         before the first request."""
         require_key()
-        from twitterapi import Client, CostLimitExceeded
         from jobs import diffusion_trace
+        from twitterapi import Client, CostLimitExceeded
         c = self.track(Client(verbose=False, max_usd=0.000001,
                               store=self.fresh_store("diffusion_refusal")))
         self.repro("diffusion_trace('2084352161404920316', limit=60, "
@@ -127,8 +130,8 @@ class TestRealtimeGuard(E2ETest):
         self.assertEqual(payload["error"]["type"], "refusal")
         self.assertIn("--confirm", payload["error"]["message"])
         # Read-only verification that no rule leaked (listing is allowed).
-        from twitterapi import Client
         from realtime import list_rules
+        from twitterapi import Client
         c = self.track(Client(verbose=False))
         rules = list_rules(c)
         tags = [r.get("tag") for r in rules]

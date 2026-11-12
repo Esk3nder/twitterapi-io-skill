@@ -11,12 +11,15 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sys
+import threading
+import typing
 from pathlib import Path
 
-from twitterapi import UsageError  # noqa: F401  (re-exported for the CLIs)
+from twitterapi import UsageError
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TEXT_LIMIT = 800
 TEXT_FIELDS = frozenset({"text", "description", "bio", "alt_text"})
 
@@ -77,8 +80,7 @@ def classify(exc, command: str):
     """The exit-code contract, in one place: (error type, exit code, help).
 
     2 = usage, refusal, or setup; 1 = API, runtime, or internal failure."""
-    from twitterapi import (APIError, CostLimitExceeded, IncompleteDataError,
-                            SetupError)
+    from twitterapi import APIError, CostLimitExceeded, IncompleteDataError, SetupError
     if isinstance(exc, SetupError):
         # The message names the cause: missing or invalid key, bad
         # `TWITTERAPI_IO_QPS`, no credits, rate limit, or an outage.
@@ -126,8 +128,16 @@ def run_cli(command: str, function, argv=None, parser=None, dests=()) -> int:
     subcommand level; a CLI with subcommands passes both so the error names
     the subcommand path."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if threading.current_thread() is threading.main_thread():
+        # SIGTERM (a timeout, a supervisor) stops a job the way Ctrl-C does,
+        # so it can still report the rows and spend it holds.
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         return function(argv)
+    except KeyboardInterrupt:
+        emit_line(error("runtime", "stopped by the user before a result was "
+                        "ready; `store.py` lists what each run spent", command))
+        return 1
     except Exception as exc:
         name = parser and dests and subcommand(parser(), args, dests)
         if name:
@@ -201,7 +211,7 @@ def prepare_output(payload: dict, *, command: str, fields: str | None = None,
         records = list(out.get(name) or [])
         total_key = f"{name}_total"
         total = int(out.pop(total_key, len(records)))
-        if records and all(isinstance(item, dict) for item in records):
+        if schema and records and all(isinstance(item, dict) for item in records):
             selected = parse_fields(fields, schema, command, defaults.get(name))
             records = [project(item, selected, schema) for item in records]
         out[name] = records
@@ -257,7 +267,7 @@ def fast_version(argv=None) -> bool:
 class ArgumentParser(argparse.ArgumentParser):
     """argparse with JSON usage failures on stdout."""
 
-    _current_args = []
+    _current_args: typing.ClassVar[list] = []
 
     def __init__(self, *args, **kwargs):
         kwargs.setdefault("allow_abbrev", False)
@@ -300,6 +310,7 @@ def display_path(path) -> str:
 def dashboard(script: str, description: str, *, store_path=None,
               cohort_limit: int = 5) -> dict:
     import sqlite3
+
     from store import DEFAULT_DB, table_stats
     path = os.path.abspath(os.path.expanduser(store_path or DEFAULT_DB))
     stats = {"pages": 0, "accounts": 0, "tweets": 0, "cohorts": 0,

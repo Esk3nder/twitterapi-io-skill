@@ -14,7 +14,7 @@ Both exercise the sliding-time-window walk that replaces cursor pagination
 """
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from tests.e2e_base import E2ETest, require_key
 
@@ -23,7 +23,7 @@ TW_FMT = "%a %b %d %H:%M:%S %z %Y"
 
 def ts_of(day):
     return int(datetime.strptime(day, "%Y-%m-%d")
-               .replace(tzinfo=timezone.utc).timestamp())
+               .replace(tzinfo=UTC).timestamp())
 
 
 class TestHistoryWindow(E2ETest):
