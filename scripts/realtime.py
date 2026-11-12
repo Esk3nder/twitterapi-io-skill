@@ -29,15 +29,30 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, APIError, IncompleteDataError  # noqa: E402
-from axi import (RULE_FIELDS, TWEET_FIELDS, ArgumentParser, HelpFormatter, add_common_output_flags,
-                 emit, emit_line, error, fast_version, format_record, prepare_output,
-                 parse_fields, run_cli, success, UsageError)  # noqa: E402
+from axi import (
+    RULE_FIELDS,
+    TWEET_FIELDS,
+    ArgumentParser,
+    HelpFormatter,
+    UsageError,
+    add_common_output_flags,
+    emit,
+    emit_line,
+    error,
+    fast_version,
+    format_record,
+    parse_fields,
+    prepare_output,
+    run_cli,
+    success,
+)
+from twitterapi import APIError, Client, IncompleteDataError
 
 WS_HOST = "ws.twitterapi.io"
 WS_PATH = "/twitter/tweet/websocket"
 WS_IDLE_TIMEOUT = 70            # seconds without a frame before recv times out
 RECONNECT_MIN_SECONDS = 90      # vendor guidance: wait >=90s before reconnecting
+RETRY_HELP = f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"
 CAPACITY_CLOSE_CODE = 1013      # vendor guidance: wait 60s+ on this code
 INTERVAL_MIN, INTERVAL_MAX = 0.1, 86400
 
@@ -236,7 +251,7 @@ class WebSocketClient:
             if not chunk:
                 raise ConnectionError("server closed during handshake")
             resp += chunk
-        head_bytes, sep, rest = resp.partition(b"\r\n\r\n")
+        head_bytes, _, rest = resp.partition(b"\r\n\r\n")
         self._buf = rest                # keep frame bytes that rode along
         head = head_bytes.decode("latin-1")
         status = head.split("\r\n")[0]
@@ -392,11 +407,16 @@ def _parser():
     actions = r.add_subparsers(dest="action", required=True)
     listing = actions.add_parser("list", help="list current filter rules",
                                  formatter_class=HelpFormatter,
-                                 epilog="Examples:\n  realtime.py rules list\n  realtime.py rules list --fields id,tag,active")
+                                 epilog=("Examples:\n"
+                                         "  realtime.py rules list\n"
+                                         "  realtime.py rules list --fields id,tag,active"))
     add_common_output_flags(listing)
     add = actions.add_parser("add", help="create an inactive rule",
                              formatter_class=HelpFormatter,
-                             epilog="Examples:\n  realtime.py rules add --tag <tag> --value \"<query>\" --confirm\n  realtime.py rules list")
+                             epilog=("Examples:\n"
+                                     '  realtime.py rules add --tag <tag> --value "<query>" '
+                                     "--confirm\n"
+                                     "  realtime.py rules list"))
     add.add_argument("--tag", required=True, help="rule label")
     add.add_argument("--value", required=True, help="X search query, <=255 chars")
     add.add_argument("--interval", type=float, default=60,
@@ -406,7 +426,9 @@ def _parser():
     for action in ("activate", "deactivate"):
         q = actions.add_parser(action, help=f"{action} an existing rule",
                                formatter_class=HelpFormatter,
-                               epilog=f"Examples:\n  realtime.py rules {action} --rule-id <id> --confirm\n  realtime.py rules list")
+                               epilog=(f"Examples:\n"
+                                       f"  realtime.py rules {action} --rule-id <id> --confirm\n"
+                                       f"  realtime.py rules list"))
         q.add_argument("--rule-id", required=True, help="existing rule ID")
         q.add_argument("--tag", help="replacement tag; omit to keep the current tag")
         q.add_argument("--value", help="replacement query; omit to keep the current query")
@@ -417,14 +439,18 @@ def _parser():
                        help="acknowledge server-side mutation and billing risk")
     delete = actions.add_parser("delete", help="delete an existing rule",
                                 formatter_class=HelpFormatter,
-                                epilog="Examples:\n  realtime.py rules delete --rule-id <id> --confirm\n  realtime.py rules list")
+                                epilog=("Examples:\n"
+                                        "  realtime.py rules delete --rule-id <id> --confirm\n"
+                                        "  realtime.py rules list"))
     delete.add_argument("--rule-id", required=True, help="existing rule ID")
     delete.add_argument("--confirm", action="store_true",
                         help="acknowledge server-side mutation")
 
     s = sub.add_parser("stream", help="consume the websocket stream",
                        formatter_class=HelpFormatter,
-                       epilog="Examples:\n  realtime.py stream --seconds <seconds>\n  realtime.py stream --fields id,created_at,text,rule")
+                       epilog=("Examples:\n"
+                               "  realtime.py stream --seconds <seconds>\n"
+                               "  realtime.py stream --fields id,created_at,text,rule"))
     s.add_argument("--seconds", type=int, help="stop after this many seconds")
     add_common_output_flags(s)
     return p
@@ -460,7 +486,8 @@ def _main(argv=None):
                 fields=a.fields, full=a.full, collections={"rules": RULE_FIELDS},
                 defaults={"rules": ("id", "tag", "value", "active")},
                 context="for this twitterapi.io account",
-                help_lines=("Run `realtime.py rules <add|activate|deactivate|delete> --help` for mutations",))
+                help_lines=("Run `realtime.py rules <add|activate|deactivate|delete> --help` "
+                            "for mutations",))
             emit(success("realtime.py rules list", payload))
             print(active_rule_warning(c, rules), file=sys.stderr)
             return 0
@@ -499,8 +526,9 @@ def _stream_cli(c, a):
     reconnect = (f"wait >={RECONNECT_MIN_SECONDS}s before reconnecting "
                  f"(>=60s on close code {CAPACITY_CLOSE_CODE})")
     try:
-        callback = lambda evt: _print_event(
-            evt, fields=a.fields, full=a.full, state=state)
+        def callback(evt):
+            _print_event(evt, fields=a.fields, full=a.full, state=state)
+
         for _ in stream(c, seconds=a.seconds, on_event=callback, status=status):
             pass
     except KeyboardInterrupt:
@@ -515,8 +543,7 @@ def _stream_cli(c, a):
             # StreamConnectError, or a transport failure in the rule check:
             # no observation window ever started, so this is a failure.
             print(f"[realtime] {e}; {reconnect}", file=sys.stderr)
-            emit_line(error("runtime", str(e), "realtime.py stream",
-                            f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
+            emit_line(error("runtime", str(e), "realtime.py stream", RETRY_HELP))
             return 1
         if isinstance(e, TimeoutError):
             # A quiet stream is normal (no rule matched anything yet); it ends
@@ -528,8 +555,7 @@ def _stream_cli(c, a):
         else:                           # server close or reset
             print(f"[realtime] {e}; {reconnect}", file=sys.stderr)
             if not state["records"]:
-                emit_line(error("runtime", str(e), "realtime.py stream",
-                                f"Wait at least {RECONNECT_MIN_SECONDS} seconds, then rerun the stream"))
+                emit_line(error("runtime", str(e), "realtime.py stream", RETRY_HELP))
                 return 1
             ended_by, detail = "closed", str(e)
 

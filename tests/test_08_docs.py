@@ -31,10 +31,10 @@ class TestReadmeCountsMatchCode(unittest.TestCase):
     skips 9."""
 
     def test_verify_coverage_counts(self):
-        import sys
-        sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import twitterapi
         import verify
+
+        from tests.e2e_base import SCRIPTS  # noqa: F401  (isolates HOME, adds scripts/)
         with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
             text = " ".join(f.read().split())
         probed = len(verify.probe_endpoint_names())

@@ -2,10 +2,10 @@
 """twitterapi.io client. Standard library only — no pip install.
 
 Every endpoint spec, response shape and price in this file was verified against
-the live API on 2026-08-10. See ../references/verified-facts.md for the probe
-evidence. Do not "fix" a parameter name here to look consistent: the API mixes
-camelCase and snake_case per endpoint and the spellings below are the measured
-ones.
+the live API; ../references/facts.json records when, and
+../references/verified-facts.md holds the probe evidence. Do not "fix" a
+parameter name here to look consistent: the API mixes camelCase and snake_case
+per endpoint and the spellings below are the measured ones.
 
 Read-only. No write endpoints are implemented — see verified-facts.md for why.
 
@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -47,107 +48,107 @@ CREDITS_PER_USD = 100_000
 #                absence is contract drift, never proof of completeness.
 # --------------------------------------------------------------------------
 ENDPOINTS = {
-    "user_info": dict(
-        path="/twitter/user/info", key_param="userName",
-        items=None, items_in="data", page_param=None, page_max=1),
-    "user_about": dict(
-        path="/twitter/user_about", key_param="userName",
-        items=None, items_in="data", page_param=None, page_max=1),
-    "batch_users": dict(
-        path="/twitter/user/batch_info_by_ids", key_param="userIds",
-        items="users", items_in="root", page_param=None, page_max=100,
-        key_list=True, paged=False),
-    "search_users": dict(
-        path="/twitter/user/search", key_param="query",
-        items="users", items_in="root", page_param=None, page_max=20),
+    "user_info": {
+        "path": "/twitter/user/info", "key_param": "userName",
+        "items": None, "items_in": "data", "page_param": None, "page_max": 1},
+    "user_about": {
+        "path": "/twitter/user_about", "key_param": "userName",
+        "items": None, "items_in": "data", "page_param": None, "page_max": 1},
+    "batch_users": {
+        "path": "/twitter/user/batch_info_by_ids", "key_param": "userIds",
+        "items": "users", "items_in": "root", "page_param": None, "page_max": 100,
+        "key_list": True, "paged": False},
+    "search_users": {
+        "path": "/twitter/user/search", "key_param": "query",
+        "items": "users", "items_in": "root", "page_param": None, "page_max": 20},
     # follower_ids is the cheap path: 0.45 credits/id at max page, 5000/call.
-    "follower_ids": dict(
-        path="/twitter/user/followers_ids", key_param="userName",
-        items="ids", items_in="root", page_param="count", page_max=5000),
-    "followers": dict(
-        path="/twitter/user/followers", key_param="userName",
-        items="followers", items_in="root", page_param="pageSize", page_max=200),
-    "followings": dict(
-        path="/twitter/user/followings", key_param="userName",
-        items="followings", items_in="root", page_param="pageSize", page_max=200),
-    "verified_followers": dict(                      # snake user_id, digits only
-        path="/twitter/user/verifiedFollowers", key_param="user_id",
-        items="followers", items_in="root", page_param=None, page_max=20),
+    "follower_ids": {
+        "path": "/twitter/user/followers_ids", "key_param": "userName",
+        "items": "ids", "items_in": "root", "page_param": "count", "page_max": 5000},
+    "followers": {
+        "path": "/twitter/user/followers", "key_param": "userName",
+        "items": "followers", "items_in": "root", "page_param": "pageSize", "page_max": 200},
+    "followings": {
+        "path": "/twitter/user/followings", "key_param": "userName",
+        "items": "followings", "items_in": "root", "page_param": "pageSize", "page_max": 200},
+    "verified_followers": {                      # snake user_id, digits only
+        "path": "/twitter/user/verifiedFollowers", "key_param": "user_id",
+        "items": "followers", "items_in": "root", "page_param": None, "page_max": 20},
     # data-wrapped: tweets at data.tweets, pagination at ROOT.
-    "last_tweets": dict(
-        path="/twitter/user/last_tweets", key_param="userName",
-        items="tweets", items_in="data", page_param=None, page_max=20),
-    "tweet_timeline": dict(
-        path="/twitter/user/tweet_timeline", key_param="userId",
-        items="tweets", items_in="data", page_param=None, page_max=20,
-        key_resolver="user_id"),
-    "mentions": dict(
-        path="/twitter/user/mentions", key_param="userName",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "tweets_by_ids": dict(
-        path="/twitter/tweets", key_param="tweet_ids",
-        items="tweets", items_in="root", page_param=None, page_max=100,
-        key_list=True, paged=False),
-    "replies": dict(
-        path="/twitter/tweet/replies", key_param="tweetId",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "quotes": dict(
-        path="/twitter/tweet/quotes", key_param="tweetId",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "retweeters": dict(
-        path="/twitter/tweet/retweeters", key_param="tweetId",
-        items="users", items_in="root", page_param=None, page_max=20),
-    "thread_context": dict(
-        path="/twitter/tweet/thread_context", key_param="tweetId",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "search": dict(
-        path="/twitter/tweet/advanced_search", key_param="query",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "list_members": dict(                            # snake, unlike list_tweets
-        path="/twitter/list/members", key_param="list_id",
-        items="members", items_in="root", page_param=None, page_max=20),
-    "list_followers": dict(
-        path="/twitter/list/followers", key_param="list_id",
-        items="followers", items_in="root", page_param=None, page_max=20),
-    "list_tweets": dict(                             # camel, unlike list_members
-        path="/twitter/list/tweets_timeline", key_param="listId",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "trends": dict(                                  # NOT data-wrapped
-        path="/twitter/trends", key_param="woeid",
-        items="trends", items_in="root", page_param="count", page_max=50,
-        paged=False),
+    "last_tweets": {
+        "path": "/twitter/user/last_tweets", "key_param": "userName",
+        "items": "tweets", "items_in": "data", "page_param": None, "page_max": 20},
+    "tweet_timeline": {
+        "path": "/twitter/user/tweet_timeline", "key_param": "userId",
+        "items": "tweets", "items_in": "data", "page_param": None, "page_max": 20,
+        "key_resolver": "user_id"},
+    "mentions": {
+        "path": "/twitter/user/mentions", "key_param": "userName",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "tweets_by_ids": {
+        "path": "/twitter/tweets", "key_param": "tweet_ids",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 100,
+        "key_list": True, "paged": False},
+    "replies": {
+        "path": "/twitter/tweet/replies", "key_param": "tweetId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "quotes": {
+        "path": "/twitter/tweet/quotes", "key_param": "tweetId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "retweeters": {
+        "path": "/twitter/tweet/retweeters", "key_param": "tweetId",
+        "items": "users", "items_in": "root", "page_param": None, "page_max": 20},
+    "thread_context": {
+        "path": "/twitter/tweet/thread_context", "key_param": "tweetId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "search": {
+        "path": "/twitter/tweet/advanced_search", "key_param": "query",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "list_members": {                            # snake, unlike list_tweets
+        "path": "/twitter/list/members", "key_param": "list_id",
+        "items": "members", "items_in": "root", "page_param": None, "page_max": 20},
+    "list_followers": {
+        "path": "/twitter/list/followers", "key_param": "list_id",
+        "items": "followers", "items_in": "root", "page_param": None, "page_max": 20},
+    "list_tweets": {                             # camel, unlike list_members
+        "path": "/twitter/list/tweets_timeline", "key_param": "listId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "trends": {                                  # NOT data-wrapped
+        "path": "/twitter/trends", "key_param": "woeid",
+        "items": "trends", "items_in": "root", "page_param": "count", "page_max": 50,
+        "paged": False},
     # Verified live. Note `query` is REQUIRED on this one.
-    "community_tweets_all": dict(
-        path="/twitter/community/get_tweets_from_all_community", key_param="query",
-        items="tweets", items_in="root", page_param=None, page_max=20),
+    "community_tweets_all": {
+        "path": "/twitter/community/get_tweets_from_all_community", "key_param": "query",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
     # --- read surface completed 2026-08-10, all live-probed ---
     # replies/v2 returns 31-38 per call vs 20 for plain /replies: ~1.8x fewer
     # requests for the same data. Prefer it. queryType: Relevance|Latest|Likes.
-    "replies_v2": dict(
-        path="/twitter/tweet/replies/v2", key_param="tweetId",
-        items="tweets", items_in="root", page_param=None, page_max=38),
+    "replies_v2": {
+        "path": "/twitter/tweet/replies/v2", "key_param": "tweetId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 38},
     # data-wrapped with ROOT pagination — same trap as last_tweets.
-    "articles": dict(                       # param is all-lowercase `username`
-        path="/twitter/user/articles", key_param="username",
-        items="articles", items_in="data", page_param=None, page_max=20),
-    "community_info": dict(
-        path="/twitter/community/info", key_param="community_id",
-        items=None, items_in="root", page_param=None, page_max=1),
-    "community_members": dict(
-        path="/twitter/community/members", key_param="community_id",
-        items="members", items_in="root", page_param=None, page_max=20),
-    "community_moderators": dict(
-        path="/twitter/community/moderators", key_param="community_id",
-        items="moderators", items_in="root", page_param=None, page_max=20),
-    "community_tweets": dict(
-        path="/twitter/community/tweets", key_param="community_id",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "list_tweets_filtered": dict(           # camel listId, supports time bounds
-        path="/twitter/list/tweets", key_param="listId",
-        items="tweets", items_in="root", page_param=None, page_max=20),
-    "space_detail": dict(
-        path="/twitter/spaces/detail", key_param="space_id",
-        items=None, items_in="root", page_param=None, page_max=1),
+    "articles": {                       # param is all-lowercase `username`
+        "path": "/twitter/user/articles", "key_param": "username",
+        "items": "articles", "items_in": "data", "page_param": None, "page_max": 20},
+    "community_info": {
+        "path": "/twitter/community/info", "key_param": "community_id",
+        "items": None, "items_in": "root", "page_param": None, "page_max": 1},
+    "community_members": {
+        "path": "/twitter/community/members", "key_param": "community_id",
+        "items": "members", "items_in": "root", "page_param": None, "page_max": 20},
+    "community_moderators": {
+        "path": "/twitter/community/moderators", "key_param": "community_id",
+        "items": "moderators", "items_in": "root", "page_param": None, "page_max": 20},
+    "community_tweets": {
+        "path": "/twitter/community/tweets", "key_param": "community_id",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "list_tweets_filtered": {           # camel listId, supports time bounds
+        "path": "/twitter/list/tweets", "key_param": "listId",
+        "items": "tweets", "items_in": "root", "page_param": None, "page_max": 20},
+    "space_detail": {
+        "path": "/twitter/spaces/detail", "key_param": "space_id",
+        "items": None, "items_in": "root", "page_param": None, "page_max": 1},
 }
 
 # Endpoints whose results are stable enough to cache indefinitely (a follow
@@ -155,8 +156,8 @@ ENDPOINTS = {
 # endpoints (search, replies, last_tweets, mentions) are time-sensitive and
 # always fetched fresh — caching them would silently serve stale corpora.
 CACHEABLE = {"follower_ids", "followers", "followings", "verified_followers",
-             "batch_users", "user_info", "user_about", "community_members",
-             "community_moderators", "list_members", "list_followers"}
+             "batch_users", "community_members", "community_moderators",
+             "list_members", "list_followers"}
 COMMUNITY_COLLECTIONS = {
     "community_members", "community_moderators", "community_tweets",
 }
@@ -210,8 +211,12 @@ def _query_views(query):
     return "".join(unquoted), "".join(top)
 
 
-def prepare_search_query(query):
+def prepare_search_query(query, index_faves=False):
     """Return an honest wire query and any predicate enforced from results.
+
+    ``index_faves=True`` leaves ``min_faves`` in the wire query: the index then
+    filters on its like-count snapshot, which is far cheaper than scanning
+    every match but can miss posts whose likes rose since the snapshot.
 
     The search index resolves bare dates outside UTC and uses a stale likes
     snapshot for ``min_faves``. Exact UTC tokens go to the API; engagement is
@@ -224,6 +229,9 @@ def prepare_search_query(query):
     match. Those queries raise ValueError rather than being silently rewritten.
     """
     query = str(query or "")
+    if index_faves:
+        return _BARE_SEARCH_DATE.sub(
+            lambda m: f"{m.group(1)}:{m.group(2)}_00:00:00_UTC", query).strip(), None
     unquoted, top = _query_views(query)
     top_clauses = list(_MIN_FAVES.finditer(top))
     any_clauses = len(_ANY_MIN_FAVES.findall(unquoted))
@@ -289,6 +297,14 @@ class IncompleteDataError(RuntimeError):
     """The API indicated more data exists but the client cannot retrieve it safely."""
 
 
+# OSError covers URLError, timeouts and resets; a connection dropped while the
+# body is being read raises http.client errors instead.
+TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
+# A request that failed for this account or resource. Programming errors are
+# deliberately absent: they must propagate, not become "partial".
+REQUEST_FAILURES = (APIError, IncompleteDataError, *TRANSPORT_FAILURES)
+
+
 class PaginationStream:
     """Single-use iterator with explicit completeness metadata.
 
@@ -321,6 +337,10 @@ def credits_to_usd(c: float) -> float:
 
 _FACTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "references", "facts.json")
+# verify.py writes today's date here after any passing full sweep, so a
+# checkout whose facts.json stamp is old but whose facts were just re-checked
+# does not warn on every run.
+CHECKED_PATH = os.path.expanduser("~/.twitterapi-cache/contracts-checked")
 _stale_warned = False
 
 
@@ -341,6 +361,9 @@ def _warn_if_facts_stale():
         with open(_FACTS_PATH) as f:
             facts = json.load(f)
         stamped = facts.get("verified_at", "")
+        if os.path.exists(CHECKED_PATH):
+            with open(CHECKED_PATH) as f:
+                stamped = max(stamped, f.read().strip())    # ISO dates sort as text
         limit = int(facts.get("staleness_warn_days", 90))
         age = int((time.time() - time.mktime(time.strptime(stamped, "%Y-%m-%d")))
                   / 86400)
@@ -393,6 +416,9 @@ class Client:
         self.oldest_cache_age = None   # seconds; how stale the served data is
         self.spent_credits = 0.0
         self.saved_credits = 0.0          # credits NOT spent thanks to cache hits
+        self.halted = None                # reason every later request is refused
+        self.start_balance = None         # first balance read, for the run ledger
+        self.run_id = f"{int(time.time())}-{os.getpid()}"
         self._last_call = 0.0
         self._fixed_qps = self._qps is not None
         self._qps_checked_at = 0
@@ -421,10 +447,17 @@ class Client:
         if self._qps is None or self.requests_made - self._qps_checked_at >= 500:
             try:
                 bal = self.balance()
-            except Exception:
-                bal = 0
-            new = next(q for floor, q in QPS_LADDER if bal >= floor)
-            if self.verbose and new != self._qps:
+                new = next(q for floor, q in QPS_LADDER if bal >= floor)
+            except (*REQUEST_FAILURES, KeyError, TypeError, ValueError) as exc:
+                # An unreadable balance is unknown, not zero: zero maps to one
+                # request per five seconds for the next 500 requests.
+                bal, new = None, self._qps or QPS_LADDER[0][1]
+                print(f"[twitterapi] NOTE: balance read failed ({exc}); "
+                      f"keeping {new} QPS", file=sys.stderr)
+            if self.start_balance is None:
+                self.start_balance = bal
+            # A changed rate is always reported; the first one only if verbose.
+            if bal is not None and new != self._qps and (self.verbose or self._qps):
                 print(f"[twitterapi] balance {bal:,} credits "
                       f"(${credits_to_usd(bal):,.2f}) -> {new} QPS", file=sys.stderr)
             self._qps = new
@@ -433,12 +466,12 @@ class Client:
 
     def _throttle(self):
         gap = 1.0 / self.qps
-        with self._lock:            # check+sleep+stamp must be atomic, or two
-            now = time.monotonic()  # threads both pass the check and fire together
-            wait = gap - (now - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+        with self._lock:            # reserve the next send slot atomically, or
+            now = time.monotonic()  # two threads both take the same one
+            slot = max(now, self._last_call + gap)
+            self._last_call = slot
+        if slot > now:              # outside the lock: accounting must not wait
+            time.sleep(slot - now)
 
     # -- transport --------------------------------------------------------
     def _raw(self, method, path, params=None, *, max_credits=None):
@@ -457,10 +490,9 @@ class Client:
         return body
 
     def _raw_json(self, method, path, body, *, max_credits=None):
-        """Request with a JSON body. Used by bulk_search and the filter-rule
-        endpoints — note DELETE /oapi/tweet_filter/delete_rule takes its
-        rule_id in the BODY, not the query string. Shares _raw's transport, so
-        a data path (bulk_search) has the same ceiling and retry rules."""
+        """Request with a JSON body, for the filter-rule endpoints. DELETE
+        /oapi/tweet_filter/delete_rule takes its rule_id in the BODY, not the
+        query string. Shares _raw's transport, ceiling and retry rules."""
         data = json.dumps(body).encode()
 
         def request():
@@ -530,10 +562,12 @@ class Client:
                 if e.code == 429 or e.code >= 500:
                     last = APIError(e.code, detail, path)
                     if attempt < attempts - 1:      # don't sleep before giving up
-                        time.sleep(2 ** attempt)
+                        asked = (e.headers.get("Retry-After") or "") if e.headers else ""
+                        time.sleep(min(float(asked), 60) if asked.isdigit()
+                                   else 2 ** attempt)
                     continue
                 raise APIError(e.code, detail, path) from None
-            except (urllib.error.URLError, TimeoutError) as e:
+            except TRANSPORT_FAILURES as e:
                 last = e                            # worst case stays booked
                 if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
@@ -549,6 +583,7 @@ class Client:
                                or json.dumps(body)[:200], path)
             if not free:                # a free balance read settles nothing
                 self._provisional.credits = worst
+                self._record_run()
             return body
         raise last if isinstance(last, Exception) else RuntimeError("retries exhausted")
 
@@ -598,7 +633,7 @@ class Client:
             return next(r for floor, r in PRICE_TIERS[name] if page_size >= floor)
         return FLAT_CREDITS["profile"] if name in (
             "user_info", "user_about", "batch_users", "search_users",
-            "retweeters", "verified_followers", "followers", "followings",
+            "retweeters", "verified_followers",
             "list_members", "list_followers", "community_info",
             "check_follow") else FLAT_CREDITS["tweet"]
 
@@ -673,6 +708,14 @@ class Client:
         self._provisional.credits = MIN_REQUEST_CREDITS
         with self._lock:
             self.spent_credits += actual_credits - booked
+        self._record_run()
+
+    def _record_run(self):
+        """Keep this process's spend in the store as it accrues, so the
+        record survives a run that is killed before it can report."""
+        if self.store is not None:
+            self.store.record_run(self.run_id, self.requests_made,
+                                  self.spent_credits, self.start_balance)
 
     def _book_attempt(self, path, credits, operation):
         """Count one request attempt and book its worst-case cost atomically.
@@ -680,10 +723,18 @@ class Client:
         Check and booking share the lock, so two threads cannot both see room
         under max_usd and then both spend it."""
         with self._lock:
+            if self.halted:
+                raise CostLimitExceeded(
+                    f"{self.halted}; no further requests were sent")
             if credits:
                 self._require_budget(credits, operation)
             self.requests_made += 1     # count every attempt: failures bill too
             self.spent_credits += credits
+
+    def halt(self, reason):
+        """Refuse every later request, so a job that was told to stop returns
+        the rows it already holds as a partial instead of nothing."""
+        self.halted = reason
 
     def _release_to_floor(self, booked):
         """The server answered with an error: it bills the floor, not a page."""
@@ -708,24 +759,7 @@ class Client:
                 f"${self.max_usd:,.5f} ceiling (${self.spent_usd:,.5f} "
                 f"already spent); refusing before the paid request.")
 
-    def _preflight(self, name, n_records, page_size=None, *, full_scan=False):
-        if full_scan:
-            # A local predicate can reject every paid row, so no returned-row
-            # limit can estimate the number of pages. Make max_usd the explicit
-            # scan bound instead of presenting a limit-derived underestimate.
-            if self.max_usd is None:
-                raise UsageError(
-                    f"{name} uses a local predicate that may require a full "
-                    f"result scan; limit={n_records!r} bounds returned matches, "
-                    "not fetched rows. Pass max_usd= to bound paid scan cost.")
-            print(
-                f"[twitterapi] WARNING: {name} uses a local predicate; "
-                f"limit={n_records!r} bounds returned matches, not fetched "
-                f"rows. The query may scan to exhaustion, bounded by the "
-                f"cumulative max_usd=${self.max_usd:,.5f} ceiling.",
-                file=sys.stderr,
-            )
-            return
+    def _preflight(self, name, n_records, page_size=None):
         if self.max_usd is None or not n_records:
             return
         projected = self.spent_usd + self.estimate(name, n_records, page_size)
@@ -767,19 +801,17 @@ class Client:
             raise ValueError(
                 f"'{name}' returns a single object, not a list — "
                 f"call the dedicated method instead of paginate().")
-        local_min_faves = None
         if name == "search":
-            key, local_min_faves = prepare_search_query(key)
+            raise UsageError(
+                "search has one walker, workflows.search_window(): cursor "
+                "paging loops on old ranges, so paginate() does not serve it")
         key = self._resolve_endpoint_key(name, key)
         if spec.get("key_list"):
             ids = [part for part in str(key).split(",") if part.strip()]
             ps = min(max(len(ids), 1), spec["page_max"])
         else:
             ps = self.effective_page_size(name, page_size)
-        self._preflight(
-            name, limit, ps,
-            full_scan=(local_min_faves is not None and local_min_faves > 0),
-        )
+        self._preflight(name, limit, ps)
         worst_page = self.page_credits(name, ps, ps)
         params = {key_param or spec["key_param"]: key}
         if spec["page_param"]:
@@ -832,8 +864,7 @@ class Client:
                         self.store.put_page(
                             spec["path"], params, resp,
                             credits=self.page_credits(name, len(items), ps))
-            except (APIError, IncompleteDataError, urllib.error.URLError,
-                    TimeoutError) as exc:
+            except REQUEST_FAILURES as exc:
                 if not seen:
                     raise
                 self._mark_partial(stream, name, seen, str(exc))
@@ -849,22 +880,18 @@ class Client:
                 # Preserve the wire payload while adding a stable public field;
                 # callers should not have to know extendedEntities.media.
                 items = [enrich_tweet_media(item) for item in items]
-            acquired_items = items
             # Persist records so a corpus can be read back for free later.
             # Only FRESH pages: a cache hit re-persisted would stamp an old
             # snapshot as just seen and overwrite newer rows with stale values.
-            if (cached is None and self.store is not None and acquired_items
-                    and isinstance(acquired_items[0], dict)):
+            if (cached is None and self.store is not None and items
+                    and isinstance(items[0], dict)):
                 if spec["items"] == "tweets":
-                    self.store.put_tweets(acquired_items)
+                    self.store.put_tweets(items)
                 elif spec["items"] in ("followers", "followings", "members",
                                        "moderators", "users"):
-                    self.store.put_accounts(acquired_items)
+                    self.store.put_accounts(items)
 
-            items = (filter_search_tweets(acquired_items, local_min_faves)
-                     if name == "search" else acquired_items)
-
-            if not acquired_items:
+            if not items:
                 empty_pages += 1
             else:
                 empty_pages = 0
@@ -885,7 +912,7 @@ class Client:
                     yield it
                     return
                 yield it
-            if not acquired_items and not has_next and seen == 0:
+            if not items and not has_next and seen == 0:
                 if name in COMMUNITY_COLLECTIONS:
                     # Empty is legitimate for a real community, so resolve
                     # the identity only at the otherwise ambiguous boundary.
@@ -988,15 +1015,9 @@ class Client:
         if not isinstance(data, dict) or not data:
             raise APIError(200, f"user {user_name!r} not found: response "
                                 f"data is {data!r}", spec["path"])
+        if self.store is not None:      # a paid profile is kept, not discarded
+            self.store.put_accounts([data])
         return data
-
-    def follower_count(self, user_name) -> int:
-        followers = self.user_info(user_name).get("followers")
-        if followers in (None, ""):
-            raise IncompleteDataError(
-                f"profile for {user_name!r} omitted the followers count; "
-                "refusing to report an unknown count as 0")
-        return int(followers)
 
     def follower_ids(self, user_name=None, *, user_id=None, limit=None):
         """Cheapest way to enumerate followers: 0.45 credits/id at 5000/call
@@ -1018,69 +1039,6 @@ class Client:
     def last_tweets(self, user_name, *, limit=None, include_replies=False):
         return self.paginate("last_tweets", user_name, limit=limit,
                              extra={"includeReplies": str(include_replies).lower()})
-
-    def bulk_search(self, queries, query_type="Latest"):
-        """Run N searches in ONE request. Verified: returns
-        {results: {query_0: {tweets, has_next_page, next_cursor}, ...}}.
-
-        This is the only lever against the QPS ceiling — 20 req/s is the hard
-        maximum, so batching N queries per request multiplies throughput by N.
-        Use it whenever you have several independent searches."""
-        if not queries:
-            return []
-        prepared, local_min_faves = [], []
-        for query in queries:
-            item = (dict(query) if isinstance(query, dict)
-                    else {"query": query, "queryType": query_type})
-            item["query"], threshold = prepare_search_query(item.get("query"))
-            prepared.append(item)
-            local_min_faves.append(threshold)
-        body = {"queries": prepared}
-        full_page = self.page_credits("search", 20, 20)
-        self._require_budget(len(body["queries"]) * full_page,
-                             f"bulk_search batch of {len(body['queries'])} queries")
-        resp = self._raw_json("POST", "/twitter/tweet/bulk_advanced_search", body,
-                              max_credits=len(body["queries"]) * full_page)
-        results = resp.get("results") or {}
-        if not isinstance(results, dict):
-            results = {}
-        out = []
-        invalid = []
-        charges = []
-        for i in range(len(body["queries"])):
-            result_key = f"query_{i}"
-            r = results.get(result_key)
-            if not isinstance(r, dict) or "tweets" not in r:
-                invalid.append(result_key)
-                charges.append(full_page)  # unknown response: never undercount
-                continue
-            tweets = r.get("tweets")
-            if not isinstance(tweets, list) or not isinstance(
-                    r.get("has_next_page"), bool):
-                # A missing has_next_page is unknown, never "no more pages"
-                # (verified 2026-10-23: every live subresult carries a bool,
-                # including empty ones).
-                invalid.append(result_key)
-                charges.append(full_page)
-                continue
-            charges.append(self.page_credits("search", len(tweets), 20))
-            tweets = [enrich_tweet_media(tweet) for tweet in tweets]
-            tweets = filter_search_tweets(tweets, local_min_faves[i])
-            # has_next_page is authoritative for "more exists"; a short page is
-            # NOT proof of completeness (results can be filtered). Callers that
-            # infer from length alone silently lose data.
-            out.append({"tweets": tweets,
-                        "has_next_page": r["has_next_page"],
-                        "next_cursor": r.get("next_cursor") or ""})
-        # ONE request produced N billable search results: settle its booking
-        # to the combined pages. Missing/malformed subresults are
-        # conservatively booked full.
-        self._settle(sum(charges))
-        if invalid:
-            raise IncompleteDataError(
-                f"bulk_search response omitted or malformed {invalid}; refusing "
-                f"to report those queries as empty. Results are INCOMPLETE.")
-        return out
 
     def community_info(self, community_id) -> dict:
         self._require_budget(self.page_credits("community_info", 1, 1),
@@ -1163,7 +1121,8 @@ def _main(argv=None):
                  "Run `jobs.py` for cached and analytical workflows"],
     }
     if not args.balance:
-        emit(success("twitterapi.py", body)); return 0
+        emit(success("twitterapi.py", body))
+        return 0
     c = Client(verbose=False)
     credits = c.balance()
     emit(success("twitterapi.py --balance", {

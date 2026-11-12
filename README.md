@@ -146,7 +146,9 @@ python3 scripts/workflows.py history openai --include-retweets --out tweets.json
 python3 scripts/workflows.py monitor openai,elonmusk --interval 60 --state s.json
 
 # analytical jobs, JSON to stdout — cents unless marked
-python3 scripts/jobs.py brief openai --days 7            # ~$0.01
+python3 scripts/jobs.py brief openai                     # last 7 days, ~$0.01
+python3 scripts/jobs.py tweet https://x.com/jack/status/20   # one post + its thread
+python3 scripts/jobs.py narrative "ai agents min_faves:50" --days 7 --index-faves
 python3 scripts/jobs.py authenticity someaccount --sample 500   # ~$0.01
 python3 scripts/jobs.py authority "crypto AI" --sample 30 --max-usd 1
 python3 scripts/jobs.py diffusion 2084352161404920316    # ~$0.02
@@ -183,8 +185,14 @@ limits the follower profiles sampled. Supplying it to another job is an
 error rather than a silently ignored flag. `authority` writes flushed progress
 to stderr while preserving JSON-only stdout.
 
+A walk that stops early — the spend ceiling, Ctrl-C, a timeout, an API failure
+after rows arrived — keeps every page it bought and returns them as a partial
+result. Rerun the same command within 24 hours and those pages are replayed
+from the store at no cost before the walk continues.
+
 Add `--out FILE` to stream records as JSONL while stdout receives the final JSON
-summary, and `--max-pages N` to
+summary (the path must be new: an existing file is refused rather than
+overwritten), and `--max-pages N` to
 bound an open-ended history walk. The page cap applies separately to each
 search pass. Even when the first pass hits its cap and makes the overall result
 partial, the native-retweet pass receives its own cap. Thus
@@ -207,7 +215,6 @@ c = Client(store=s, max_usd=10)            # Store object: caching on
 c2 = Client(store="/tmp/twitter.db", max_usd=10)  # paths are coerced before HTTP
 
 c.estimate("follower_ids", 200_000_000)    # -> 900.0 dollars, before spending
-c.bulk_search(["from:openai", "from:anthropicai", "from:google"])  # 3 queries, 1 request
 c.paginate("community_members", "1493446837214187523", limit=500)  # one of the 26 paginated endpoints
 c.paginate("community_tweets_all", "market structure")  # tweets, not communities
 ```
@@ -322,14 +329,15 @@ QPS scales with credit balance; **20 is the ceiling**.
 | ≥ 10,000 credits | 10 |
 | ≥ 50,000 credits | 20 |
 
-Requests, not credits, bound large jobs. `bulk_search` runs N queries in one
-request; bigger pages cut request count (`follower_ids` 5,000 vs `followers`
-200; `replies/v2` ~35 vs `replies` 20).
+Requests, not credits, bound large jobs. A search over a long window runs as
+up to 8 parallel time shards; bigger pages cut request count (`follower_ids`
+5,000 vs `followers` 200; `replies/v2` ~35 vs `replies` 20).
 
 ## Caching
 
-Graph and membership endpoints cache indefinitely in local sqlite; content
-endpoints always refetch. A repeated 10,000-follower crawl costs **$0.045 the
+Graph and membership endpoints cache indefinitely in local sqlite (`--max-age
+DAYS` buys them again when the cached copy is older); search results are
+refetched, except that an unfinished walk replays its own pages for 24 hours. A repeated 10,000-follower crawl costs **$0.045 the
 first time and $0.00 the second** — asserted in the test suite.
 
 Every workflow's final `spend_report()` names both session spend and, when
@@ -337,7 +345,9 @@ present, cache hits plus dollars saved. A `$0.00` rerun with saved credits means
 the cache worked; it is not missing accounting.
 
 The cache lives at `~/.twitterapi-cache/store.db`. Deleting it is safe; it only
-makes the next crawl paid again.
+makes the next crawl paid again. `python3 scripts/store.py` prints what it
+holds, the spend recorded over the last 7 days and the most recent runs;
+`--compact` drops duplicate profile copies written by older versions.
 
 ## Writes are out of scope
 
@@ -367,7 +377,7 @@ Four layers keep a stale fact from passing as true:
 | Layer | Catches | When |
 |---|---|---|
 | `verify.py` | contract or price drift | on demand, ~$0.05 |
-| Runtime warning | facts older than 90 days | at first API call |
+| Runtime warning | facts not re-checked by a passing `verify.py` for 90 days | at first API call |
 | `run_e2e.sh` | behavioural regressions and spend cap | before release, <$0.25 |
 | Weekly CI | drift nobody looked for | Mondays, automatic |
 
@@ -411,7 +421,8 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
 - **`authority()` needs a cohort with internal follow edges.** A handful of
   accounts returns an empty ranking, correctly but uselessly.
 - **Busy-topic narrative tracking costs dollars, not cents.** Bound it with a
-  tighter window or an engagement filter.
+  tighter window, or with `min_faves:N` plus `--index-faves` so the search
+  index does the filtering.
 - **Two prices are unmeasured:** whether a short final page bills as a whole
   page, and `verified_followers` per-record cost. Both are marked in the code.
 - **Per-user monitoring endpoints** (`/oapi/x_user_stream/*`) need a separate
@@ -430,6 +441,8 @@ while active; `realtime.py` prints the active-rule count on every command.
 
 ```
 SKILL.md                      agent-facing entry point
+references/traps.md           API traps and library composition, read on demand
+pyproject.toml                ruff configuration (no dependencies)
 references/facts.json         machine-checkable evidence, dated
 references/verified-facts.md  prose evidence and rationale
 scripts/twitterapi.py         30 endpoints: casing, envelopes, cost, QPS, cache

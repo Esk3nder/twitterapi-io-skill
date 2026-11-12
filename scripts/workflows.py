@@ -20,19 +20,44 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import (APIError, Client, CostLimitExceeded, IncompleteDataError,
-                        credits_to_usd, enrich_tweet_media, filter_search_tweets,
-                        prepare_search_query)  # noqa: E402
-from store import Store, parse_ts  # noqa: E402
-from axi import (ACCOUNT_FIELDS, TWEET_FIELDS, ArgumentParser, UsageError,
-                 HelpFormatter, add_common_output_flags, dashboard, emit, emit_line,
-                 error, fast_version, format_record, parse_fields, run_cli,
-                 success)  # noqa: E402
+from axi import (
+    ACCOUNT_FIELDS,
+    TWEET_FIELDS,
+    ArgumentParser,
+    HelpFormatter,
+    UsageError,
+    add_common_output_flags,
+    dashboard,
+    emit,
+    emit_line,
+    error,
+    fast_version,
+    format_record,
+    parse_fields,
+    run_cli,
+    success,
+)
+from store import DEFAULT_DB, parse_ts
+from twitterapi import (
+    APIError,
+    Client,
+    CostLimitExceeded,
+    IncompleteDataError,
+    credits_to_usd,
+    enrich_tweet_media,
+    filter_search_tweets,
+    prepare_search_query,
+)
 
 SEARCH_PAGE = 20                        # advanced_search returns at most 20 per call
+SEARCH_PATH = "/twitter/tweet/advanced_search"
+RESUME_MAX_AGE = 86400                  # seconds a bought search page can be replayed
+SECOND_SPLITS = ("filter:replies", "-filter:replies")   # disjoint and exhaustive
+MAX_QUERY_CHARS = 480                   # X rejects longer search queries
 DEFAULT_MAX_USD = 5.0                   # ceiling for a Client this module creates itself
 MONITOR_SEEN_CAP = 5000                 # newest ids kept for monitor dedupe
 MONITOR_OVERLAP = 120                   # seconds each poll re-scans for late-indexed posts
@@ -59,6 +84,20 @@ def _bounded_client(client, max_usd):
     return client
 
 
+def _cli_session(a):
+    """(client, output file) for one workflow command.
+
+    Every workflow writes through the store: followers bought by `audience`
+    and posts seen by `monitor` are kept, and spend is recorded. An existing
+    --out file is refused before anything is bought: a rerun after a partial
+    result must not empty the rows the first run wrote."""
+    out = getattr(a, "out", None)
+    if out and os.path.exists(out):
+        raise UsageError(f"--out {out} already exists; move it or pick another path")
+    c = Client(max_usd=a.max_usd, store=getattr(a, "store", None) or DEFAULT_DB)
+    return c, (open(out, "w") if out else sys.stdout)
+
+
 def _clean_handle(raw, flag="USER"):
     handle = (raw or "").strip().lstrip("@")
     if not _HANDLE.match(handle):
@@ -76,7 +115,7 @@ def _day_ts(value, flag):
         day = datetime.strptime(value, "%Y-%m-%d")
     except (TypeError, ValueError):
         raise UsageError(f"{flag} must be YYYY-MM-DD, got {value!r}") from None
-    return int(day.replace(tzinfo=timezone.utc).timestamp())
+    return int(day.replace(tzinfo=UTC).timestamp())
 
 
 def _window_ts(since, until):
@@ -167,9 +206,8 @@ def audience(user, *, ids_only=True, limit=None, max_usd=None,
 def _audience_cli(a):
     if a.limit is not None and a.limit < 1:
         raise UsageError(f"--limit must be at least 1, got {a.limit}")
-    c = Client(max_usd=a.max_usd)
+    c, fh = _cli_session(a)
     got = 0
-    fh = open(a.out, "w") if a.out else sys.stdout
     was_truncated = False
     truncated_reason = None
     refused = False
@@ -186,10 +224,10 @@ def _audience_cli(a):
             was_truncated = was_truncated or clipped
             got += 1
         truncated = False
-    except CostLimitExceeded as e:
+    except (CostLimitExceeded, KeyboardInterrupt) as e:
         truncated = True
         refused = not got
-        truncated_reason = str(e)
+        truncated_reason = str(e) or "stopped by the user"
         print(f"[audience] {'stopped' if got else 'refused'}: {e}", file=sys.stderr)
     except IncompleteDataError as e:
         truncated = True
@@ -198,6 +236,7 @@ def _audience_cli(a):
     finally:
         if a.out:
             fh.close()
+        c.store.close()
     print(f"{got:,} records | {c.spend_report()}", file=sys.stderr)
     if refused:
         emit_line(error("refusal", truncated_reason, "workflows.py audience",
@@ -216,7 +255,8 @@ def _audience_cli(a):
                               f"0 followers found for @{a.user} in the requested scope"),
             "artifact": a.out,
             "help": (["Run `workflows.py audience <user> --profiles` for profile fields"]
-                     + (["Run `workflows.py audience <user> --limit <count>` with a larger count to show more"]
+                     + (["Run `workflows.py audience <user> --limit <count>` with a larger "
+                         "count to show more"]
                         if more and complete else [])
                      + (["Run `workflows.py audience <user> --full` for complete text"]
                         if was_truncated else [])),
@@ -229,88 +269,115 @@ def _audience_cli(a):
 
 
 # ----------------------------------------------------------------- history --
+def _search_page(c, q, replay):
+    """One advanced_search page -> (tweets, has_next_page as the API sent it).
+
+    A fresh page is charged and persisted before it is returned. With
+    `replay`, the page's id list is also kept for RESUME_MAX_AGE, so a rerun
+    of the same window is served from the store and pays nothing."""
+    params = {"query": q, "queryType": "Latest"}
+    index = c.store.get_page(SEARCH_PATH, params, RESUME_MAX_AGE) if replay else None
+    rows = c.store.raw_tweets(index["ids"]) if index else None
+    if rows is not None:
+        c.cache_hits += 1
+        c.saved_credits += Client.page_credits("search", len(rows), SEARCH_PAGE)
+        return rows, index["has_next_page"]
+    resp = c._raw("GET", SEARCH_PATH, params,
+                  max_credits=Client.page_credits("search", SEARCH_PAGE, SEARCH_PAGE))
+    tweets = resp.get("tweets")
+    if not isinstance(tweets, list):
+        problem = ("omitted the 'tweets' field" if "tweets" not in resp
+                   else f"returned 'tweets' as {type(tweets).__name__}")
+        raise IncompleteDataError(
+            f"advanced_search {problem}; refusing to read contract drift as "
+            f"an empty window, so the result is partial.")
+    batch = [enrich_tweet_media(tweet) for tweet in tweets]
+    c._charge("search", len(batch), SEARCH_PAGE)
+    has_more = resp.get("has_next_page")
+    # A fetched page is already paid for. Persist it before it is yielded so a
+    # caller that stops consuming still retains every acquired row.
+    if c.store is not None and batch:
+        c.store.put_tweets(batch)
+    if replay and isinstance(has_more, bool):
+        c.store.put_page(SEARCH_PATH, params, {
+            "ids": [t.get("id") for t in batch], "has_next_page": has_more})
+    return batch, has_more
+
+
+def _prepare(c, query, index_faves):
+    """prepare_search_query, plus one warning per client when the walk must
+    buy every match to apply `min_faves` (parallel shards share the client)."""
+    wire, local_min_faves = prepare_search_query(query, index_faves)
+    if local_min_faves and not getattr(c, "scan_warned", False):
+        c.scan_warned = True
+        ceiling = "no ceiling" if c.max_usd is None else f"the ${c.max_usd:,.2f} ceiling"
+        print(f"[search] WARNING: min_faves:{local_min_faves} is checked against "
+              f"live like counts, so every match in the window is bought and "
+              f"most may be discarded, bounded only by {ceiling}. --index-faves "
+              f"lets the search index filter instead: far cheaper, but it can "
+              f"miss posts whose likes rose recently.", file=sys.stderr)
+    return wire, local_min_faves
+
+
 def search_window(client, query, since_ts=None, until_ts=None, *,
-                  max_pages=None, progress=False):
+                  max_pages=None, progress=False, index_faves=False,
+                  replay=True):
     """THE sliding-time-window walk over advanced_search. Generator.
 
     Cursor pagination loops on historical ranges, and advanced_search returns
     at most 20 tweets per call, so the walk requests newest-first within
     [since_ts, until_ts), takes the OLDEST createdAt on the page, and moves
     until_time to that second (re-including it; dedupe by id absorbs the
-    overlap). Spends through `client` under the client's own ceiling; this
-    function never changes client.max_usd.
+    overlap). Spends through `client` under the client's own ceiling.
 
-    Yields qualifying tweet dicts newest-first, each id once. Every fetched
-    page is persisted to client.store (when set) before its tweets are yielded.
+    Yields qualifying tweet dicts newest-first, each id once. With a store
+    and a fixed `until_ts`, a rerun of the same window replays the pages
+    already bought (see _search_page); `replay=False` is for a caller whose
+    windows never repeat.
 
     Completeness: normal exhaustion (StopIteration) happens ONLY when the
     window is proven walked: an empty page, a short page without
     has_next_page, or the boundary reaching since_ts. Otherwise it raises,
     after yielding everything already acquired (those records stay valid):
       CostLimitExceeded   the client ceiling stops the next paid page;
-      IncompleteDataError contract drift (no `tweets` list), a page that
-                          asserts more data but has no parseable timestamps,
-                          20+ tweets in one second, or max_pages reached.
+      IncompleteDataError contract drift, a page that asserts more data but
+                          has no parseable timestamps, one second that still
+                          holds a full page after being split, or max_pages.
     """
     c = client
-    query, local_min_faves = prepare_search_query(query)
+    query, local_min_faves = _prepare(c, query, index_faves)
+    replay = replay and c.store is not None and until_ts is not None
     seen, pages = set(), 0
+
+    def unseen(batch):
+        keep = {t.get("id") for t in filter_search_tweets(batch, local_min_faves)}
+        for t in batch:
+            if t.get("id") in seen:
+                continue
+            seen.add(t.get("id"))
+            if t.get("id") in keep:
+                yield t
+
     while True:
         q = query
         if since_ts is not None:
             q += f" since_time:{since_ts}"
         if until_ts is not None:
             q += f" until_time:{until_ts}"
-        resp = c._raw("GET", "/twitter/tweet/advanced_search",
-                      {"query": q, "queryType": "Latest"},
-                      max_credits=Client.page_credits("search", SEARCH_PAGE,
-                                                      SEARCH_PAGE))
-        tweets = resp.get("tweets") if isinstance(resp, dict) else None
-        if not isinstance(tweets, list):
-            problem = ("omitted the 'tweets' field"
-                       if not isinstance(resp, dict) or "tweets" not in resp
-                       else f"returned 'tweets' as {type(tweets).__name__}")
-            raise IncompleteDataError(
-                f"advanced_search {problem}; refusing to read contract drift "
-                f"as an empty window. The {len(seen):,} tweets already "
-                f"yielded are valid, but the result is partial.")
-        batch = [enrich_tweet_media(tweet) for tweet in tweets]
-        c._charge("search", len(batch), SEARCH_PAGE)
+        batch, has_more = _search_page(c, q, replay)
         pages += 1
-
-        # A fetched page is already paid for. Persist it before yielding so a
-        # caller that stops consuming later still retains every acquired row,
-        # and the documented $0 catalogue/threads jobs see the same corpus.
-        if c.store is not None and batch:
-            c.store.put_tweets(batch)
-
-        # Timestamps come from the WHOLE page, not just fresh tweets. Using only
-        # fresh ones leaves oldest=None on an all-duplicate page and terminates
-        # the crawl early with data still unretrieved.
-        qualifying = filter_search_tweets(batch, local_min_faves)
-        qualifying_ids = {t.get("id") for t in qualifying}
-        fresh, stamps = 0, []
-        for t in batch:
-            stamp = parse_ts(t.get("createdAt"))
-            if stamp is not None:
-                stamps.append(stamp)
-            if t.get("id") in seen:
-                continue
-            seen.add(t.get("id"))
-            if t.get("id") not in qualifying_ids:
-                continue
-            fresh += 1
-            yield t
-
+        # Timestamps come from the WHOLE page, not just fresh tweets: an
+        # all-duplicate page must still move the boundary.
+        stamps = [s for s in (parse_ts(t.get("createdAt")) for t in batch)
+                  if s is not None]
+        yield from unseen(batch)
         if progress:
-            print(f"  page {pages}: {len(batch)} returned, {fresh} new, "
-                  f"{len(seen):,} total, ${c.spent_usd:,.4f}", file=sys.stderr)
+            print(f"  page {pages}: {len(batch)} returned, {len(seen):,} total, "
+                  f"${c.spent_usd:,.4f}", file=sys.stderr)
 
-        has_more = resp.get("has_next_page")
         if not isinstance(has_more, bool):
-            # Unknown, never "no more pages". This page's tweets are valid and
-            # were yielded above; only whether more of the window exists is
-            # unknown.
+            # Unknown, never "no more pages". This page's tweets were yielded
+            # above; only whether more of the window exists is unknown.
             raise IncompleteDataError(
                 f"advanced_search omitted has_next_page (got {has_more!r}); "
                 f"whether more of the window exists is unknown. The "
@@ -342,23 +409,21 @@ def search_window(client, query, since_ts=None, until_ts=None, *,
                 f"but the result is partial.")
 
         oldest = min(stamps)
+        new_until = oldest + 1          # re-include the boundary second
         if full and max(stamps) == oldest:
-            # Every tweet on a FULL page shares one second. A time window
-            # cannot page within a single second, so advancing past it drops
-            # whatever else was posted in that second. Record it — never lose
-            # data silently.
-            if progress:
-                print(f"  WARNING: 20+ tweets share second {oldest} "
-                      f"({datetime.fromtimestamp(oldest, timezone.utc):%Y-%m-%d %H:%M:%S}Z). "
-                      f"Time-window paging cannot split a second — some tweets "
-                      f"in it are unreachable and are being skipped.",
-                      file=sys.stderr)
-            raise IncompleteDataError(
-                f"20+ tweets share second {oldest}; time-window paging cannot "
-                f"split it, so the result is partial.")
-        else:
-            # Re-include the boundary second; dedupe by id handles the overlap.
-            new_until = oldest + 1
+            # A full page inside ONE second: a time window cannot page within
+            # it, so fetch that second again as disjoint halves.
+            for part in SECOND_SPLITS:
+                half, more = _search_page(
+                    c, f"{query} {part} since_time:{oldest} until_time:{oldest + 1}",
+                    replay)
+                yield from unseen(half)
+                if more is not False or len(half) >= SEARCH_PAGE:
+                    raise IncompleteDataError(
+                        f"{SEARCH_PAGE}+ tweets share second {oldest} even "
+                        f"split by reply status; time-window paging cannot "
+                        f"split it further, so the result is partial.")
+            new_until = oldest          # that whole second is now covered
 
         if until_ts is not None and new_until >= until_ts:
             new_until = until_ts - 1    # force progress rather than loop
@@ -367,18 +432,95 @@ def search_window(client, query, since_ts=None, until_ts=None, *,
             return                      # boundary reached = clean exhaustion
 
 
+def search_shards(client, query, since_ts, until_ts, *, shards=8,
+                  index_faves=False):
+    """search_window over [since_ts, until_ts) as parallel sub-windows.
+
+    One window is walked a page at a time (about two seconds each); the
+    account allows 20 requests a second. Yields the newest sub-window first.
+    A stop in any shard (ceiling, unprovable completeness, Ctrl-C) is raised
+    only AFTER every row every shard acquired has been yielded."""
+    span = until_ts - (since_ts or until_ts)
+    _prepare(client, query, index_faves)            # warn once, before the threads
+    shards = max(1, min(shards, span // 3600))      # under an hour each: don't
+    edges = [until_ts - span * i // shards for i in range(shards)] + [since_ts]
+
+    def walk(i):
+        rows = []
+        try:
+            for t in search_window(client, query, edges[i + 1], edges[i],
+                                   index_faves=index_faves):
+                rows.append(t)
+        except (CostLimitExceeded, IncompleteDataError) as exc:
+            return rows, exc
+        return rows, None
+
+    futures = []
+    with ThreadPoolExecutor(shards) as pool:
+        try:
+            for i in range(shards):
+                futures.append(pool.submit(walk, i))
+            while wait(futures, timeout=10).not_done:
+                print(f"[search] {client.requests_made:,} requests, "
+                      f"${client.spent_usd:,.4f} spent, "
+                      f"{sum(f.done() for f in futures)}/{shards} shards done",
+                      file=sys.stderr)
+        except KeyboardInterrupt:
+            client.halt("stopped by the user")
+    stop, seen = None, set()
+    for future in futures:
+        rows, exc = future.result()
+        for t in rows:
+            # Whether the index treats a shard edge as inclusive is not a
+            # documented contract; a tweet on an edge must still appear once.
+            if t.get("id") not in seen:
+                seen.add(t.get("id"))
+                yield t
+        stop = stop or exc
+    if len(futures) < shards:           # interrupted before every shard began
+        stop = stop or CostLimitExceeded(client.halted)
+    if stop:
+        raise stop
+
+
+def anchored_now(client, key):
+    """`now` for a walk that ends at the present.
+
+    An unfinished walk with the same key in the last RESUME_MAX_AGE seconds
+    gives its own start time back, so the rerun requests identical windows
+    and replays every page already bought instead of paying for it again."""
+    if client.store is None:
+        return int(time.time())
+    client.store.drop_pages(SEARCH_PATH, RESUME_MAX_AGE)    # too old to replay
+    mark = client.store.get_page("walk", {"key": key}, RESUME_MAX_AGE) or {}
+    now = mark.get("now") or int(time.time())
+    client.store.put_page("walk", {"key": key}, {"now": now})
+    return now
+
+
+def finish_walk(client, key):
+    """The walk completed: the next run starts from the real present."""
+    if client.store is not None:
+        client.store.put_page("walk", {"key": key}, {})
+
+
 def history_search(query, since=None, until=None, *, max_usd=None,
-                   max_pages=None, client=None, progress=True):
+                   max_pages=None, client=None, progress=True,
+                   index_faves=False, now=None):
     """Historical tweet search over [since, until) as YYYY-MM-DD UTC days.
 
     Validates the window (malformed or inverted dates raise UsageError before
-    any request), then delegates to search_window(); see it for the walk and
-    completeness semantics. max_usd=None keeps a supplied client's ceiling.
+    any request). A bounded window without max_pages is walked in parallel
+    shards; see search_window for the completeness semantics. max_usd=None
+    keeps a supplied client's ceiling.
     """
     since_ts, until_ts = _window_ts(since, until)
     c = _bounded_client(client, max_usd)
-    return search_window(c, query, since_ts, until_ts, max_pages=max_pages,
-                         progress=progress)
+    until_ts = until_ts or now or int(time.time())
+    if since_ts is None or max_pages:
+        return search_window(c, query, since_ts, until_ts, max_pages=max_pages,
+                             progress=progress, index_faves=index_faves)
+    return search_shards(c, query, since_ts, until_ts, index_faves=index_faves)
 
 
 def _history_cli(a):
@@ -387,7 +529,7 @@ def _history_cli(a):
                          "query `from:USER`, so --query would be ignored")
     if a.user:
         a.user = _clean_handle(a.user)
-    since_ts, _ = _window_ts(a.since, a.until)
+    _window_ts(a.since, a.until)
     if a.max_pages is not None and a.max_pages < 1:
         raise UsageError(f"--max-pages must be at least 1, got {a.max_pages}")
     if a.include_retweets and not a.user:
@@ -396,18 +538,13 @@ def _history_cli(a):
     q = f"from:{a.user}" if a.user else a.query
     if a.exclude_replies:
         q += " -filter:replies"
-    prepare_search_query(q)     # refuses unsafe min_faves forms before any spend
-    c = Client(max_usd=a.max_usd)
-    if c.store is not None:
-        return _history_walk(a, c, q)
-    # History persists every paid page, so the CLI opens the store it writes
-    # and closes it on every exit path.
-    store_path = getattr(a, "store", None)
-    with (Store(store_path) if store_path else Store()) as c.store:
-        return _history_walk(a, c, q)
+    prepare_search_query(q, a.index_faves)  # refuses unsafe min_faves before any spend
+    c, fh = _cli_session(a)
+    with c.store:
+        return _history_walk(a, c, q, fh)
 
 
-def _history_walk(a, c, q):
+def _history_walk(a, c, q, fh):
     if not a.user:
         scope = ("raw query results; composition depends on the query and "
                  "native retweets are not added automatically")
@@ -423,7 +560,8 @@ def _history_walk(a, c, q):
     print(f"[history] scope: {scope}", file=sys.stderr)
     print(f"query: {q!r}  window {a.since or 'any'} -> {a.until or 'now'}",
           file=sys.stderr)
-    fh = open(a.out, "w") if a.out else sys.stdout
+    walk_key = f"history:{q}:{a.since}:{a.until}:{a.include_retweets}"
+    now = anchored_now(c, walk_key)
     queries = [q]
     if a.include_retweets:
         queries.append(f"from:{a.user} filter:nativeretweets")
@@ -443,8 +581,8 @@ def _history_walk(a, c, q):
                          else "original/reply/quote pass")
                 print(f"[history] {label}: {search_query!r}", file=sys.stderr)
             records = iter(history_search(
-                search_query, a.since, a.until, client=c,
-                max_usd=a.max_usd, max_pages=a.max_pages))
+                search_query, a.since, a.until, client=c, max_usd=a.max_usd,
+                max_pages=a.max_pages, index_faves=a.index_faves, now=now))
             while True:
                 try:
                     t = next(records)
@@ -458,11 +596,11 @@ def _history_walk(a, c, q):
                     truncated_reason = str(e)
                     print(f"\nSTOPPED: {e}", file=sys.stderr)
                     break
-                except CostLimitExceeded as e:
+                except (CostLimitExceeded, KeyboardInterrupt) as e:
                     # The spend ceiling is shared across passes, so another
                     # pass cannot make useful progress once it is exhausted.
                     truncated = True
-                    truncated_reason = str(e)
+                    truncated_reason = str(e) or "stopped by the user"
                     stop_all_passes = True
                     print(f"\nSTOPPED: {e}", file=sys.stderr)
                     break
@@ -562,8 +700,8 @@ def _history_walk(a, c, q):
         index_limited = True
         truncated_reason = ("full-lifetime coverage cannot be established because "
                             "the search index does not reach account creation")
-        oldest_day = datetime.fromtimestamp(oldest_ts, timezone.utc).date()
-        created_day = datetime.fromtimestamp(account_created_ts, timezone.utc).date()
+        oldest_day = datetime.fromtimestamp(oldest_ts, UTC).date()
+        created_day = datetime.fromtimestamp(account_created_ts, UTC).date()
         gap_days = (oldest_day - created_day).days
         day_word = "day" if gap_days == 1 else "days"
         print(f"[history] INDEX COVERAGE: PARTIAL — the search reached back to "
@@ -575,6 +713,8 @@ def _history_walk(a, c, q):
               file=sys.stderr)
     print(f"{n:,} tweets | {c.spend_report()}", file=sys.stderr)
     complete = not (truncated or index_limited)
+    if not truncated:
+        finish_walk(c, walk_key)
     summary = success(
         "workflows.py history", {
             "tweets_count": f"{n} of {n if complete else 'unknown'} total",
@@ -585,8 +725,10 @@ def _history_walk(a, c, q):
             "help": (["Run `workflows.py history <user> --full` for complete text"]
                      if was_text_truncated else []),
         }, complete=complete, reason=truncated_reason,
-        resume=("Raise `--max-usd <amount>`, raise `--max-pages <count>`, or narrow "
-                "the date window" if not complete else None), records_returned=n)
+        resume=("Rerun the same command within 24 hours with a new `--out`: "
+                "pages already bought replay free. Raise `--max-usd <amount>` "
+                "or `--max-pages <count>` if one of them stopped the walk"
+                if not complete else None), records_returned=n)
     print(json.dumps(summary, ensure_ascii=False) if not a.out else
           json.dumps(summary, indent=2, ensure_ascii=False))
     return 0
@@ -651,7 +793,13 @@ def monitor(users, *, interval=60, max_usd=None, state_file=None, client=None,
     # order, so list(set)[-N:] keeps an arbitrary subset.
     seen_ids = list(state.get("seen_ids") or [])[-MONITOR_SEEN_CAP:]
     seen_set = set(seen_ids)
-    q = "(" + " OR ".join(f"from:{u}" for u in users) + ")"
+    # One OR query per group of handles that fits X's query length.
+    queries = []
+    for user in users:
+        if queries and len(queries[-1]) + len(user) + 9 <= MAX_QUERY_CHARS:
+            queries[-1] += f" OR from:{user}"
+        else:
+            queries.append(f"from:{user}")
     if state_file and "last_ts" not in state:
         # Pin the cold-start window now: a first poll that stops early must
         # resume here, not at a later now - lookback that skips posts.
@@ -663,7 +811,8 @@ def monitor(users, *, interval=60, max_usd=None, state_file=None, client=None,
         # drop everything past the 20th tweet in a busy interval, so walk the
         # window with the shared sliding-window walker.
         new = []
-        for t in search_window(c, q, max(0, window_start - overlap), now):
+        for t in (t for q in queries for t in search_window(
+                c, f"({q})", max(0, window_start - overlap), now, replay=False)):
             tweet_id = t.get("id")
             if tweet_id in seen_set:
                 continue
@@ -700,7 +849,12 @@ def _print_tweet(t):
 
 def _monitor_cli(a):
     users = _monitor_params(a.users, a.interval, a.lookback, a.overlap)
-    c = Client(max_usd=a.max_usd)
+    c, _ = _cli_session(a)
+    with c.store:
+        return _monitor_run(a, c, users)
+
+
+def _monitor_run(a, c, users):
     print(f"monitoring {users} every {a.interval}s "
           f"(~${credits_to_usd(15) * (86400 / a.interval):.2f}/day at minimum billing)",
           file=sys.stderr)
@@ -761,7 +915,8 @@ def _main(argv=None):
         return 0
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:
-        emit(dashboard(__file__, "Run streaming twitterapi.io audience, history, and monitor workflows"))
+        emit(dashboard(
+            __file__, "Run streaming twitterapi.io audience, history, and monitor workflows"))
         return 0
     p = _parser()
     args = p.parse_args(argv)
@@ -781,22 +936,24 @@ def _parser():
 
     a = sub.add_parser("audience", help="enumerate an account's followers",
                        formatter_class=HelpFormatter,
-                       epilog="Examples:\n  workflows.py audience <user> --limit <count>\n  workflows.py audience <user> --profiles --fields id,user_name,name")
+                       epilog=("Examples:\n"
+                               "  workflows.py audience <user> --limit <count>\n"
+                               "  workflows.py audience <user> --profiles "
+                               "--fields id,user_name,name"))
     a.add_argument("user", help="account handle")
     a.add_argument("--limit", type=int, help="maximum follower records")
     a.add_argument("--profiles", dest="ids_only", action="store_false",
                    help="fetch full profiles (2.2x cost) instead of IDs")
     a.add_argument("--verified-only", action="store_true",
                    help="use the verified-followers endpoint")
-    a.add_argument("--out", help="write record JSONL to this path")
-    a.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
-                   help="hard spend ceiling (default 5.00)")
-    add_common_output_flags(a)
+    a.add_argument("--out", help="write record JSONL to this new path")
     a.set_defaults(func=_audience_cli)
 
     h = sub.add_parser("history", help="historical tweet search",
                        formatter_class=HelpFormatter,
-                       epilog="Examples:\n  workflows.py history <user> --since <YYYY-MM-DD>\n  workflows.py history --query \"<query>\" --max-pages <count>")
+                       epilog=("Examples:\n"
+                               "  workflows.py history <user> --since <YYYY-MM-DD>\n"
+                               "  workflows.py history --query \"<query>\" --max-pages <count>"))
     h.add_argument("user", nargs="?", help="account handle (shorthand for from:USER)")
     h.add_argument("--query", help="raw X search query instead of a handle")
     h.add_argument("--since", help="YYYY-MM-DD")
@@ -806,16 +963,17 @@ def _parser():
                    help="second pass with filter:nativeretweets to capture "
                         "retweets, which `from:` alone omits entirely")
     h.add_argument("--max-pages", type=int, help="maximum pages per search pass")
-    h.add_argument("--store", help="sqlite path for the persisted history corpus")
-    h.add_argument("--out", help="write record JSONL to this path")
-    h.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
-                   help="hard spend ceiling (default 5.00)")
-    add_common_output_flags(h)
+    h.add_argument("--index-faves", action="store_true",
+                   help="let the search index apply min_faves: far cheaper, "
+                        "but it can miss posts whose likes rose recently")
+    h.add_argument("--out", help="write record JSONL to this new path")
     h.set_defaults(func=_history_cli)
 
     m = sub.add_parser("monitor", help="poll accounts for new tweets",
                        formatter_class=HelpFormatter,
-                       epilog="Examples:\n  workflows.py monitor <user>,<user> --once\n  workflows.py monitor <users> --state <path>")
+                       epilog=("Examples:\n"
+                               "  workflows.py monitor <user>,<user> --once\n"
+                               "  workflows.py monitor <users> --state <path>"))
     m.add_argument("users", help="comma-separated handles")
     m.add_argument("--interval", type=int, default=60,
                    help="poll interval in seconds")
@@ -826,10 +984,13 @@ def _parser():
     m.add_argument("--overlap", type=int, default=MONITOR_OVERLAP,
                    help="seconds each poll re-scans before the last window, "
                         "to catch late-indexed posts; re-scanned posts are billed")
-    m.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
-                   help="hard spend ceiling (default 5.00)")
-    add_common_output_flags(m)
     m.set_defaults(func=_monitor_cli)
+    for q in (a, h, m):
+        q.add_argument("--max-usd", type=float, default=argparse.SUPPRESS,
+                       help="hard spend ceiling (default 5.00)")
+        q.add_argument("--store", default=argparse.SUPPRESS,
+                       help="SQLite store path (default ~/.twitterapi-cache/store.db)")
+        add_common_output_flags(q)
     return p
 
 

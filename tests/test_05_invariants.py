@@ -14,18 +14,18 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.e2e_base import E2ETest, require_key
+from tests.e2e_base import E2ETest
 from tests.fakes import ScriptedClient, client_class
 
 
 def tweet(tweet_id, ts, handle="alpha"):
     return {
         "id": str(tweet_id),
-        "createdAt": datetime.fromtimestamp(ts, timezone.utc).strftime(
+        "createdAt": datetime.fromtimestamp(ts, UTC).strftime(
             "%a %b %d %H:%M:%S %z %Y"),
         "author": {"id": f"u-{handle}", "userName": handle},
         "likeCount": 0,
@@ -33,18 +33,42 @@ def tweet(tweet_id, ts, handle="alpha"):
 
 
 class MemoryStore:
+    """The store surface the search walk uses, held in memory."""
+
     def __init__(self):
-        self.tweets = []
+        self.tweets, self.pages = [], {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
     def put_tweets(self, records):
         self.tweets.extend(records)
+
+    def raw_tweets(self, ids):
+        held = {t["id"]: t for t in self.tweets}
+        return [held[i] for i in ids] if all(i in held for i in ids) else None
+
+    def get_page(self, path, params, max_age=None):
+        return self.pages.get((path, json.dumps(params, sort_keys=True)))
+
+    def put_page(self, path, params, body, credits=0):
+        self.pages[(path, json.dumps(params, sort_keys=True))] = body
+
+    def drop_pages(self, path, older_than):
+        pass
+
+    def record_run(self, *args):
+        pass
 
 
 class StoreWriteError(RuntimeError):
     pass
 
 
-class FailingStore:
+class FailingStore(MemoryStore):
     def put_tweets(self, records):
         raise StoreWriteError("sqlite write failed")
 
@@ -194,34 +218,6 @@ class TestCohortHydrationMoney(E2ETest):
         self.assertEqual(co.handles(), ["user0", "user1"])
 
 
-class TestBulkSearchInvariants(E2ETest):
-    def test_empty_bulk_search_makes_no_paid_request(self):
-        """No work must not incur even the API's per-request billing floor."""
-        c = ScriptedClient(raw_json=[{"results": {}}])
-        self.assertEqual(c.bulk_search([]), [])
-        self.assertEqual(c.json_calls, [], "empty work must not reach transport")
-        self.assertEqual(c.spent_credits, 0.0)
-
-    def test_missing_bulk_subresult_is_not_reported_as_complete_empty_data(self):
-        """A malformed batch cannot turn a missing account into a zero-tweet one."""
-        c = ScriptedClient(raw_json=[{
-            "results": {"query_0": {"tweets": [], "has_next_page": False}}
-        }])
-        with self.assertRaises(RuntimeError):
-            c.bulk_search(["from:alpha", "from:beta"])
-
-    def test_bulk_batch_is_refused_before_its_max_charge_can_cross_ceiling(self):
-        """One POST must not overspend merely because its subqueries bill together."""
-        c = ScriptedClient(
-            raw_json=[{"results": {}}], max_usd=0.005)
-        with self.assertRaises(Exception) as cm:
-            c.bulk_search(["from:alpha", "from:beta"])
-        from twitterapi import CostLimitExceeded
-        self.assertIsInstance(cm.exception, CostLimitExceeded)
-        self.assertEqual(c.json_calls, [], "refusal must happen before transport")
-        self.assertEqual(c.spent_credits, 0.0)
-
-
 class TestPaginationInvariants(E2ETest):
     def test_paid_articles_survive_a_later_api_failure_as_flagged_partial(self):
         """F24: a broken continuation must not destroy already-paid articles."""
@@ -317,32 +313,12 @@ class TestPaginationInvariants(E2ETest):
         c = ScriptedClient(raw=[page], store=path)
         self.addCleanup(lambda: getattr(c.store, "close", lambda: None)())
 
-        got = list(c.paginate("search", "from:alpha"))
+        got = list(c.paginate("mentions", "alpha"))
 
         self.assertEqual([t["id"] for t in got], ["paid"])
         self.assertNotIsInstance(c.store, str)
         self.assertEqual(c.store.tweets_for(user_names=["alpha"])[0]["id"],
                          "paid")
-
-    def test_search_min_faves_uses_response_counts_not_stale_index_filter(self):
-        """A fresh likeCount must be the ground truth for engagement filters."""
-        qualifying = dict(tweet("target", 1_700_000_002), likeCount=109)
-        below = dict(tweet("below", 1_700_000_001), likeCount=99)
-        store = MemoryStore()
-        c = ScriptedClient(raw=[{
-            "tweets": [qualifying, below],
-            "has_next_page": False,
-            "next_cursor": "",
-        }], store=store)
-
-        got = list(c.paginate(
-            "search", "from:alpha min_faves:100", limit=20))
-
-        self.assertEqual([t["id"] for t in got], ["target"])
-        self.assertNotIn("min_faves:", c.raw_calls[0][2]["query"])
-        self.assertEqual({t["id"] for t in store.tweets},
-                         {"target", "below"},
-                         "all paid rows should remain available to the cache")
 
     def test_paginate_surfaces_normalized_media_on_tweets(self):
         """Callers must not need to know the extendedEntities wire shape."""
@@ -356,7 +332,7 @@ class TestPaginationInvariants(E2ETest):
             "tweets": [record], "has_next_page": False, "next_cursor": "",
         }])
 
-        got = list(c.paginate("search", "from:alpha"))
+        got = list(c.paginate("mentions", "alpha"))
 
         self.assertEqual(got[0]["media"][0]["type"], "photo")
         self.assertEqual(got[0]["media"][0]["alt_text"],
@@ -364,69 +340,14 @@ class TestPaginationInvariants(E2ETest):
         self.assertIn("name=4096x4096",
                       got[0]["media"][0]["full_resolution_url"])
 
-    def test_search_min_faves_requires_an_explicit_full_scan_budget(self):
-        """A returned-row limit must not masquerade as a paid-scan bound."""
-        c = ScriptedClient(raw=[{
-            "tweets": [], "has_next_page": False, "next_cursor": "",
-        }], max_usd=None)
-
-        with self.assertRaises(ValueError) as cm:
-            list(c.paginate(
-                "search", "from:alpha min_faves:1000", limit=10))
-
-        self.assertEqual(c.raw_calls, [], "refusal must precede paid transport")
-        message = str(cm.exception).lower()
-        self.assertIn("limit", message)
-        self.assertIn("max_usd", message)
-        self.assertIn("full", message)
-
-    def test_search_min_faves_warns_that_limit_does_not_bound_scan(self):
-        """A budgeted local predicate must disclose its scan-cost contract."""
-        c = ScriptedClient(raw=[{
-            "tweets": [], "has_next_page": False, "next_cursor": "",
-        }], max_usd=0.05)
-        err = io.StringIO()
-
-        with contextlib.redirect_stderr(err):
-            list(c.paginate(
-                "search", "from:alpha min_faves:1000", limit=10))
-
-        warning = err.getvalue().lower()
-        self.assertIn("limit=10", warning)
-        self.assertIn("returned", warning)
-        self.assertIn("max_usd", warning)
-        self.assertIn("scan", warning)
-
-    def test_zero_min_faves_keeps_the_normal_limit_cost_contract(self):
-        """A no-op engagement floor must not force full-scan budgeting."""
-        c = ScriptedClient(raw=[{
-            "tweets": [tweet("one", 1_700_000_000)],
-            "has_next_page": False,
-            "next_cursor": "",
-        }], max_usd=None)
-        err = io.StringIO()
-
-        with contextlib.redirect_stderr(err):
-            got = list(c.paginate(
-                "search", "from:alpha min_faves:0", limit=10))
-
-        self.assertEqual([item["id"] for item in got], ["one"])
-        self.assertNotIn("scan", err.getvalue().lower())
-
-    def test_search_bare_dates_are_normalized_to_utc_day_boundaries(self):
-        """Bare search dates must not inherit the index's shifted timezone."""
-        c = ScriptedClient(raw=[{
-            "tweets": [], "has_next_page": False, "next_cursor": "",
-        }])
-
-        list(c.paginate(
-            "search",
-            "from:alpha since:2026-07-01 until:2026-08-01"))
-
-        sent = c.raw_calls[0][2]["query"]
-        self.assertIn("since:2026-07-01_00:00:00_UTC", sent)
-        self.assertIn("until:2026-08-01_00:00:00_UTC", sent)
-        self.assertNotIn("since:2026-07-01 ", sent)
+    def test_search_is_not_served_by_cursor_pagination(self):
+        """Cursors loop on old ranges; search has exactly one walker."""
+        from twitterapi import UsageError
+        c = ScriptedClient(raw=[])
+        with self.assertRaises(UsageError) as cm:
+            list(c.paginate("search", "from:alpha"))
+        self.assertIn("search_window", str(cm.exception))
+        self.assertEqual(c.raw_calls, [])
 
     def test_next_page_is_refused_when_one_bounded_page_can_cross_ceiling(self):
         """A terminal page cannot overspend and then look successful."""
@@ -435,7 +356,7 @@ class TestPaginationInvariants(E2ETest):
         c = ScriptedClient(raw=[page], max_usd=0.002)
         from twitterapi import CostLimitExceeded
         with self.assertRaises(CostLimitExceeded):
-            list(c.paginate("search", "from:alpha"))
+            list(c.paginate("mentions", "alpha"))
         self.assertEqual(c.raw_calls, [], "known page maximum must be reserved pre-request")
         self.assertEqual(c.spent_credits, 0.0)
 
@@ -450,7 +371,7 @@ class TestPaginationInvariants(E2ETest):
              "has_next_page": False, "next_cursor": ""},
         ]
         c = ScriptedClient(raw=pages)
-        got = [t["id"] for t in c.paginate("search", "from:alpha", limit=4)]
+        got = [t["id"] for t in c.paginate("mentions", "alpha", limit=4)]
         self.assertEqual(got, ["1", "2", "3", "4"])
         self.assertEqual(len(c.raw_calls), 3,
                          "a duplicate must not satisfy the caller's unique limit")
@@ -472,7 +393,7 @@ class TestPaginationInvariants(E2ETest):
         for label, pages in cases.items():
             with self.subTest(label=label):
                 c = ScriptedClient(raw=pages)
-                stream = c.paginate("search", "from:alpha")
+                stream = c.paginate("mentions", "alpha")
                 got = list(stream)
                 self.assertGreater(len(got), 0)
                 self.assertFalse(stream.complete)
@@ -480,91 +401,185 @@ class TestPaginationInvariants(E2ETest):
 
 
 class TestCorpusInvariants(E2ETest):
-    def test_corpus_batches_unique_handles_and_resumes_without_boundary_loss(self):
-        """Duplicate handles must not rebill, and the first batched page must join its walk."""
-        from jobs import corpus
-        base = 1_700_000_000
-        first = [tweet(f"a{i}", base - i, "Alpha") for i in range(20)]
-        boundary_walk = [tweet("a19", base - 19, "Alpha")] + [
-            tweet(f"a{i}", base - i, "Alpha") for i in range(20, 39)]
-        tail = [tweet("a39", base - 39, "Alpha")]
-        bulk = {"results": {
-            "query_0": {"tweets": first, "has_next_page": True,
-                        "next_cursor": "ignored"},
-            "query_1": {"tweets": [tweet("b0", base - 5, "beta")],
-                        "has_next_page": False, "next_cursor": ""},
-            # Present only so the unmodified duplicate-query implementation can finish.
-            "query_2": {"tweets": first, "has_next_page": False,
-                        "next_cursor": ""},
-        }}
-        c = ScriptedClient(
-            raw_json=[bulk],
-            raw=[
-                {"tweets": boundary_walk, "has_next_page": True,
-                 "next_cursor": "ignored"},
-                {"tweets": tail, "has_next_page": False, "next_cursor": ""},
-            ],
-            store=MemoryStore())
-        got = corpus(["@Alpha", "beta", "alpha"], since_ts=base - 100,
-                     until_ts=base + 1, client=c)
-        self.assertEqual(len({t["id"] for t in got}), 41)
-        sent = c.json_calls[0][2]["queries"]
-        self.assertEqual([q["query"] for q in sent], [
-            f"from:Alpha since_time:{base - 100} until_time:{base + 1}",
-            f"from:beta since_time:{base - 100} until_time:{base + 1}",
-        ], "case-insensitive duplicate handles must not create a paid subquery")
-        self.assertIn(f"until_time:{base - 18}", c.raw_calls[0][2]["query"],
-                      "resume must re-include the oldest batched second")
+    @staticmethod
+    def _by_handle(base):
+        def answer(path, params):
+            handle = params["query"].split()[0].removeprefix("from:")
+            return {"tweets": [tweet(f"{handle}-1", base, handle)],
+                    "has_next_page": False}
+        return answer
 
-    def test_bulk_transport_failure_falls_back_and_retrieves_every_handle(self):
-        """Batching is an optimization; its failure must not omit an account."""
+    def test_corpus_walks_each_unique_handle_once_inside_the_window(self):
+        """Repeating @Name as name must not buy the same account twice."""
         from jobs import corpus
-        from twitterapi import APIError
         base = 1_700_000_000
-        c = ScriptedClient(
-            raw_json=[APIError(503, "temporary", "/bulk")],
-            raw=[
-                {"tweets": [tweet("a", base, "alpha")],
-                 "has_next_page": False, "next_cursor": ""},
-                {"tweets": [tweet("b", base, "beta")],
-                 "has_next_page": False, "next_cursor": ""},
-            ], store=MemoryStore())
-        got = corpus(["alpha", "beta"], since_ts=base - 5,
-                     until_ts=base + 5, client=c)
-        self.assertEqual({t["id"] for t in got}, {"a", "b"})
-        walked = [call[2]["query"].split()[0] for call in c.raw_calls]
-        self.assertCountEqual(walked, ["from:alpha", "from:beta"])
+        c = ScriptedClient(raw=self._by_handle(base), store=MemoryStore())
+        got = list(corpus(["@Alpha", "beta", "alpha", " "], base - 100, base + 1,
+                          client=c))
+        self.assertEqual([t["id"] for t in got], ["Alpha-1", "beta-1"])
+        self.assertEqual([call[2]["query"] for call in c.raw_calls], [
+            f"from:Alpha since_time:{base - 100} until_time:{base + 1}",
+            f"from:beta since_time:{base - 100} until_time:{base + 1}"])
+
+    def test_a_stop_in_a_later_handle_keeps_the_earlier_handles_rows(self):
+        """A truncated corpus must surface as a stop, after the paid rows."""
+        from jobs import corpus
+        from twitterapi import IncompleteDataError
+        base = 1_700_000_000
+        c = ScriptedClient(raw=[
+            {"tweets": [tweet("a", base, "alpha")], "has_next_page": False},
+            {"tweets": [tweet("b", base, "beta")]},        # no has_next_page
+        ], store=MemoryStore())
+        got = []
+        with self.assertRaises(IncompleteDataError):
+            for t in corpus(["alpha", "beta"], base - 5, base + 5, client=c):
+                got.append(t)
+        self.assertEqual([t["id"] for t in got], ["a", "b"])
 
     def test_local_store_failure_does_not_trigger_more_paid_searches(self):
-        """A SQLite failure after a successful batch must not cause surprise API spend."""
+        """A SQLite failure after a paid page must not cause surprise API spend."""
         from jobs import corpus
         base = 1_700_000_000
-        bulk = {"results": {"query_0": {
-            "tweets": [tweet("a", base, "alpha")],
-            "has_next_page": False, "next_cursor": ""}}}
-        c = ScriptedClient(
-            raw_json=[bulk],
-            raw=[{"tweets": [tweet("a", base, "alpha")],
-                  "has_next_page": False, "next_cursor": ""}],
-            store=FailingStore())
+        c = ScriptedClient(raw=self._by_handle(base), store=FailingStore())
         with self.assertRaises(StoreWriteError):
-            corpus(["alpha"], since_ts=base - 5, until_ts=base + 5, client=c)
-        self.assertEqual(c.raw_calls, [],
-                         "persistence errors are not authorization for paid fallback")
+            list(corpus(["alpha", "beta"], base - 5, base + 5, client=c))
+        self.assertEqual(len(c.raw_calls), 1,
+                         "persistence errors are not authorization for more spend")
 
 
 class TestWindowCompleteness(E2ETest):
-    def test_full_page_inside_one_second_raises_incomplete(self):
-        """An unsplittable second cannot produce a confidently complete count."""
+    def test_a_full_second_is_split_by_reply_status_and_walked_whole(self):
+        """Thirty tweets in one second: a time window shows 20; the two
+        disjoint halves must recover all 30 and prove the window walked."""
         from workflows import search_window
         base = 1_700_000_000
+        replies = [tweet(f"r{i}", base) for i in range(12)]
+        others = [tweet(f"o{i}", base) for i in range(18)]
         c = ScriptedClient(raw=[
-            {"tweets": [tweet(i, base) for i in range(20)],
-             "has_next_page": True, "next_cursor": "ignored"},
-            {"tweets": [], "has_next_page": False, "next_cursor": ""},
+            {"tweets": (replies + others)[:20], "has_next_page": True},
+            {"tweets": replies, "has_next_page": False},
+            {"tweets": others, "has_next_page": False},
+            {"tweets": [], "has_next_page": False},
         ], store=MemoryStore())
-        with self.assertRaises(RuntimeError):
-            list(search_window(c, "from:alpha", base - 5, base + 5, max_pages=2))
+        got = list(search_window(c, "from:alpha", base - 5, base + 5))
+        self.assertEqual(len({t["id"] for t in got}), 30)
+        self.assertEqual(len(got), 30, "each id is yielded once")
+        queries = [call[2]["query"] for call in c.raw_calls]
+        self.assertEqual(queries[1], f"from:alpha filter:replies since_time:{base} "
+                                     f"until_time:{base + 1}")
+        self.assertEqual(queries[2], f"from:alpha -filter:replies since_time:{base} "
+                                     f"until_time:{base + 1}")
+        self.assertIn(f"until_time:{base}", queries[3],
+                      "the walk resumes below the second it just covered")
+
+    def test_a_second_that_is_still_full_after_the_split_raises_incomplete(self):
+        """An unsplittable second cannot produce a confidently complete count."""
+        from twitterapi import IncompleteDataError
+        from workflows import search_window
+        base = 1_700_000_000
+        full = {"tweets": [tweet(i, base) for i in range(20)], "has_next_page": True}
+        c = ScriptedClient(raw=[full, dict(full)], store=MemoryStore())
+        got = []
+        with self.assertRaises(IncompleteDataError) as cm:
+            for t in search_window(c, "from:alpha", base - 5, base + 5):
+                got.append(t)
+        self.assertEqual(len(got), 20, "the paid rows are yielded before the stop")
+        self.assertIn(str(base), str(cm.exception))
+
+    def test_a_rerun_of_the_same_window_replays_what_was_bought(self):
+        """A stopped walk must not pay for its first pages again."""
+        from workflows import search_window
+        base = 1_700_000_000
+        pages = [
+            {"tweets": [tweet(i, base - i) for i in range(20)], "has_next_page": True},
+            {"tweets": [tweet(i, base - i) for i in range(19, 25)], "has_next_page": False},
+        ]
+        store = self.fresh_store("window-replay")
+        first = ScriptedClient(raw=list(pages), store=store)
+        bought = [t["id"] for t in search_window(first, "from:alpha", base - 100, base + 5)]
+        rerun = ScriptedClient(raw=[], store=store)
+        replayed = [t["id"] for t in search_window(rerun, "from:alpha", base - 100, base + 5)]
+        self.assertEqual(replayed, bought)
+        self.assertEqual(len(bought), 25)
+        self.assertEqual(rerun.raw_calls, [], "every page came from the store")
+        self.assertEqual(rerun.spent_credits, 0.0)
+        self.assertEqual(rerun.cache_hits, 2)
+        self.assertGreater(rerun.saved_credits, 0)
+
+    def test_replay_buys_a_page_again_when_its_rows_are_gone(self):
+        """An id list whose tweets are missing is not a page; never return
+        fewer rows than were bought."""
+        from workflows import search_window
+        base = 1_700_000_000
+        page = {"tweets": [tweet("a", base), tweet("b", base - 1)], "has_next_page": False}
+        store = self.fresh_store("window-replay-gap")
+        list(search_window(ScriptedClient(raw=[page], store=store),
+                           "from:alpha", base - 100, base + 5))
+        store.db.execute("DELETE FROM tweets WHERE id='b'")
+        store.db.commit()
+        rerun = ScriptedClient(raw=[page], store=store)
+        got = [t["id"] for t in search_window(rerun, "from:alpha", base - 100, base + 5)]
+        self.assertEqual(got, ["a", "b"])
+        self.assertEqual(len(rerun.raw_calls), 1)
+
+    def test_an_open_ended_walk_is_never_replayed(self):
+        """Without a fixed end the same query means a different window."""
+        from workflows import search_window
+        page = {"tweets": [tweet("a", 1_700_000_000)], "has_next_page": False}
+        store = self.fresh_store("window-open")
+        for _ in range(2):
+            c = ScriptedClient(raw=[page], store=store)
+            list(search_window(c, "from:alpha"))
+            self.assertEqual(len(c.raw_calls), 1)
+
+    def test_min_faves_is_checked_locally_and_warns_of_the_full_scan(self):
+        """A fresh likeCount is the ground truth, and the cost is disclosed."""
+        from workflows import search_window
+        qualifying = dict(tweet("target", 1_700_000_002), likeCount=109)
+        below = dict(tweet("below", 1_700_000_001), likeCount=99)
+        store = MemoryStore()
+        c = ScriptedClient(raw=[{"tweets": [qualifying, below],
+                                 "has_next_page": False}], store=store)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = list(search_window(c, "from:alpha min_faves:100"))
+        self.assertEqual([t["id"] for t in got], ["target"])
+        self.assertNotIn("min_faves:", c.raw_calls[0][2]["query"])
+        self.assertEqual({t["id"] for t in store.tweets}, {"target", "below"},
+                         "all paid rows should remain available to the cache")
+        warning = err.getvalue()
+        self.assertIn("WARNING", warning)
+        self.assertIn("--index-faves", warning)
+        self.assertIn("$1.00 ceiling", warning)
+
+    def test_index_faves_sends_the_threshold_and_filters_nothing(self):
+        from workflows import search_window
+        rows = [dict(tweet("stale-count", 1_700_000_002), likeCount=3)]
+        c = ScriptedClient(raw=[{"tweets": rows, "has_next_page": False}])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = list(search_window(c, "from:alpha min_faves:100", index_faves=True))
+        self.assertIn("min_faves:100", c.raw_calls[0][2]["query"])
+        self.assertEqual([t["id"] for t in got], ["stale-count"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_zero_min_faves_and_plain_queries_do_not_warn(self):
+        from workflows import search_window
+        for query in ("from:alpha min_faves:0", "from:alpha"):
+            c = ScriptedClient(raw=[{"tweets": [], "has_next_page": False}])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                list(search_window(c, query))
+            self.assertEqual(err.getvalue(), "", query)
+
+    def test_bare_dates_are_normalized_to_utc_day_boundaries(self):
+        """Bare search dates must not inherit the index's shifted timezone."""
+        from workflows import search_window
+        c = ScriptedClient(raw=[{"tweets": [], "has_next_page": False}])
+        list(search_window(c, "from:alpha since:2026-07-01 until:2026-08-01"))
+        sent = c.raw_calls[0][2]["query"]
+        self.assertIn("since:2026-07-01_00:00:00_UTC", sent)
+        self.assertIn("until:2026-08-01_00:00:00_UTC", sent)
 
     def test_max_pages_exhaustion_raises_incomplete(self):
         """A safety cap is not evidence that the requested time range ended."""
@@ -594,7 +609,7 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         import jobs
 
         path = self.store_path("network-job-store")
-        client = SimpleNamespace(store=SimpleNamespace(close=mock.Mock()))
+        client = SimpleNamespace(store=mock.Mock())
         output = io.StringIO()
         with mock.patch.dict(jobs.os.environ, {"TWITTERAPI_IO_KEY": "test"}), \
              mock.patch.object(jobs, "Client", return_value=client) as client_type, \
@@ -608,12 +623,13 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         self.assertTrue(json.loads(output.getvalue())["shared"])
         # Client converts the path to a Store; the job closes it afterwards.
         client_type.assert_called_once_with(
-            verbose=False, store=path, max_usd=5.0)
+            verbose=False, store=path, max_usd=5.0, cache_max_age=None)
         client.store.close.assert_called_once_with()
 
     def test_diffusion_transport_failure_is_not_reported_as_zero_engagement(self):
         """Failed engagement crawls must not become a confident all-zero trace."""
         import urllib.error
+
         from jobs import diffusion_trace
 
         class FailingClient:
@@ -631,8 +647,8 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         import jobs
         calls = []
 
-        def fake_corpus(handles, since_ts=None, until_ts=None, client=None):
-            calls.append((list(handles), since_ts, client))
+        def fake_corpus(handles, since_ts, until_ts, client=None):
+            calls.append((list(handles), until_ts - since_ts, client))
             return [tweet("a", 1_700_000_000, "alpha"),
                     tweet("b", 1_700_000_000, "beta")]
 
@@ -648,7 +664,7 @@ class TestJobAndWorkflowOrchestration(E2ETest):
             out = jobs.competitive_benchmark(["alpha", "beta"], days=7,
                                              client=C())
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], ["alpha", "beta"])
+        self.assertEqual(calls[0][:2], (["alpha", "beta"], 7 * 86400))
         self.assertEqual([r["tweets_in_window"] for r in out["entities"]], [1, 1])
 
     def test_monitor_does_not_advance_checkpoint_after_incomplete_window(self):
@@ -703,7 +719,7 @@ class TestHistoryHonesty(E2ETest):
             "user": "alpha", "query": None, "since": None, "until": None,
             "exclude_replies": False,
             "include_retweets": False, "max_pages": None, "max_usd": 1.0,
-            "out": None, "store": None,
+            "out": None, "store": None, "index_faves": False,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -741,35 +757,46 @@ class TestHistoryHonesty(E2ETest):
         and must close the store it opened."""
         import workflows
         from jobs import catalogue
-        from store import Store
 
+        created = []
         scripted = client_class(raw=[{
             "tweets": [tweet("paid", 1_700_000_001, "alpha")],
             "has_next_page": False,
             "next_cursor": "",
-        }])
-        output = tempfile.NamedTemporaryFile()
-        self.addCleanup(output.close)
+        }], created=created)
         store_path = self.store_path("history-cli-store")
-        opened = []
-
-        def store_type(*args):
-            opened.append(Store(*args))
-            return opened[-1]
 
         with mock.patch.object(workflows, "Client", scripted), \
-             mock.patch.object(workflows, "Store", side_effect=store_type), \
              contextlib.redirect_stdout(io.StringIO()), \
              contextlib.redirect_stderr(io.StringIO()):
-            rc = workflows._history_cli(
-                self._args(out=output.name, store=store_path))
+            rc = workflows._history_cli(self._args(
+                out=self.store_path("history-cli-out.jsonl"), store=store_path))
 
         self.assertEqual(rc, 0)
-        self.assertEqual(len(opened), 1)
+        self.assertEqual(len(created), 1)
         with self.assertRaises(sqlite3.ProgrammingError):
-            opened[0].db.execute("SELECT 1")     # closed by the CLI
+            created[0].store.db.execute("SELECT 1")     # closed by the CLI
         store = self.fresh_store("history-cli-store")
         self.assertEqual(catalogue("alpha", store=store)["counts"]["total"], 1)
+
+    def test_an_existing_out_file_is_refused_before_any_request(self):
+        """A rerun must not empty the rows the first run wrote."""
+        import workflows
+        from twitterapi import UsageError
+
+        created = []
+        out_path = self.store_path("history-existing-out.jsonl")
+        with open(out_path, "w") as fh:
+            fh.write("first run\n")
+        for cli, args in ((workflows._history_cli, self._args(out=out_path)),
+                          (workflows._audience_cli, SimpleNamespace(
+                              user="alpha", limit=None, out=out_path, max_usd=1.0))):
+            with mock.patch.object(workflows, "Client",
+                                   client_class(created=created)), self.assertRaises(UsageError):
+                cli(args)
+        self.assertEqual(created, [], "refused before a client or store exists")
+        with open(out_path) as fh:
+            self.assertEqual(fh.read(), "first run\n")
 
     def test_history_declares_scope_and_include_retweets_runs_second_pass(self):
         """A parsed flag cannot silently do nothing or leave omissions unstated."""
@@ -885,8 +912,8 @@ class TestHistoryHonesty(E2ETest):
         """Coverage diagnostics must not call a later crawl date 'before'."""
         import workflows
 
-        created = datetime(2021, 5, 12, tzinfo=timezone.utc)
-        oldest = datetime(2021, 5, 14, tzinfo=timezone.utc)
+        created = datetime(2021, 5, 12, tzinfo=UTC)
+        oldest = datetime(2021, 5, 14, tzinfo=UTC)
         rec = tweet("oldest-indexed", int(oldest.timestamp()), "alpha")
         rec["author"].update({
             "createdAt": created.strftime("%a %b %d %H:%M:%S %z %Y"),
@@ -900,11 +927,10 @@ class TestHistoryHonesty(E2ETest):
                                  store=MemoryStore(),
                                  spend_report=lambda: "1 request, ~$0.0030")
         out, err = io.StringIO(), io.StringIO()
-        with tempfile.NamedTemporaryFile() as output, \
-             mock.patch.object(workflows, "Client", return_value=client), \
+        with mock.patch.object(workflows, "Client", return_value=client), \
              mock.patch.object(workflows, "history_search", fake_history), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = workflows._history_cli(self._args(out=output.name))
+            rc = workflows._history_cli(self._args(out=self.store_path("history-out-coverage")))
 
         report = err.getvalue().lower()
         self.assertEqual(rc, 0)
@@ -932,11 +958,10 @@ class TestHistoryHonesty(E2ETest):
                                  store=MemoryStore(),
                                  spend_report=lambda: "1 request, ~$0.0030")
         out, err = io.StringIO(), io.StringIO()
-        with tempfile.NamedTemporaryFile() as output, \
-             mock.patch.object(workflows, "Client", return_value=client), \
+        with mock.patch.object(workflows, "Client", return_value=client), \
              mock.patch.object(workflows, "history_search", fake_history), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = workflows._history_cli(self._args(out=output.name))
+            rc = workflows._history_cli(self._args(out=self.store_path("history-out-gap")))
 
         report = err.getvalue().lower()
         self.assertEqual(rc, 0, "valid partial data uses exit 0 under AXI")
@@ -1282,21 +1307,6 @@ class TestSpendReporting(E2ETest):
         self.assertIn("oldest cached data served: 9.5 hours old", report)
 
 
-class TestLiveBulkSearch(E2ETest):
-    def test_live_bulk_search_shape_and_client_accounting(self):
-        """The real POST path must match the verified envelope and exact charge identity."""
-        require_key()
-        from twitterapi import Client
-        c = self.track(Client(verbose=False, max_usd=0.01,
-                              store=self.fresh_store("live_bulk")))
-        self.repro("Client().bulk_search(['from:kaitoinfra'])")
-        result = c.bulk_search(["from:kaitoinfra"])
-        self.assertEqual(len(result), 1)
-        self.assertEqual(set(result[0]), {"tweets", "has_next_page", "next_cursor"})
-        self.assertIsInstance(result[0]["tweets"], list)
-        expected = Client.page_credits("search", len(result[0]["tweets"]), 20)
-        self.assertEqual(c.spent_credits, expected,
-                         "one-query batch spend must equal its one search page")
 
 
 if __name__ == "__main__":

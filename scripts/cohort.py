@@ -18,12 +18,19 @@ from __future__ import annotations
 
 import os
 import sys
-import urllib.error
+from collections import Counter
+from itertools import islice
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import (APIError, Client, CostLimitExceeded,
-                        IncompleteDataError, credits_to_usd)  # noqa: E402
-from store import Store  # noqa: E402
+from store import Store
+from twitterapi import REQUEST_FAILURES as _REQUEST_FAILURES
+from twitterapi import (
+    APIError,
+    Client,
+    CostLimitExceeded,
+    IncompleteDataError,
+    credits_to_usd,
+)
 
 AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
 # The three ways to engage a post: (kind, endpoint, extra params). Replies and
@@ -32,10 +39,6 @@ AUTHORITY_ESTIMATED_FOLLOWINGS = 2_000
 ENGAGEMENT_LEGS = (("reply", "replies_v2", {"queryType": "Latest"}),
                    ("quote", "quotes", None),
                    ("retweet", "retweeters", None))
-# A request that failed for this account or this resource. Programming errors
-# are deliberately absent: they must propagate, not become "partial".
-_REQUEST_FAILURES = (APIError, IncompleteDataError, urllib.error.URLError,
-                     TimeoutError)
 
 
 class Cohort:
@@ -177,16 +180,22 @@ class Cohort:
 
     @classmethod
     def from_search(cls, query, limit=200, **kw):
-        """Authors of tweets matching a query — the people talking about X."""
+        """Authors of the newest `limit` tweets matching a query.
+
+        A `min_faves:N` clause is applied by the search index, so it bounds
+        what is bought: the seed is then posts that drew engagement rather
+        than whoever posted last. A walk that stops early raises."""
+        from workflows import search_window
         co = cls(label=f"search:{query}", **kw)
-        batch = []
-        for t in co._drain(co.c.paginate("search", query, limit=limit),
-                           f"search {query!r}", limit):
+        batch = list(islice(search_window(co.c, query, index_faves=True), limit))
+        for t in batch:
             a = t.get("author") or {}
             co._add(a.get("id"), a.get("userName"), 1.0, "search_author")
-            batch.append(t)
-        if batch:
-            co.s.put_tweets(batch)      # persist the corpus, not just the cohort
+        if len(batch) >= limit:
+            co._mark_partial(
+                f"search {query!r} stopped at limit={limit:,}; the cohort is "
+                f"the newest {limit:,} matches, not everyone who matched.")
+        co.s.put_tweets(batch)          # persist the corpus, not just the cohort
         return co
 
     @classmethod
@@ -268,10 +277,11 @@ class Cohort:
                 hit["weight"] += m["weight"]
             else:
                 out._add(m["account_id"], m["user_name"], m["weight"], m["provenance"])
+                added = out.members[out._key(m["account_id"], m["user_name"])]
                 if m["account_id"]:
-                    ix["id:" + m["account_id"]] = out.members[out._key(m["account_id"], m["user_name"])]
+                    ix["id:" + m["account_id"]] = added
                 if m["user_name"]:
-                    ix["nm:" + m["user_name"].lower()] = out.members[out._key(m["account_id"], m["user_name"])]
+                    ix["nm:" + m["user_name"].lower()] = added
         return out
 
     def intersect(self, other):
@@ -299,8 +309,7 @@ class Cohort:
     # -- enrichment -------------------------------------------------------
     def _stored_profiles(self):
         """Stored account rows, by id and by lower-case handle."""
-        rows = {r["id"]: r for r in (dict(x) for x in self.s.db.execute(
-            "SELECT * FROM accounts"))}
+        rows = self.s.profiles()
         by_name = {r["user_name"].lower(): r for r in rows.values()
                    if r["user_name"]}
         return rows, by_name
@@ -468,7 +477,9 @@ class Cohort:
     def authority(self, max_usd=5.0, confirm=True, progress=False):
         """Rank members by IN-degree within the cohort's own follow graph:
         how many OTHER members follow each member. "Who does this scene itself
-        follow" — a computed frontier, not a guessed one.
+        follow" — a computed frontier, not a guessed one. Accounts OUTSIDE
+        the cohort that two or more members follow are kept too, as
+        ``authority_external`` ([{handle, in_degree}], highest first).
 
         Uses OUT-edges (each member's followings) because following-counts are
         bounded (thousands) while follower-counts are unbounded (millions), so
@@ -507,6 +518,7 @@ class Cohort:
         reasons = []
         crawled = 0
         indeg = {self._key(m["account_id"], m["user_name"]): 0.0 for m in members}
+        external = Counter()
         try:
             # id-only members can't have their followings fetched (the endpoint
             # takes a handle), so they'd be invisible as edge SOURCES and undercount
@@ -548,7 +560,8 @@ class Cohort:
                     walk = self.c.paginate("followings", handle)
                     for follows in walk:
                         fid = str(follows.get("id") or "")
-                        fname = (follows.get("userName") or follows.get("screen_name") or "").lower()
+                        fname = (follows.get("userName") or follows.get("screen_name")
+                                 or "").lower()
                         if fid in member_ids:
                             tgt = self._key(fid, fname)
                             indeg[tgt] = indeg.get(tgt, 0) + 1
@@ -556,6 +569,8 @@ class Cohort:
                             mm = member_by_name[fname]
                             tgt = self._key(mm["account_id"], mm["user_name"])
                             indeg[tgt] = indeg.get(tgt, 0) + 1
+                        elif fname:
+                            external[fname] += 1
                     if getattr(walk, "complete", True) is False:
                         # The member's out-edges were cut short by an API
                         # failure, not the ceiling. Edges already paid for
@@ -589,6 +604,9 @@ class Cohort:
         finally:
             self.c.max_usd = prior      # never leave the ceiling tightened
         self.authority_crawled = crawled
+        self.authority_external = [
+            {"handle": handle, "in_degree": count}
+            for handle, count in external.most_common(200) if count > 1]
         self.authority_complete = crawled == len(members)
         self.authority_incomplete_reason = (
             None if self.authority_complete else

@@ -11,23 +11,46 @@ import contextlib
 import io
 import json
 import os
+import signal
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest import mock
-
-from tests.e2e_base import SCRIPTS  # noqa: F401  (SCRIPTS puts scripts/ on sys.path)
-from tests.fakes import client_class
 
 import jobs
 import twitterapi
 from store import Store
 
+from tests.e2e_base import SCRIPTS  # noqa: F401  (SCRIPTS puts scripts/ on sys.path)
+from tests.fakes import client_class
+
 
 def fmt(ts):
-    return datetime.fromtimestamp(ts, timezone.utc).strftime(
+    return datetime.fromtimestamp(ts, UTC).strftime(
         "%a %b %d %H:%M:%S +0000 %Y")
+
+
+def window(params):
+    """(since, until) of a search request; the walk always sends both."""
+    query = params["query"]
+    return (int(query.split("since_time:")[1].split()[0]),
+            int(query.split("until_time:")[1].split()[0]))
+
+
+def search_index(posts):
+    """A fake advanced_search over `posts` ({id, ts, ...wire fields}): the
+    newest 20 inside the requested window, and whether more remain."""
+    def answer(params):
+        since, until = window(params)
+        handle = params["query"].split("from:")[1].split()[0] \
+            if "from:" in params["query"] else None
+        hits = sorted((p for p in posts if since <= p["ts"] < until
+                       and handle in (None, p["author"]["userName"])),
+                      key=lambda p: -p["ts"])
+        return {"tweets": [{**p, "createdAt": fmt(p["ts"])} for p in hits[:20]],
+                "has_next_page": len(hits) > 20}
+    return answer
 
 
 class JobsCase(unittest.TestCase):
@@ -62,30 +85,21 @@ class JobsCase(unittest.TestCase):
 # ------------------------------------------- 1. ceiling mid-job = partial --
 class TestCeilingMidJobIsPartial(JobsCase):
     def busy_raw(self):
-        now = int(time.time())
-
-        def page(ut):
-            return [{"id": f"t{ut - k}", "createdAt": fmt(ut - 1 - k * 60),
-                     "likeCount": 1, "author": {"userName": "busy"}}
-                    for k in range(20)]
-
         def raw(path, params):
             if path.endswith("user/info"):
                 return {"data": {"userName": "busy", "followers": 10}}
             if path.endswith("advanced_search"):
-                ut = int(params["query"].split("until_time:")[1])
-                return {"tweets": page(ut), "has_next_page": True}
+                _, ut = window(params)
+                return {"tweets": [
+                    {"id": f"t{ut - k}", "createdAt": fmt(ut - 1 - k * 60),
+                     "likeCount": 1, "author": {"userName": "busy"}}
+                    for k in range(20)], "has_next_page": True}
             raise AssertionError(path)
-
-        def raw_json(path, body):
-            return {"results": {"query_0": {"tweets": page(now),
-                                            "has_next_page": True}}}
-        return raw, raw_json
+        return raw
 
     def test_brief_ceiling_after_spend_returns_partial_contract(self):
-        raw, raw_json = self.busy_raw()
         code, body = self.run_jobs(
-            ["brief", "busy", "--store", self.db, "--max-usd", "0.02"], raw, raw_json)
+            ["brief", "busy", "--store", self.db, "--max-usd", "0.02"], self.busy_raw())
         self.assertEqual(code, 0, body)
         self.assertFalse(body["complete"])
         self.assertEqual(body["completeness"]["status"], "partial")
@@ -94,36 +108,33 @@ class TestCeilingMidJobIsPartial(JobsCase):
         self.assertIn("$", body["spend"])
 
     def test_brief_ceiling_mid_walk_keeps_the_tweets_it_bought(self):
-        """Integration of corpus() with the shared walker: the first bulk page
-        and every walked page before the ceiling were paid for and stored, so
-        the partial must carry them rather than 0 tweets."""
-        raw, raw_json = self.busy_raw()
+        """Every page walked before the ceiling was paid for and stored, so
+        the partial must carry those rows rather than 0 tweets."""
         code, body = self.run_jobs(
-            ["brief", "busy", "--store", self.db, "--max-usd", "0.02"], raw, raw_json)
+            ["brief", "busy", "--store", self.db, "--max-usd", "0.02"], self.busy_raw())
         self.assertEqual(code, 0, body)
         self.assertFalse(body["complete"])
         self.assertGreaterEqual(body["tweet_count"], 20, body)
 
     def test_true_pre_spend_refusal_stays_exit_two(self):
-        raw, raw_json = self.busy_raw()
         code, body = self.run_jobs(
             ["brief", "busy", "--store", self.db, "--max-usd", "0.00001"],
-            raw, raw_json)
+            self.busy_raw())
         self.assertEqual(code, 2)
         self.assertEqual(body["error"]["type"], "refusal")
         self.assertEqual(self.requests, [])
 
-    def test_records_a_walker_attached_to_its_stop_are_returned(self):
-        exc = twitterapi.CostLimitExceeded("Spend ceiling hit mid-window")
-        exc.records = [{"id": "kept", "text": "paid", "likeCount": 3,
-                        "createdAt": "now"}]
+    def test_rows_yielded_before_a_stop_are_returned(self):
+        def stopped_corpus(*args, **kwargs):
+            yield {"id": "kept", "text": "paid", "likeCount": 3, "createdAt": "now"}
+            raise twitterapi.CostLimitExceeded("Spend ceiling hit mid-window")
 
         class C:
             spent_usd = 0.01
             def user_info(self, _): return {"name": "n", "followers": 1}
             def spend_report(self): return "1 request"
 
-        with mock.patch.object(jobs, "corpus", side_effect=exc):
+        with mock.patch.object(jobs, "corpus", stopped_corpus):
             result = jobs.entity_brief("alpha", client=C())
         self.assertFalse(result["complete"])
         self.assertEqual([t["id"] for t in result["top_tweets"]], ["kept"])
@@ -158,7 +169,7 @@ class TestDiffusionLimit(JobsCase):
                      ["authenticity", "a", "--sample", "0"],
                      ["authority", "q", "--sample", "-5"],
                      ["brief", "a", "--days", "0"]):
-            code, body = self.run_jobs(argv + ["--store", self.db])
+            code, body = self.run_jobs([*argv, "--store", self.db])
             self.assertEqual(code, 2, argv)
             self.assertEqual(body["error"]["type"], "usage", argv)
             self.assertIn("must be at least 1", body["error"]["message"])
@@ -250,31 +261,25 @@ class TestOverlapEstimate(JobsCase):
 class TestBenchmarkHandles(JobsCase):
     def test_spaces_case_and_empties_are_normalized(self):
         now = int(time.time())
+        index = search_index([
+            {"id": f"{h}{k}", "ts": now - 100 - k, "likeCount": 5,
+             "author": {"userName": h}} for h in ("stripe", "vercel") for k in range(3)])
 
         def raw(path, params):
             if path.endswith("user/info"):
                 return {"data": {"userName": params["userName"], "followers": 10}}
-            raise AssertionError(path)
-
-        def raw_json(path, body):
-            res = {}
-            for i, q in enumerate(body["queries"]):
-                h = q["query"].split("from:")[1].split()[0]
-                res[f"query_{i}"] = {"tweets": [{
-                    "id": f"{h}{k}", "createdAt": fmt(now - 100 - k),
-                    "likeCount": 5, "author": {"userName": h}} for k in range(3)],
-                    "has_next_page": False}
-            return {"results": res}
+            return index(params)
 
         code, body = self.run_jobs(["benchmark", "stripe, vercel,,@Stripe ",
-                                    "--store", self.db], raw, raw_json)
+                                    "--store", self.db], raw)
         self.assertEqual(code, 0, body)
         self.assertEqual([e["handle"] for e in body["entities"]],
                          ["stripe", "vercel"])
         self.assertEqual([e["tweets_in_window"] for e in body["entities"]], [3, 3])
-        queries = [q["query"] for path, b in self.requests
-                   if path.endswith("bulk_advanced_search") for q in b["queries"]]
-        self.assertTrue(all("from: " not in q for q in queries), queries)
+        queries = [b["query"] for path, b in self.requests
+                   if path.endswith("advanced_search")]
+        self.assertEqual({q.split()[0] for q in queries},
+                         {"from:stripe", "from:vercel"}, queries)
 
     def test_no_handles_is_a_usage_error(self):
         code, body = self.run_jobs(["benchmark", " , ", "--store", self.db])
@@ -310,22 +315,142 @@ class TestBriefHonesty(JobsCase):
     def raw(self, path, params):
         if path.endswith("user/info"):
             return {"data": {"userName": "alpha", "followers": 3}}
-        raise AssertionError(path)
-
-    def raw_json(self, path, body):
-        return {"results": {"query_0": {"tweets": [{
-            "id": "1", "createdAt": fmt(int(time.time()) - 60), "likeCount": 4,
+        return search_index([{
+            "id": "1", "ts": int(time.time()) - 60, "likeCount": 4,
             "replyCount": 2, "quoteCount": 1, "viewCount": 90,
-            "author": {"userName": "alpha"}}], "has_next_page": False}}}
+            "author": {"userName": "alpha"}}])(params)
 
     def test_absent_verification_is_unknown_and_requested_fields_are_filled(self):
         code, body = self.run_jobs(["brief", "alpha", "--store", self.db,
-                                    "--fields", "views,replies,quotes"],
-                                   self.raw, self.raw_json)
+                                    "--fields", "views,replies,quotes"], self.raw)
         self.assertEqual(code, 0, body)
         self.assertIsNone(body["profile"]["verified"])
         self.assertEqual(body["top_tweets"],
                          [{"views": 90, "replies": 2, "quotes": 1}])
+
+    def test_a_bare_handle_looks_back_a_week_by_default(self):
+        """Thirty days of a busy account is real money nobody asked for."""
+        code, body = self.run_jobs(["brief", "alpha", "--store", self.db], self.raw)
+        self.assertEqual(code, 0, body)
+        self.assertEqual(body["window_days"], 7)
+        self.assertEqual(body["top_tweets"][0]["handle"], "alpha")
+        spans = {until - since for since, until in (
+            window(b) for path, b in self.requests if path.endswith("advanced_search"))}
+        self.assertEqual(spans, {7 * 86400 // 8}, "eight equal shards of one week")
+
+
+# ------------------------------------------------ stop and resume (D1, D2) --
+class TestStopAndResume(JobsCase):
+    def setUp(self):
+        super().setUp()
+        base = int(time.time()) - 600
+        # One post every 30 minutes for 100 hours: several pages per shard.
+        self.index = search_index([
+            {"id": f"p{k}", "ts": base - k * 1800, "likeCount": k,
+             "author": {"userName": "alpha"}} for k in range(200)])
+
+    def raw(self, path, params):
+        if path.endswith("user/info"):
+            return {"data": {"userName": "alpha", "followers": 3}}
+        return self.index(params)
+
+    def searches(self):
+        return [b["query"] for path, b in self.requests
+                if path.endswith("advanced_search")]
+
+    def test_a_rerun_after_the_ceiling_replays_the_pages_already_bought(self):
+        argv = ["brief", "alpha", "--store", self.db, "--max-usd"]
+        code, first = self.run_jobs([*argv, "0.012"], self.raw)
+        self.assertEqual(code, 0, first)
+        self.assertFalse(first["complete"])
+        self.assertIn("within 24 hours", first["completeness"]["resume"])
+        bought = set(self.searches())
+        self.assertTrue(bought)
+
+        self.requests.clear()
+        code, second = self.run_jobs([*argv, "1"], self.raw)
+        self.assertEqual(code, 0, second)
+        self.assertTrue(second["complete"], second)
+        self.assertEqual(second["tweet_count"], 200)
+        self.assertEqual(bought & set(self.searches()), set(),
+                         "no page from the first run was paid for again")
+        self.assertIn("cache hit", second["spend"])
+
+        # The walk finished, so the next run is about the real present again.
+        with Store(self.db) as s:
+            self.assertEqual(s.get_page("walk", {"key": "brief:alpha:7:None"}), {})
+
+    def test_ctrl_c_mid_walk_returns_the_rows_and_the_spend(self):
+        seen = []
+
+        def raw(path, params):
+            if path.endswith("advanced_search"):
+                seen.append(path)
+                if len(seen) == 9:      # some shard is on its second page
+                    os.kill(os.getpid(), signal.SIGINT)     # a real Ctrl-C
+                    time.sleep(0.2)     # let the main thread take the signal
+            return self.raw(path, params)
+
+        code, body = self.run_jobs(["brief", "alpha", "--store", self.db], raw)
+        self.assertEqual(code, 0, body)
+        self.assertFalse(body["complete"])
+        self.assertIn("stopped by the user", body["completeness"]["reason"])
+        self.assertGreaterEqual(body["tweet_count"], 20)
+        self.assertIn("$", body["spend"])
+
+    def test_a_halted_client_sends_nothing_more(self):
+        from tests.fakes import ScriptedClient
+        c = ScriptedClient(raw=[])
+        c.halt("stopped by the user")
+        with self.assertRaises(twitterapi.CostLimitExceeded) as cm:
+            c.user_info("alpha")
+        self.assertIn("stopped by the user", str(cm.exception))
+        self.assertEqual(c.raw_calls, [])
+        self.assertEqual(c.spent_credits, 0.0)
+
+
+# ------------------------------------------------------------ tweet lookup --
+class TestTweetLookup(JobsCase):
+    def raw(self, path, params):
+        post = {"id": "1900000000000000001", "createdAt": fmt(1_700_000_100),
+                "text": "the post", "likeCount": 7,
+                "author": {"userName": "alpha"},
+                "quoted_tweet": {"id": "5", "text": "quoted",
+                                 "author": {"userName": "beta"}}}
+        if path.endswith("/twitter/tweets"):
+            return {"tweets": [post] if params["tweet_ids"] == post["id"] else []}
+        if path.endswith("thread_context"):
+            return {"tweets": [post, {"id": "0", "createdAt": fmt(1_700_000_000),
+                                      "text": "root", "author": {"userName": "alpha"}}],
+                    "has_next_page": False}
+        raise AssertionError(path)
+
+    def test_a_link_resolves_to_the_post_its_quote_and_its_thread(self):
+        for ref in ("https://x.com/alpha/status/1900000000000000001?s=20",
+                    "twitter.com/alpha/statuses/1900000000000000001",
+                    "1900000000000000001"):
+            with self.subTest(ref=ref):
+                code, body = self.run_jobs(["tweet", ref, "--store", self.db], self.raw)
+                self.assertEqual(code, 0, body)
+                self.assertTrue(body["complete"])
+                self.assertEqual(body["tweet"]["text"], "the post")
+                self.assertEqual(body["quoted"]["handle"], "beta")
+                self.assertEqual([t["id"] for t in body["thread"]],
+                                 ["0", "1900000000000000001"], "oldest first")
+
+    def test_a_handle_or_garbage_is_a_usage_error_before_any_request(self):
+        for ref in ("alpha", "https://x.com/alpha", "status/abc"):
+            with self.subTest(ref=ref):
+                code, body = self.run_jobs(["tweet", ref, "--store", self.db], self.raw)
+                self.assertEqual(code, 2, body)
+                self.assertEqual(body["error"]["type"], "usage")
+        self.assertEqual(self.requests, [])
+
+    def test_a_post_the_api_does_not_return_is_stated_not_invented(self):
+        code, body = self.run_jobs(["tweet", "42424242", "--store", self.db], self.raw)
+        self.assertEqual(code, 0, body)
+        self.assertIsNone(body["tweet"])
+        self.assertIn("was not returned", body["tweet_state"])
 
 
 # ------------------------------------------------------- 7/8. key handling --
@@ -408,28 +533,105 @@ class TestAuthority(JobsCase):
         self.assertIn("locked", body["completeness"]["reason"])
         self.assertEqual(body["frontier"][0]["handle"], "m0")
 
+    def test_accounts_outside_the_seed_that_members_follow_are_ranked(self):
+        """The discovery is who the scene follows that was NOT in the seed."""
+        now = int(time.time())
+        follows = {"m0": ["hub", "m1", "solo"], "m1": ["Hub"], "m2": ["hub"]}
+
+        def raw(path, params):
+            if path.endswith("advanced_search"):
+                return {"tweets": [{"id": f"t{i}", "createdAt": fmt(now - i),
+                                    "author": {"id": str(i), "userName": n}}
+                                   for i, n in enumerate(follows)],
+                        "has_next_page": False}
+            if path.endswith("followings"):
+                return {"followings": [{"id": f"x-{n.lower()}", "userName": n}
+                                       for n in follows[params["userName"]]],
+                        "has_next_page": False}
+            raise AssertionError(path)
+
+        code, body = self.run_jobs(["authority", "x", "--store", self.db,
+                                    "--max-usd", "1"], raw)
+        self.assertEqual(code, 0, body)
+        self.assertTrue(body["complete"], body)
+        self.assertEqual(body["frontier_external"],
+                         [{"handle": "hub", "in_degree": 3}],
+                         "followed by one member (solo) is not a frontier")
+        self.assertEqual(body["frontier_external_count"], "1 of 1 total")
+
 
 # ------------------------------------------------------------- narrative ----
-class TestNarrativePartialPrior(unittest.TestCase):
-    def test_partial_prior_window_does_not_invent_new_authors(self):
-        cur = [{"id": "1", "author": {"userName": "old_voice"}}]
-        calls = []
+class TestNarrative(unittest.TestCase):
+    NOW = 1_700_000_000
+    DAY = 86400
 
-        def fake_window(c, query, since, until):
-            calls.append(since)
-            if len(calls) == 2:
-                raise twitterapi.CostLimitExceeded("Spend ceiling hit mid-window")
-            return cur
+    class C:
+        spent_usd = 0.01
+        def spend_report(self): return "2 requests"
 
-        class C:
-            spent_usd = 0.01
-            def spend_report(self): return "2 requests"
+    def post(self, post_id, days_ago, handle, likes=0, **entities):
+        return {"id": post_id, "createdAt": fmt(self.NOW - days_ago * self.DAY),
+                "likeCount": likes, "text": post_id,
+                "author": {"userName": handle, "followers": 9} if handle else {},
+                "entities": entities}
 
-        with mock.patch.object(jobs, "search_window", fake_window):
-            result = jobs.narrative_tracker("topic", client=C())
+    def run_narrative(self, posts, stop=None, query="topic"):
+        def fake_shards(c, q, since, until, index_faves=False):
+            self.assertEqual((since, until), (self.NOW - 60 * self.DAY, self.NOW))
+            yield from posts
+            if stop:
+                raise stop
+        with mock.patch.object(jobs, "search_shards", fake_shards):
+            return jobs.narrative_tracker(query, days=30, client=self.C(), now=self.NOW)
+
+    def test_windows_are_split_at_the_middle_and_terms_are_diffed(self):
+        result = self.run_narrative([
+            self.post("new-big", 1, "Fresh", 50, symbols=[{"text": "ABC"}],
+                      urls=[{"expanded_url": "https://www.Example.com/a"}],
+                      user_mentions=[{"screen_name": "Hub"}]),
+            self.post("new-small", 2, "veteran", 5, symbols=[{"text": "abc"}],
+                      hashtags=[{"text": "Tag"}, {"text": "tag"}]),
+            self.post("old", 40, "Veteran", 9, symbols=[{"text": "ABC"}]),
+        ])
+        self.assertTrue(result["complete"])
+        self.assertEqual((result["current_tweet_count"], result["prior_tweet_count"]), (2, 1))
+        self.assertEqual(result["new_authors"], ["fresh"])
+        self.assertEqual([t["id"] for t in result["top_tweets"]], ["new-big", "new-small"])
+        self.assertEqual(result["top_tweets"][0]["handle"], "Fresh")
+        self.assertEqual(result["top_authors"][0],
+                         {"handle": "Fresh", "tweets": 1, "likes": 50, "followers": 9})
+        self.assertEqual(result["rising_cashtags"],
+                         [{"term": "abc", "current": 2, "prior": 1}])
+        self.assertEqual(result["rising_hashtags"],
+                         [{"term": "tag", "current": 1, "prior": 0}],
+                         "one tweet repeating a tag counts once")
+        self.assertEqual(result["rising_mentions"][0]["term"], "hub")
+        self.assertEqual(result["rising_domains"][0]["term"], "example.com")
+
+    def test_an_author_without_a_handle_is_not_an_author_named_empty(self):
+        """D13: a null userName crashed the job and counted as author ''."""
+        nameless = self.post("ghost", 1, None, 3)
+        nameless["author"] = {"userName": None}
+        result = self.run_narrative([nameless, self.post("no-author", 2, None)])
+        self.assertEqual(result["new_authors"], [])
+        self.assertEqual(result["top_authors"], [])
+        self.assertIsNone(result["top_tweets"][0]["handle"])
+
+    def test_a_partial_walk_does_not_invent_new_authors_or_rising_terms(self):
+        result = self.run_narrative(
+            [self.post("seen", 1, "old_voice", 4, hashtags=[{"text": "x"}])],
+            stop=twitterapi.CostLimitExceeded("Spend ceiling hit mid-window"))
         self.assertFalse(result["complete"])
         self.assertEqual(result["new_authors"], [],
                          "authors absent from a partial prior are not 'new'")
+        self.assertEqual(result["rising_hashtags"], [])
+        self.assertEqual([t["id"] for t in result["top_tweets"]], ["seen"],
+                         "the rows that were bought are still returned")
+
+    def test_min_faves_across_windows_is_flagged_as_not_like_for_like(self):
+        self.assertIn("not like for like",
+                      self.run_narrative([], query="topic min_faves:50")["_note"])
+        self.assertNotIn("not like for like", self.run_narrative([])["_note"])
 
 
 if __name__ == "__main__":
