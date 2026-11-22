@@ -922,7 +922,7 @@ COLLECTIONS = {
     "benchmark": {"entities": {
         "handle": ("handle",), "followers": ("followers",),
         "tweets_in_window": ("tweets_in_window",), "peak_likes": ("peak_likes",),
-        "verified": ("verified",)}},
+        "walk": ("walk",), "verified": ("verified",)}},
     "media": {"artifacts": MEDIA_FIELDS},
 }
 

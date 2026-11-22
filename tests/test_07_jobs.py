@@ -389,6 +389,14 @@ class TestStopAndResume(JobsCase):
         code, out = self.run_jobs(["brief", "alpha", "--store", self.db], raw)
         self.assertEqual(code, 1, out)
 
+    def test_the_benchmark_cli_says_how_far_each_account_was_walked(self):
+        """Live run 2026-11-22: the job set `walk` and the output schema
+        dropped it, so a "not reached" account showed only a null count."""
+        code, out = self.run_jobs(
+            ["benchmark", "alpha", "--store", self.db, "--days", "2"], self.raw)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["entities"][0]["walk"], "complete")
+
     def test_max_age_zero_buys_again_and_a_negative_is_refused(self):
         """Codex review 2026-11-11 (C5): `--max-age 0` meant never expire."""
         import jobs
