@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
+import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -67,10 +70,12 @@ ENDPOINTS = {
         "items": "ids", "items_in": "root", "page_param": "count", "page_max": 5000},
     "followers": {
         "path": "/twitter/user/followers", "key_param": "userName",
-        "items": "followers", "items_in": "root", "page_param": "pageSize", "page_max": 200},
+        "items": "followers", "items_in": "root", "page_param": "pageSize",
+        "page_min": 20, "page_max": 200},     # the server clamps pageSize to 20-200
     "followings": {
         "path": "/twitter/user/followings", "key_param": "userName",
-        "items": "followings", "items_in": "root", "page_param": "pageSize", "page_max": 200},
+        "items": "followings", "items_in": "root", "page_param": "pageSize",
+        "page_min": 20, "page_max": 200},
     "verified_followers": {                      # snake user_id, digits only
         "path": "/twitter/user/verifiedFollowers", "key_param": "user_id",
         "items": "followers", "items_in": "root", "page_param": None, "page_max": 20},
@@ -408,6 +413,11 @@ class Client:
             store = Store(os.fspath(store))
         self.timeout = timeout
         self.verbose = verbose
+        if max_usd is not None and not (math.isfinite(max_usd) and max_usd >= 0):
+            # NaN compares false against everything, so it would switch the
+            # ceiling off while looking like one.
+            raise UsageError(f"max_usd must be a finite amount of 0 or more, "
+                             f"got {max_usd!r}")
         self.max_usd = max_usd            # cumulative ceiling across all calls
         self.store = store                # optional read/write-through cache
         self.cache_max_age = cache_max_age  # seconds; None = cached copy never expires
@@ -417,8 +427,10 @@ class Client:
         self.spent_credits = 0.0
         self.saved_credits = 0.0          # credits NOT spent thanks to cache hits
         self.halted = None                # reason every later request is refused
+        self._ledger_warned = False
         self.start_balance = None         # first balance read, for the run ledger
-        self.run_id = f"{int(time.time())}-{os.getpid()}"
+        self.run_id = f"{int(time.time())}-{os.getpid()}-{secrets.token_hex(3)}"
+        self._ledger_lock = threading.Lock()
         self._last_call = 0.0
         self._fixed_qps = self._qps is not None
         self._qps_checked_at = 0
@@ -538,6 +550,15 @@ class Client:
                 raise exc from last
             if not free:
                 self._throttle()
+                if self.halted:
+                    # Halted while waiting for a send slot: nothing was sent,
+                    # so nothing is owed.
+                    with self._lock:
+                        self.requests_made -= 1
+                        self.spent_credits -= worst
+                    raise CostLimitExceeded(
+                        f"{self.halted}; no further requests were sent")
+                self._record_run()      # a kill mid-request still leaves a record
             try:
                 with urllib.request.urlopen(make_request(), timeout=self.timeout) as r:
                     raw_body = r.read()
@@ -583,7 +604,6 @@ class Client:
                                or json.dumps(body)[:200], path)
             if not free:                # a free balance read settles nothing
                 self._provisional.credits = worst
-                self._record_run()
             return body
         raise last if isinstance(last, Exception) else RuntimeError("retries exhausted")
 
@@ -651,12 +671,14 @@ class Client:
         Only endpoints with a page-size parameter honour ``page_size``; a
         fixed endpoint returns its full page whatever the caller asked for, so
         budgeting with the caller's number under-reserves (search with
-        page_size=1 still returns, and bills, 20 tweets). For id-list
+        page_size=1 still returns, and bills, 20 tweets). A size under the
+        server's minimum is raised to it for the same reason. For id-list
         endpoints the page size is the number of ids sent."""
         spec = ENDPOINTS[name]
         if spec["page_param"] is None and not spec.get("key_list"):
             return spec["page_max"]
-        return min(page_size or spec["page_max"], spec["page_max"])
+        return max(min(page_size or spec["page_max"], spec["page_max"]),
+                   spec.get("page_min", 1))
 
     @staticmethod
     def credits_for(name, n_records, page_size=None):
@@ -713,9 +735,24 @@ class Client:
     def _record_run(self):
         """Keep this process's spend in the store as it accrues, so the
         record survives a run that is killed before it can report."""
-        if self.store is not None:
-            self.store.record_run(self.run_id, self.requests_made,
-                                  self.spent_credits, self.start_balance)
+        if self.store is None:
+            return
+        try:
+            # One writer at a time, snapshot inside: a slower thread must not
+            # overwrite a newer total with an older one.
+            with self._ledger_lock:
+                with self._lock:
+                    requests, credits = self.requests_made, self.spent_credits
+                self.store.record_run(self.run_id, requests, credits,
+                                      self.start_balance)
+        except sqlite3.Error as exc:
+            # The ledger is bookkeeping. Failing here would throw away the
+            # response this request just paid for.
+            if not self._ledger_warned:
+                self._ledger_warned = True
+                print(f"[spend] the run ledger could not be written ({exc}); "
+                      f"this run's spend is reported but may not be recorded",
+                      file=sys.stderr)
 
     def _book_attempt(self, path, credits, operation):
         """Count one request attempt and book its worst-case cost atomically.
@@ -741,6 +778,7 @@ class Client:
         if booked > MIN_REQUEST_CREDITS:
             with self._lock:
                 self.spent_credits -= booked - MIN_REQUEST_CREDITS
+            self._record_run()
 
     def _over_ceiling(self) -> bool:
         return self.max_usd is not None and self.spent_usd >= self.max_usd
@@ -808,7 +846,11 @@ class Client:
         key = self._resolve_endpoint_key(name, key)
         if spec.get("key_list"):
             ids = [part for part in str(key).split(",") if part.strip()]
-            ps = min(max(len(ids), 1), spec["page_max"])
+            if len(ids) > spec["page_max"]:
+                raise UsageError(
+                    f"'{name}' takes at most {spec['page_max']} ids per call, "
+                    f"got {len(ids)}; split the list")
+            ps = max(len(ids), 1)
         else:
             ps = self.effective_page_size(name, page_size)
         self._preflight(name, limit, ps)
@@ -824,12 +866,15 @@ class Client:
             params[k] = v
 
         cacheable = self.store is not None and name in CACHEABLE
-        cursor, seen = "", 0
+        cursor, seen, bought = "", 0, False
         seen_cursors, seen_items, empty_pages = set(), set(), 0
         while True:
             params["cursor"] = cursor
+            # Once one page of this crawl is bought, the rest is bought too: a
+            # cached continuation belongs to an older crawl, and mixing the
+            # two would return a list that never existed.
             cached = (self.store.get_page(spec["path"], params, self.cache_max_age)
-                      if cacheable else None)
+                      if cacheable and not bought else None)
             try:
                 if cached is not None:
                     resp = cached
@@ -850,6 +895,7 @@ class Client:
                     # not the hoped-for record count, or a terminal full page can
                     # cross the caller's ceiling and still return as "complete".
                     self._require_budget(worst_page, f"next '{name}' page")
+                    bought = True
                     resp = self._raw("GET", spec["path"], params,
                                      max_credits=worst_page)
                     try:

@@ -128,10 +128,11 @@ def run_cli(command: str, function, argv=None, parser=None, dests=()) -> int:
     subcommand level; a CLI with subcommands passes both so the error names
     the subcommand path."""
     args = list(sys.argv[1:] if argv is None else argv)
+    previous = None
     if threading.current_thread() is threading.main_thread():
         # SIGTERM (a timeout, a supervisor) stops a job the way Ctrl-C does,
         # so it can still report the rows and spend it holds.
-        signal.signal(signal.SIGTERM, signal.default_int_handler)
+        previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         return function(argv)
     except KeyboardInterrupt:
@@ -148,6 +149,9 @@ def run_cli(command: str, function, argv=None, parser=None, dests=()) -> int:
             body["spend"] = exc.spend
         emit_line(body)
         return code
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def parse_fields(requested: str | None, schema: dict, command: str,

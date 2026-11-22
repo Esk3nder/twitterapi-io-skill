@@ -56,8 +56,8 @@ Use `<command> --help` for each command's exact flags and examples.
 ## Reading the output
 
 Stdout is JSON (or JSON Lines for streaming records); progress, spend, and
-warnings stay on stderr. Lists default to brief fields: `--fields <a,b,c>` adds
-supported fields and `--full` returns complete long text.
+warnings stay on stderr. Lists default to brief fields: `--fields <a,b,c>`
+returns exactly the named fields and `--full` returns complete long text.
 
 **Exit codes:** `0` valid complete or valid partial result · `2` usage, refusal,
 or setup failure · `1` runtime, API, or internal failure. An exit 0 is not proof
@@ -66,10 +66,14 @@ carry `complete: false`, a reason, the records returned, `spend`, and a resume
 command. Do not present a partial result as whole.
 
 A walk that stops early (spend ceiling, Ctrl-C, a timeout, an API failure
-after rows arrived) keeps every page it bought. Rerunning the same command
-within 24 hours replays those pages from the store at no cost and continues
-from where it stopped. `history --out` refuses to overwrite an existing file,
-so give a rerun a new path.
+after rows arrived) returns the rows it holds as a partial. Rerunning the same
+command within 24 hours of its first start replays the search pages of an
+unfinished `history`, `brief`, `narrative` or `benchmark` from the store at no
+cost and continues from where it stopped; follower and graph pages are cached
+without expiry. Everything else (`tweet`, `diffusion`, the `authority` seed
+search, profile lookups) is paid again. A finished search is never replayed:
+rerunning it buys current results. `history --out` refuses to overwrite a file
+that holds records, so give such a rerun a new path.
 
 Jobs return JSON for you to interpret. They compute who and what; they do not
 compute themes, consensus, or whether engagement is organic. Do not present a

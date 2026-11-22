@@ -53,6 +53,7 @@ from axi import (
 from cohort import ENGAGEMENT_LEGS, Cohort
 from store import DEFAULT_DB, Store, extract_tweet_media, parse_ts
 from twitterapi import (
+    APIError,
     Client,
     CostLimitExceeded,
     IncompleteDataError,
@@ -60,9 +61,11 @@ from twitterapi import (
 from workflows import anchored_now, finish_walk, search_shards
 
 DEFAULT_MAX_USD = 5.0
-DEFAULT_RESUME = ("Rerun the same command within 24 hours: search and "
-                  "follower pages already bought replay free. If the reason "
-                  "names the spend ceiling, raise `--max-usd <amount>`")
+DEFAULT_RESUME = ("Rerun the same command: follower and graph pages already "
+                  "bought are cached, and an unfinished brief, narrative or "
+                  "benchmark search replays its pages for 24 hours. Other "
+                  "requests are paid again. If the reason names the spend "
+                  "ceiling, raise `--max-usd <amount>`")
 STOPPED = "stopped by the user"
 # Jobs whose walk ends at the present; _main pins that moment (anchored_now)
 # so an unfinished run can be replayed.
@@ -73,7 +76,7 @@ def _client(max_usd=DEFAULT_MAX_USD, store_path=None, max_age_days=None):
     """Client checks the key before it opens the store, so a missing key
     raises SetupError without leaking a sqlite connection."""
     return Client(verbose=False, store=store_path or DEFAULT_DB, max_usd=max_usd,
-                  cache_max_age=max_age_days * 86400 if max_age_days else None)
+                  cache_max_age=None if max_age_days is None else max_age_days * 86400)
 
 
 # ------------------------------------------------------- partial results ----
@@ -82,8 +85,8 @@ def _client(max_usd=DEFAULT_MAX_USD, store_path=None, max_age_days=None):
 # a reason, and the job reports them as the partial contract. Only a stop that
 # happened before anything was gathered OR paid is a true refusal; it re-raises
 # so the CLI exits 2. An API or network failure is a stop only where the
-# paginated stream already holds rows (Client.paginate marks it partial); on a
-# first page, and in the search-window walker, it propagates and exits 1.
+# paginated stream or search walk already holds rows; before any row it
+# propagates and exits 1.
 # Ctrl-C or SIGTERM halts the client: the job returns what it holds, and every
 # later paid step refuses.
 _STOPS = (CostLimitExceeded, IncompleteDataError)
@@ -130,6 +133,10 @@ def _walk(c, gather):
         return rows, None
     except _STOPS as exc:
         return rows, _stop_reason(c, exc, rows)
+    except (APIError, OSError) as exc:
+        if not rows:
+            raise
+        return rows, f"the search failed part-way: {exc}"
     except KeyboardInterrupt:
         return rows, _interrupted(c)
 
@@ -425,6 +432,7 @@ def entity_brief(handle, *, days=7, client=None, now=None):
                     "description": info.get("description"),
                     "verified": _known_bool(info, "isBlueVerified")},
         "window_days": days,
+        "as_of": datetime.fromtimestamp(now, UTC).isoformat(),
         "tweet_count": len(tweets),
         "top_tweets": _top_tweets(tweets),
         "top_tweets_total": len(tweets),
@@ -534,7 +542,7 @@ def narrative_tracker(query, *, days=30, client=None, now=None,
         for kind in TERM_KINDS:
             rising[kind] = sorted(
                 ({"term": k, "current": n, "prior": t_prior[kind][k]}
-                 for k, n in t_now[kind].items()),
+                 for k, n in t_now[kind].items() if n > t_prior[kind][k]),
                 key=lambda r: r["current"] - r["prior"], reverse=True)
         was = {_handle(t).lower() for t in prior if _handle(t)}
         new_authors = sorted({_handle(t).lower() for t in cur if _handle(t)} - was)
@@ -586,7 +594,7 @@ def authority_map(seed_query, *, cohort_limit=150, max_usd=5.0, client=None,
                      for m in ranked[:30]],
         "frontier_total": len(ranked),
         "frontier_external": co.authority_external[:30],
-        "frontier_external_total": len(co.authority_external),
+        "frontier_external_total": co.authority_external_total,
         # The reason comes from the crawl itself: a ceiling stop and an API
         # failure mid-walk are different problems with different fixes, and
         # hardcoding the ceiling text here misdiagnosed the latter.
@@ -836,13 +844,20 @@ def competitive_benchmark(handles, *, days=30, client=None, now=None):
                          "`jobs.py benchmark stripe,vercel`")
     c = client or _client()
     now = now or int(time.time())
-    allt, stop = _walk(c, lambda: corpus(
-        handles, now - days * 86400, now, client=c))
-    reasons = [stop]
-    by_handle = {}
-    for t in allt:
-        by_handle.setdefault(
-            ((t.get("author") or {}).get("userName") or "").casefold(), []).append(t)
+    # One walk per account, so a stop names the account it happened in and
+    # the accounts after it are reported as not reached, never as zero posts.
+    by_handle, reasons, allt = {}, [], []
+    for h in handles:
+        tw, stop = _walk(c, lambda h=h: corpus(
+            [h], now - days * 86400, now, client=c))
+        by_handle[h] = (tw, "partial" if stop else "complete")
+        allt += tw
+        if stop:
+            reasons.append(f"@{h}: {stop}")
+            break
+    not_reached = [h for h in handles if h not in by_handle]
+    if not_reached:
+        reasons.append("not reached: " + ", ".join("@" + h for h in not_reached))
     rows = []
     for h in handles:
         try:
@@ -850,13 +865,16 @@ def competitive_benchmark(handles, *, days=30, client=None, now=None):
         except CostLimitExceeded as exc:
             info = {}
             reasons.append(f"profile for @{h}: {_stop_reason(c, exc, allt or rows)}")
-        tw = by_handle.get(h.casefold(), [])
-        likes = [t.get("likeCount") for t in tw if t.get("likeCount") is not None]
+        tw, walk = by_handle.get(h, (None, "not reached"))
+        likes = [t.get("likeCount") for t in tw or [] if t.get("likeCount") is not None]
         rows.append({"handle": h, "followers": info.get("followers"),
-                     "tweets_in_window": len(tw),
+                     "tweets_in_window": None if tw is None else len(tw),
                      "peak_likes": max(likes) if likes else None,
+                     "walk": walk,
                      "verified": _known_bool(info, "isBlueVerified")})
-    return {"window_days": days, "entities": rows, **_status(reasons),
+    return {"window_days": days,
+            "as_of": datetime.fromtimestamp(now, UTC).isoformat(),
+            "entities": rows, **_status(reasons),
             "spend": c.spend_report()}
 
 
@@ -934,7 +952,8 @@ def _add_common_job_flags(parser, *, paid):
         parser.add_argument("--max-age", type=float, default=argparse.SUPPRESS,
                             metavar="DAYS",
                             help="buy cached follower and graph pages again "
-                                 "when older than this (default: never)")
+                                 "when older than this; 0 buys them all again "
+                                 "(default: never)")
     parser.add_argument("--store", default=argparse.SUPPRESS,
                         help="SQLite store path (default ~/.twitterapi-cache/store.db)")
 
@@ -1047,6 +1066,8 @@ def _main(argv=None):
         return 0
 
     a.max_usd = getattr(a, "max_usd", DEFAULT_MAX_USD)
+    if getattr(a, "max_age", 0) < 0:
+        raise UsageError(f"--max-age must be 0 or more days, got {a.max_age}")
     c = _client(a.max_usd, store_path, getattr(a, "max_age", None))
     walk_key = f"{a.job}:{a.target}:{getattr(a, 'days', None)}:{vars(a).get('index_faves')}"
     try:

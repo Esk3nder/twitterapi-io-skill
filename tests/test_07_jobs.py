@@ -358,12 +358,55 @@ class TestStopAndResume(JobsCase):
         return [b["query"] for path, b in self.requests
                 if path.endswith("advanced_search")]
 
+    def test_an_api_error_part_way_returns_the_rows_as_a_partial(self):
+        """Codex review 2026-11-11 (C3): the README promised a partial; the
+        job exited 1 and returned nothing."""
+        from twitterapi import APIError
+        calls = {"n": 0}
+
+        def raw(path, params):
+            if path.endswith("advanced_search"):
+                calls["n"] += 1
+                if calls["n"] > 4:
+                    raise APIError(500, "upstream broke", path)
+            return self.raw(path, params)
+
+        code, out = self.run_jobs(["brief", "alpha", "--store", self.db], raw)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(out["complete"])
+        self.assertGreater(out["tweet_count"], 0)
+        self.assertIn("upstream broke", out["completeness"]["reason"])
+        self.assertIn("as_of", out)
+
+    def test_an_api_error_before_any_row_is_a_runtime_failure(self):
+        from twitterapi import APIError
+
+        def raw(path, params):
+            if path.endswith("advanced_search"):
+                raise APIError(500, "upstream broke", path)
+            return self.raw(path, params)
+
+        code, out = self.run_jobs(["brief", "alpha", "--store", self.db], raw)
+        self.assertEqual(code, 1, out)
+
+    def test_max_age_zero_buys_again_and_a_negative_is_refused(self):
+        """Codex review 2026-11-11 (C5): `--max-age 0` meant never expire."""
+        import jobs
+        with mock.patch.dict(jobs.os.environ, {"TWITTERAPI_IO_KEY": "test"}):
+            c = jobs._client(1, self.db, 0)
+        self.addCleanup(c.store.close)
+        self.assertEqual(c.cache_max_age, 0)
+        code, out = self.run_jobs(
+            ["brief", "alpha", "--store", self.db, "--max-age", "-1"], self.raw)
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.requests, [])
+
     def test_a_rerun_after_the_ceiling_replays_the_pages_already_bought(self):
         argv = ["brief", "alpha", "--store", self.db, "--max-usd"]
         code, first = self.run_jobs([*argv, "0.012"], self.raw)
         self.assertEqual(code, 0, first)
         self.assertFalse(first["complete"])
-        self.assertIn("within 24 hours", first["completeness"]["resume"])
+        self.assertIn("for 24 hours", first["completeness"]["resume"])
         bought = set(self.searches())
         self.assertTrue(bought)
 

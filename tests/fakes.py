@@ -2,9 +2,9 @@
 
 ScriptedClient is the real Client — accounting, ceilings, pricing, cache, and
 every envelope check above the transport — with only _raw/_raw_json scripted.
-Each scripted request passes the real budget check and books the 15-credit
-floor, as Client._send would, so a test cannot spend past a ceiling that
-production would refuse.
+Each scripted request books its worst-case cost under the real budget check
+and settles it the way Client._send does, so a test sees the same ceiling
+behaviour as production, including concurrent in-flight bookings.
 
 A script is either a list of responses, consumed in order (an exception
 instance is raised instead of returned; an exhausted list fails the test), or
@@ -45,27 +45,33 @@ class ScriptedClient(twitterapi.Client):
         self.raw_script, self.json_script = script(raw), script(raw_json)
         self.raw_calls, self.json_calls = [], []
 
-    def _book(self, method, path, max_credits):
-        """What Client._send does before transport: refuse a request the
-        ceiling forbids, then book the 15-credit floor. `/oapi/my/info` is
-        the one free endpoint."""
+    def _send_scripted(self, method, path, max_credits, script, payload, calls):
+        """Client._send with the transport scripted: book the worst case
+        before the request, release it to the floor when the server answers
+        with an error, and leave it for _charge/_settle on success.
+        `/oapi/my/info` is the one free endpoint."""
         free = path == "/oapi/my/info"
+        worst = 0.0 if free else (max_credits or twitterapi.MIN_REQUEST_CREDITS)
+        self._book_attempt(path, worst, f"{method} {path} request")
+        calls.append((method, path, payload))
+        try:
+            body = _answer(script, path, payload)
+        except twitterapi.APIError:
+            self._release_to_floor(worst)
+            raise
         if not free:
-            self._require_budget(max_credits or twitterapi.MIN_REQUEST_CREDITS,
-                                 f"{method} {path}")
-        self._book_attempt(path, 0.0 if free else twitterapi.MIN_REQUEST_CREDITS,
-                           f"{method} {path} request")
+            self._provisional.credits = worst
+            self._record_run()
+        return body
 
     def _raw(self, method, path, params=None, *, max_credits=None):
         params = dict(params or {})
-        self._book(method, path, max_credits)
-        self.raw_calls.append((method, path, params))
-        return _answer(self.raw_script, path, params)
+        return self._send_scripted(method, path, max_credits, self.raw_script,
+                                   params, self.raw_calls)
 
     def _raw_json(self, method, path, body, *, max_credits=None):
-        self._book(method, path, max_credits)
-        self.json_calls.append((method, path, body))
-        return _answer(self.json_script, path, body)
+        return self._send_scripted(method, path, max_credits, self.json_script,
+                                   body, self.json_calls)
 
 
 def client_class(raw=(), raw_json=(), created=None):

@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -59,6 +60,7 @@ RESUME_MAX_AGE = 86400                  # seconds a bought search page can be re
 SECOND_SPLITS = ("filter:replies", "-filter:replies")   # disjoint and exhaustive
 MAX_QUERY_CHARS = 480                   # X rejects longer search queries
 DEFAULT_MAX_USD = 5.0                   # ceiling for a Client this module creates itself
+MONITOR_QUERY_OVERHEAD = 50             # the parentheses and time bounds monitor appends
 MONITOR_SEEN_CAP = 5000                 # newest ids kept for monitor dedupe
 MONITOR_OVERLAP = 120                   # seconds each poll re-scans for late-indexed posts
 _HANDLE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -95,7 +97,23 @@ def _cli_session(a):
     if out and os.path.exists(out):
         raise UsageError(f"--out {out} already exists; move it or pick another path")
     c = Client(max_usd=a.max_usd, store=getattr(a, "store", None) or DEFAULT_DB)
-    return c, (open(out, "w") if out else sys.stdout)
+    try:
+        # "x": two runs given the same path must not both open it.
+        return c, (open(out, "x") if out else sys.stdout)
+    except FileExistsError:
+        c.store.close()
+        raise UsageError(f"--out {out} already exists; move it or pick "
+                         "another path") from None
+
+
+def _close_out(a, fh):
+    """Close --out. A file no record reached is removed, so the rerun the
+    partial result suggests is not refused for a path that holds nothing."""
+    if a.out:
+        fh.close()
+        if os.path.getsize(a.out) == 0:
+            os.remove(a.out)
+            a.out = None
 
 
 def _clean_handle(raw, flag="USER"):
@@ -224,18 +242,23 @@ def _audience_cli(a):
             was_truncated = was_truncated or clipped
             got += 1
         truncated = False
-    except (CostLimitExceeded, KeyboardInterrupt) as e:
+    except KeyboardInterrupt:
+        if not got:
+            raise                       # stopped, not refused: run_cli exits 1
+        truncated = True
+        truncated_reason = "stopped by the user"
+        print("[audience] stopped by the user", file=sys.stderr)
+    except CostLimitExceeded as e:
         truncated = True
         refused = not got
-        truncated_reason = str(e) or "stopped by the user"
+        truncated_reason = str(e)
         print(f"[audience] {'stopped' if got else 'refused'}: {e}", file=sys.stderr)
     except IncompleteDataError as e:
         truncated = True
         truncated_reason = str(e)
         print(f"[audience] partial: {e}", file=sys.stderr)
     finally:
-        if a.out:
-            fh.close()
+        _close_out(a, fh)
         c.store.close()
     print(f"{got:,} records | {c.spend_report()}", file=sys.stderr)
     if refused:
@@ -254,6 +277,7 @@ def _audience_cli(a):
             "records_state": (None if got else
                               f"0 followers found for @{a.user} in the requested scope"),
             "artifact": a.out,
+            "spend": c.spend_report(),
             "help": (["Run `workflows.py audience <user> --profiles` for profile fields"]
                      + (["Run `workflows.py audience <user> --limit <count>` with a larger "
                          "count to show more"]
@@ -273,11 +297,16 @@ def _search_page(c, q, replay):
     """One advanced_search page -> (tweets, has_next_page as the API sent it).
 
     A fresh page is charged and persisted before it is returned. With
-    `replay`, the page's id list is also kept for RESUME_MAX_AGE, so a rerun
-    of the same window is served from the store and pays nothing."""
+    `replay`, the page's id list is kept under the walk that bought it
+    (anchored_now), and only a rerun of that same UNFINISHED walk is served
+    from the store. A finished walk, or a client that never declared one,
+    always buys the page again: a search result is not a durable fact."""
     params = {"query": q, "queryType": "Latest"}
-    index = c.store.get_page(SEARCH_PATH, params, RESUME_MAX_AGE) if replay else None
-    rows = c.store.raw_tweets(index["ids"]) if index else None
+    walk = getattr(c, "walk_id", None)
+    index = (c.store.get_page(SEARCH_PATH, params, RESUME_MAX_AGE)
+             if replay and walk else None)
+    rows = (c.store.raw_tweets(index["ids"])
+            if index and index.get("walk") == walk else None)
     if rows is not None:
         c.cache_hits += 1
         c.saved_credits += Client.page_credits("search", len(rows), SEARCH_PAGE)
@@ -300,7 +329,8 @@ def _search_page(c, q, replay):
         c.store.put_tweets(batch)
     if replay and isinstance(has_more, bool):
         c.store.put_page(SEARCH_PATH, params, {
-            "ids": [t.get("id") for t in batch], "has_next_page": has_more})
+            "ids": [t.get("id") for t in batch], "has_next_page": has_more,
+            "walk": walk})
     return batch, has_more
 
 
@@ -330,10 +360,10 @@ def search_window(client, query, since_ts=None, until_ts=None, *,
     until_time to that second (re-including it; dedupe by id absorbs the
     overlap). Spends through `client` under the client's own ceiling.
 
-    Yields qualifying tweet dicts newest-first, each id once. With a store
-    and a fixed `until_ts`, a rerun of the same window replays the pages
-    already bought (see _search_page); `replay=False` is for a caller whose
-    windows never repeat.
+    Yields qualifying tweet dicts newest-first, each id once. With a store,
+    a fixed `until_ts` and a walk declared by anchored_now, a rerun of that
+    unfinished walk replays the pages it already bought (see _search_page);
+    `replay=False` is for a caller whose windows never repeat.
 
     Completeness: normal exhaustion (StopIteration) happens ONLY when the
     window is proven walked: an empty page, a short page without
@@ -414,6 +444,12 @@ def search_window(client, query, since_ts=None, until_ts=None, *,
             # A full page inside ONE second: a time window cannot page within
             # it, so fetch that second again as disjoint halves.
             for part in SECOND_SPLITS:
+                if max_pages and pages >= max_pages:
+                    raise IncompleteDataError(
+                        f"stopped at --max-pages {max_pages} while splitting "
+                        f"second {oldest}; the {len(seen):,} tweets already "
+                        f"yielded are valid but the result is partial.")
+                pages += 1
                 half, more = _search_page(
                     c, f"{query} {part} since_time:{oldest} until_time:{oldest + 1}",
                     replay)
@@ -438,8 +474,9 @@ def search_shards(client, query, since_ts, until_ts, *, shards=8,
 
     One window is walked a page at a time (about two seconds each); the
     account allows 20 requests a second. Yields the newest sub-window first.
-    A stop in any shard (ceiling, unprovable completeness, Ctrl-C) is raised
-    only AFTER every row every shard acquired has been yielded."""
+    A stop in any shard (ceiling, unprovable completeness, Ctrl-C, or an API
+    or network failure, which also halts the other shards) is raised only
+    AFTER every row every shard acquired has been yielded."""
     span = until_ts - (since_ts or until_ts)
     _prepare(client, query, index_faves)            # warn once, before the threads
     shards = max(1, min(shards, span // 3600))      # under an hour each: don't
@@ -452,6 +489,11 @@ def search_shards(client, query, since_ts, until_ts, *, shards=8,
                                    index_faves=index_faves):
                 rows.append(t)
         except (CostLimitExceeded, IncompleteDataError) as exc:
+            return rows, exc
+        except (APIError, OSError) as exc:
+            # The whole walk will fail with this error; stop the other shards
+            # from spending on a result that cannot be returned complete.
+            client.halt(f"a parallel search failed ({exc})")
             return rows, exc
         return rows, None
 
@@ -476,7 +518,10 @@ def search_shards(client, query, since_ts, until_ts, *, shards=8,
             if t.get("id") not in seen:
                 seen.add(t.get("id"))
                 yield t
-        stop = stop or exc
+        # The error that caused the halt outranks the refusals it produced.
+        failed = isinstance(exc, APIError | OSError)
+        if exc and (stop is None or (failed and isinstance(stop, CostLimitExceeded))):
+            stop = exc
     if len(futures) < shards:           # interrupted before every shard began
         stop = stop or CostLimitExceeded(client.halted)
     if stop:
@@ -484,22 +529,30 @@ def search_shards(client, query, since_ts, until_ts, *, shards=8,
 
 
 def anchored_now(client, key):
-    """`now` for a walk that ends at the present.
+    """Declare the walk `key` and return its `now`.
 
-    An unfinished walk with the same key in the last RESUME_MAX_AGE seconds
-    gives its own start time back, so the rerun requests identical windows
-    and replays every page already bought instead of paying for it again."""
-    if client.store is None:
-        return int(time.time())
-    client.store.drop_pages(SEARCH_PATH, RESUME_MAX_AGE)    # too old to replay
-    mark = client.store.get_page("walk", {"key": key}, RESUME_MAX_AGE) or {}
-    now = mark.get("now") or int(time.time())
-    client.store.put_page("walk", {"key": key}, {"now": now})
+    An unfinished walk with the same key that STARTED in the last
+    RESUME_MAX_AGE seconds gives its own start time back, so the rerun
+    requests identical windows and replays the pages that walk bought. The
+    marker is written once, at the start: reruns do not extend it, so a walk
+    that never finishes still starts over a day after it began."""
+    now = int(time.time())
+    if client.store is not None:
+        client.store.drop_pages(SEARCH_PATH, RESUME_MAX_AGE)    # too old to replay
+        mark = client.store.get_page("walk", {"key": key}, RESUME_MAX_AGE) or {}
+        if mark.get("now"):
+            now, walk_id = mark.get("now"), mark.get("id")
+        else:
+            walk_id = secrets.token_hex(8)
+            client.store.put_page("walk", {"key": key}, {"now": now, "id": walk_id})
+        client.walk_id = walk_id
     return now
 
 
 def finish_walk(client, key):
-    """The walk completed: the next run starts from the real present."""
+    """The walk completed: the next run starts from the real present and
+    buys its pages again."""
+    client.walk_id = None
     if client.store is not None:
         client.store.put_page("walk", {"key": key}, {})
 
@@ -596,6 +649,14 @@ def _history_walk(a, c, q, fh):
                     truncated_reason = str(e)
                     print(f"\nSTOPPED: {e}", file=sys.stderr)
                     break
+                except (APIError, OSError) as e:
+                    if not n:
+                        raise           # nothing to return: a runtime failure
+                    truncated = True
+                    truncated_reason = f"the search failed part-way: {e}"
+                    stop_all_passes = True
+                    print(f"\nSTOPPED: {e}", file=sys.stderr)
+                    break
                 except (CostLimitExceeded, KeyboardInterrupt) as e:
                     # The spend ceiling is shared across passes, so another
                     # pass cannot make useful progress once it is exhausted.
@@ -648,8 +709,7 @@ def _history_walk(a, c, q, fh):
             if stop_all_passes:
                 break
     finally:
-        if a.out:
-            fh.close()
+        _close_out(a, fh)
 
     print("[history] composition: " + " | ".join(
         f"{name} {count:,}" for name, count in composition.items())
@@ -722,11 +782,12 @@ def _history_walk(a, c, q, fh):
                              f"0 posts found for {q!r} between {a.since or 'any'} "
                              f"and {a.until or 'now'}"),
             "artifact": a.out,
+            "spend": c.spend_report(),
             "help": (["Run `workflows.py history <user> --full` for complete text"]
                      if was_text_truncated else []),
         }, complete=complete, reason=truncated_reason,
-        resume=("Rerun the same command within 24 hours with a new `--out`: "
-                "pages already bought replay free. Raise `--max-usd <amount>` "
+        resume=("Rerun the same command within 24 hours: "
+                "search pages already bought replay free. Raise `--max-usd <amount>` "
                 "or `--max-pages <count>` if one of them stopped the walk"
                 if not complete else None), records_returned=n)
     print(json.dumps(summary, ensure_ascii=False) if not a.out else
@@ -796,7 +857,8 @@ def monitor(users, *, interval=60, max_usd=None, state_file=None, client=None,
     # One OR query per group of handles that fits X's query length.
     queries = []
     for user in users:
-        if queries and len(queries[-1]) + len(user) + 9 <= MAX_QUERY_CHARS:
+        if queries and (len(queries[-1]) + len(user) + 9
+                        <= MAX_QUERY_CHARS - MONITOR_QUERY_OVERHEAD):
             queries[-1] += f" OR from:{user}"
         else:
             queries.append(f"from:{user}")
@@ -886,6 +948,7 @@ def _monitor_run(a, c, users):
         restart = ("restart from `--state <path>` to resume the same window"
                    if a.state else "rerun with `--state <path>` to make runs resumable")
         emit_line(success("workflows.py monitor", {
+                        "spend": c.spend_report(),
                         "records_count": f"{state['records']} of unknown total",
                         "records_state": (None if state["records"] else
                                           "0 new posts emitted before the monitor stopped")},
@@ -896,6 +959,7 @@ def _monitor_run(a, c, users):
                     records_returned=state["records"]))
         return 0
     summary = success("workflows.py monitor", {
+        "spend": c.spend_report(),
         "records_count": (f"{state['records']} of "
                           f"{'unknown' if interrupted else state['records']} total"),
         "records_state": (None if state["records"] else

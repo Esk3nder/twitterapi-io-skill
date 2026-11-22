@@ -21,8 +21,8 @@ level with no top-level `OR`; a clause under `OR`, inside a group, or negated is
 refused rather than rewritten into a different query. `--index-faves` leaves
 the operator in the query instead: far fewer paid rows, at the price of missing
 posts whose likes rose after the index snapshot. For a positive threshold, `limit` bounds qualifying rows, not
-paid rows scanned: pass an explicit `max_usd` ceiling or the client refuses
-before transport, and expect a scan warning on stderr.
+paid rows scanned: the spend ceiling is the only bound, and a scan warning on
+stderr says so before the first request.
 
 **Tweet media is evidence, not decoration.** Every tweet returned by the
 client has a first-class `media` list with `type`, `url`, `alt_text`, and a

@@ -382,10 +382,11 @@ def _print_event(evt, *, fields=None, full=False, state=None):
         print(f"  [{et}]", file=sys.stderr)
         return
     for t in evt.get("tweets") or []:
-        raw = {"id": t.get("id"), "createdAt": t.get("createdAt"),
-               "author": (t.get("author") or {}).get("userName")
-                         or t.get("screen_name"),
-               "text": t.get("text"), "rule": evt.get("rule_tag")}
+        # The whole tweet: a pre-trimmed copy made every other --fields
+        # name (likes, views, media) read null.
+        raw = {**t, "rule": evt.get("rule_tag")}
+        if not t.get("author") and t.get("screen_name"):
+            raw["author"] = {"userName": t["screen_name"]}
         schema = dict(TWEET_FIELDS)
         schema["rule"] = ("rule",)
         rendered, clipped = format_record(

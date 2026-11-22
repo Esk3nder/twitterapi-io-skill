@@ -187,8 +187,11 @@ to stderr while preserving JSON-only stdout.
 
 A walk that stops early — the spend ceiling, Ctrl-C, a timeout, an API failure
 after rows arrived — keeps every page it bought and returns them as a partial
-result. Rerun the same command within 24 hours and those pages are replayed
-from the store at no cost before the walk continues.
+result. Rerun the same command within 24 hours of its first start and the
+search pages of an unfinished `history`, `brief`, `narrative` or `benchmark`
+are replayed from the store at no cost before the walk continues. A finished
+search is never replayed, and `tweet`, `diffusion` and the `authority` seed
+search are paid again.
 
 Add `--out FILE` to stream records as JSONL while stdout receives the final JSON
 summary (the path must be new: an existing file is refused rather than
@@ -234,9 +237,10 @@ For advanced search, bare `since:YYYY-MM-DD` / `until:YYYY-MM-DD` tokens are
 normalized to exact UTC midnight. `min_faves:N` is removed from the API query
 and enforced locally against each response's current `likeCount`, because the
 search index's engagement snapshot can lag. Exactness can require fetching
-more rows. For a positive threshold, `limit` bounds qualifying rows rather
-than paid rows scanned, so `paginate()` requires an explicit `max_usd` ceiling
-and warns about the scan on stderr.
+more rows: the spend ceiling is the only bound on how many are scanned, and a
+warning on stderr says so before the first request. `--index-faves` leaves the
+operator to the search index instead, which costs far less but can miss posts
+whose likes rose recently.
 
 Pagination and history calls raise `IncompleteDataError` when the API claims
 more data exists but omits a required field/cursor, a time window cannot split

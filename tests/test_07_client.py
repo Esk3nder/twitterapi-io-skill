@@ -610,6 +610,21 @@ class TestPaidProfilesAndSpendAreKept(E2ETest):
         self.assertEqual((runs[0]["requests"], runs[0]["usd"]), (2, 0.0004))
         self.assertEqual(store.stats()["usd_spent_7d"], 0.0004)
 
+    def test_a_ledger_write_failure_does_not_discard_a_paid_response(self):
+        """Codex review 2026-11-11 (C8): a locked database during the ledger
+        write raised out of the request and lost the page it had paid for."""
+        import sqlite3
+        store = self.fresh_store("spend-ledger-locked")
+        c = ScriptedClient(raw=[{"data": {"id": "7", "userName": "alpha"}}] * 2,
+                           store=store)
+        err = io.StringIO()
+        with mock.patch.object(store, "record_run",
+                               side_effect=sqlite3.OperationalError("database is locked")), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(c.user_info("alpha")["id"], "7")
+            self.assertEqual(c.user_info("alpha")["id"], "7")
+        self.assertEqual(err.getvalue().count("run ledger could not be written"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

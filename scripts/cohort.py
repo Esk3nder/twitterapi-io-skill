@@ -169,6 +169,11 @@ class Cohort:
         """Build a zero-request cohort from account IDs already in hand."""
         label = kw.pop("label", "provided_ids")
         co = cls(label=label, **kw)
+        if getattr(account_ids, "complete", True) is False:
+            # Store.follower_ids_for labels a crawl that never finished; a
+            # cohort built from it must not read as the whole audience.
+            co.complete = False
+            co.incomplete_reasons.append("built from an incomplete id list")
         seen = set()
         for account_id in account_ids:
             account_id = str(account_id or "")
@@ -604,6 +609,7 @@ class Cohort:
         finally:
             self.c.max_usd = prior      # never leave the ceiling tightened
         self.authority_crawled = crawled
+        self.authority_external_total = sum(1 for n in external.values() if n > 1)
         self.authority_external = [
             {"handle": handle, "in_degree": count}
             for handle, count in external.most_common(200) if count > 1]

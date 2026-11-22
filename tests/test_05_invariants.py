@@ -494,10 +494,13 @@ class TestWindowCompleteness(E2ETest):
             {"tweets": [tweet(i, base - i) for i in range(20)], "has_next_page": True},
             {"tweets": [tweet(i, base - i) for i in range(19, 25)], "has_next_page": False},
         ]
+        from workflows import anchored_now
         store = self.fresh_store("window-replay")
         first = ScriptedClient(raw=list(pages), store=store)
+        anchored_now(first, "walk")
         bought = [t["id"] for t in search_window(first, "from:alpha", base - 100, base + 5)]
         rerun = ScriptedClient(raw=[], store=store)
+        anchored_now(rerun, "walk")
         replayed = [t["id"] for t in search_window(rerun, "from:alpha", base - 100, base + 5)]
         self.assertEqual(replayed, bought)
         self.assertEqual(len(bought), 25)
@@ -505,6 +508,32 @@ class TestWindowCompleteness(E2ETest):
         self.assertEqual(rerun.spent_credits, 0.0)
         self.assertEqual(rerun.cache_hits, 2)
         self.assertGreater(rerun.saved_credits, 0)
+
+    def test_a_finished_or_undeclared_walk_is_bought_again(self):
+        """Codex review 2026-11-11 (C1): any search page under 24 hours old
+        was replayed, so a finished search rerun two hours later returned the
+        old rows for free and called itself complete."""
+        from workflows import anchored_now, finish_walk, search_window
+        base = 1_700_000_000
+        old = {"tweets": [tweet("old", base)], "has_next_page": False}
+        new = {"tweets": [tweet("new", base + 1), tweet("old", base)],
+               "has_next_page": False}
+        store = self.fresh_store("window-no-stale-replay")
+        first = ScriptedClient(raw=[old], store=store)
+        anchored_now(first, "walk")
+        list(search_window(first, "from:alpha", base - 100, base + 5))
+        finish_walk(first, "walk")
+
+        rerun = ScriptedClient(raw=[dict(new)], store=store)
+        anchored_now(rerun, "walk")
+        got = [t["id"] for t in search_window(rerun, "from:alpha", base - 100, base + 5)]
+        self.assertEqual(got, ["new", "old"], "a finished walk is bought again")
+        self.assertEqual(len(rerun.raw_calls), 1)
+
+        library = ScriptedClient(raw=[dict(new)], store=store)
+        got = [t["id"] for t in search_window(library, "from:alpha", base - 100, base + 5)]
+        self.assertEqual(got, ["new", "old"], "no declared walk: never replayed")
+        self.assertEqual(len(library.raw_calls), 1)
 
     def test_replay_buys_a_page_again_when_its_rows_are_gone(self):
         """An id list whose tweets are missing is not a page; never return
@@ -642,15 +671,13 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         with self.assertRaises(urllib.error.URLError):
             diffusion_trace("tweet", limit=20, client=FailingClient())
 
-    def test_competitive_benchmark_uses_one_shared_corpus(self):
-        """Per-handle corpus calls would defeat batching and spend N requests."""
+    def test_competitive_benchmark_walks_each_account_over_the_same_window(self):
         import jobs
         calls = []
 
         def fake_corpus(handles, since_ts, until_ts, client=None):
             calls.append((list(handles), until_ts - since_ts, client))
-            return [tweet("a", 1_700_000_000, "alpha"),
-                    tweet("b", 1_700_000_000, "beta")]
+            return [tweet(handles[0], 1_700_000_000, handles[0])]
 
         class C:
             def user_info(self, handle):
@@ -663,9 +690,39 @@ class TestJobAndWorkflowOrchestration(E2ETest):
         with mock.patch.object(jobs, "corpus", fake_corpus):
             out = jobs.competitive_benchmark(["alpha", "beta"], days=7,
                                              client=C())
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][:2], (["alpha", "beta"], 7 * 86400))
+        self.assertEqual([c[:2] for c in calls],
+                         [(["alpha"], 7 * 86400), (["beta"], 7 * 86400)])
         self.assertEqual([r["tweets_in_window"] for r in out["entities"]], [1, 1])
+        self.assertEqual([r["walk"] for r in out["entities"]], ["complete"] * 2)
+        self.assertTrue(out["complete"])
+        self.assertIn("as_of", out)
+
+    def test_benchmark_never_reports_an_unreached_account_as_zero_posts(self):
+        """Codex review 2026-11-11 (C4): a stop in the first account left the
+        rest at tweets_in_window 0, which reads as "posted nothing"."""
+        import jobs
+        from twitterapi import IncompleteDataError
+
+        def stopping_corpus(handles, since_ts, until_ts, client=None):
+            yield tweet("a", 1_700_000_000, "alpha")
+            raise IncompleteDataError("page cap")
+
+        class C:
+            spent_usd = 0.01
+
+            def user_info(self, handle):
+                return {"followers": 10}
+
+            def spend_report(self):
+                return "1 request"
+
+        with mock.patch.object(jobs, "corpus", stopping_corpus):
+            out = jobs.competitive_benchmark(["alpha", "beta"], days=7, client=C())
+        alpha, beta = out["entities"]
+        self.assertEqual((alpha["tweets_in_window"], alpha["walk"]), (1, "partial"))
+        self.assertEqual((beta["tweets_in_window"], beta["walk"]), (None, "not reached"))
+        self.assertFalse(out["complete"])
+        self.assertIn("not reached: @beta", out["_warning"])
 
     def test_monitor_does_not_advance_checkpoint_after_incomplete_window(self):
         """A partial poll must be retried, not checkpointed past missing tweets.

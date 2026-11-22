@@ -359,6 +359,18 @@ class TestStoppedFromOutside(unittest.TestCase):
         self.assertEqual((rc, reached), (1, []))
         self.assertEqual(json.loads(out)["error"]["type"], "runtime")
 
+    def test_the_callers_sigterm_handler_is_restored(self):
+        """Codex review 2026-11-11 (C22): a library caller's handler was
+        replaced for the rest of the process."""
+        import signal
+
+        def mine(*_):
+            pass
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        signal.signal(signal.SIGTERM, mine)
+        self._run(lambda _argv: 0)
+        self.assertIs(signal.getsignal(signal.SIGTERM), mine)
+
 
 class TestSchemalessCollections(unittest.TestCase):
     def test_fields_apply_to_the_collection_that_has_them_only(self):

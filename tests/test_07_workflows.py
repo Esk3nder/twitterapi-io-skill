@@ -202,7 +202,7 @@ class TestHistoryArgumentRefusals(CliCase):
         """An unexpected failure after records were streamed printed an
         indented error document and broke the JSON Lines stream."""
         pages = [{"tweets": [tw(k, NOW - k) for k in range(20)],
-                  "has_next_page": True}, OSError("connection reset")]
+                  "has_next_page": True}, RuntimeError("a bug")]
 
         def handler(path, params):
             item = pages.pop(0)
@@ -216,6 +216,38 @@ class TestHistoryArgumentRefusals(CliCase):
         lines = self.lines(out)            # every line must parse on its own
         self.assertEqual(len(lines), 21)
         self.assertEqual(lines[-1]["error"]["type"], "runtime")
+
+    def test_a_network_failure_after_rows_is_a_partial_with_its_spend(self):
+        """Codex review 2026-11-11 (C3, C16): the docs promised a partial for
+        an API failure after rows arrived; history exited 1."""
+        pages = [{"tweets": [tw(k, NOW - k) for k in range(20)],
+                  "has_next_page": True}, OSError("connection reset")]
+
+        def handler(path, params):
+            item = pages.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        rc, out, _ = self.run_cli(
+            workflows, ["history", "--query", "foo", "--store", self.path("p.db")],
+            handler)
+        self.assertEqual(rc, 0, out)
+        lines = self.lines(out)
+        self.assertEqual(len(lines), 21)
+        self.assertFalse(lines[-1]["complete"])
+        self.assertIn("connection reset", lines[-1]["completeness"]["reason"])
+        self.assertIn("spend", lines[-1])
+
+    def test_a_network_failure_before_any_row_is_a_runtime_failure(self):
+        def handler(path, params):
+            raise OSError("connection reset")
+        out_file = self.path("empty.jsonl")
+        rc, out, _ = self.run_cli(
+            workflows, ["history", "--query", "foo", "--store", self.path("q.db"),
+                        "--out", out_file], handler)
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(os.path.exists(out_file),
+                         "an --out file no record reached must not block the rerun")
 
     def test_library_rejects_inverted_window_before_request(self):
         client = ScriptedClient(max_usd=1)
@@ -509,6 +541,16 @@ class TestWorkflowsKeepWhatTheyBuy(CliCase):
             self.assertEqual((list(cached), cached.complete), (["1", "2"], True))
             self.assertEqual(store.profiles()["42"]["user_name"], "alpha")
 
+    def test_an_interrupt_before_any_follower_is_a_stop_not_a_refusal(self):
+        """Codex review 2026-11-11 (C10): Ctrl-C before the first row exited 2
+        as a refusal, which tells the caller to change its arguments."""
+        def handler(path, params):
+            raise KeyboardInterrupt
+        rc, out, _ = self.run_cli(
+            workflows, ["audience", "alpha", "--store", self.path("i.db")], handler)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.lines(out)[-1]["error"]["type"], "runtime")
+
     def test_every_workflow_command_accepts_store_and_max_usd(self):
         for command in ("audience", "history", "monitor"):
             a = workflows._parser().parse_args(
@@ -585,6 +627,30 @@ class TestShardedWalk(CliCase):
         self.assertEqual(got[:len(healthy)], healthy)
         self.assertIn("drift", got, "the failing shard's paid row is kept too")
 
+    def test_an_api_error_in_one_shard_keeps_the_rows_and_halts_the_rest(self):
+        """Codex review 2026-11-11 (C3): one shard's API error discarded the
+        rows the others bought while they kept spending."""
+        posts = [NOW - k * 60 for k in range(1, 60 * 16)]       # ~3 pages a shard
+        healthy = self.index(posts)
+
+        def answer(path, params):
+            until = int(re.search(r"until_time:(\d+)", params["query"]).group(1))
+            if until <= NOW - 14 * self.HOUR:
+                raise APIError(500, "upstream broke", path)
+            return healthy(path, params)
+
+        c = ScriptedClient(raw=answer, max_usd=5)
+        got = []
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(APIError):
+            for t in workflows.search_shards(c, "topic", NOW - 16 * self.HOUR, NOW):
+                got.append(t["id"])
+        self.assertTrue(got, "rows bought before the failure are yielded")
+        self.assertEqual(len(got), len(set(got)))
+        self.assertIn("a parallel search failed", c.halted)
+        with self.assertRaises(workflows.CostLimitExceeded):
+            c.user_info("alpha")
+
 
 class TestAnchoredWalk(CliCase):
     def test_an_unfinished_walk_gets_its_own_start_time_back(self):
@@ -600,6 +666,24 @@ class TestAnchoredWalk(CliCase):
                 workflows.finish_walk(c, "brief:alpha:7")
                 self.assertEqual(workflows.anchored_now(c, "brief:alpha:7"), NOW + 900,
                                  "a finished walk starts from the present")
+
+    def test_reruns_do_not_keep_an_unfinished_walk_alive_past_a_day(self):
+        """Codex review 2026-11-11 (C2): each rerun rewrote the marker, so a
+        job that never finished stayed pinned to its first day forever."""
+        from store import Store
+        day = workflows.RESUME_MAX_AGE
+        with Store(self.path("anchor-expiry.db")) as store:
+            c = ScriptedClient(raw=[], store=store)
+            with mock.patch.object(workflows.time, "time", return_value=NOW):
+                first = workflows.anchored_now(c, "k")
+                first_id = c.walk_id
+            with mock.patch.object(workflows.time, "time", return_value=NOW + day - 60):
+                self.assertEqual(workflows.anchored_now(c, "k"), first)
+                self.assertEqual(c.walk_id, first_id)
+            with mock.patch.object(workflows.time, "time", return_value=NOW + day + 60):
+                self.assertEqual(workflows.anchored_now(c, "k"), NOW + day + 60)
+                self.assertNotEqual(c.walk_id, first_id,
+                                    "a new walk never replays the old one's pages")
 
     def test_without_a_store_now_is_now(self):
         c = ScriptedClient(raw=[])
