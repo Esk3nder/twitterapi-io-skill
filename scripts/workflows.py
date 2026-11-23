@@ -606,10 +606,11 @@ def _history_walk(a, c, q, fh):
                  "(two search passes)")
     elif a.exclude_replies:
         scope = ("originals + quote tweets; replies excluded; native retweets "
-                 "excluded by `from:` search")
+                 "only where `from:` search returns them")
     else:
-        scope = ("originals + replies + quote tweets; native retweets excluded "
-                 "by `from:` search (pass --include-retweets for a second pass)")
+        scope = ("originals + replies + quote tweets; `from:` search returns "
+                 "some native retweets but not reliably all (pass "
+                 "--include-retweets for a dedicated second pass)")
     print(f"[history] scope: {scope}", file=sys.stderr)
     print(f"query: {q!r}  window {a.since or 'any'} -> {a.until or 'now'}",
           file=sys.stderr)

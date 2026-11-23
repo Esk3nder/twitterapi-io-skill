@@ -963,7 +963,8 @@ class TestHistoryHonesty(E2ETest):
         self.assertEqual(calls, ["from:alpha"])
         scope = err.getvalue().lower()
         self.assertIn("scope", scope)
-        self.assertIn("native retweets excluded", scope)
+        self.assertIn("some native retweets but not reliably all", scope)
+        self.assertNotIn("excluded", scope)
 
     def test_index_coverage_message_states_date_direction_and_distance(self):
         """Coverage diagnostics must not call a later crawl date 'before'."""

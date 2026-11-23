@@ -673,9 +673,9 @@ class TestNarrative(unittest.TestCase):
             [self.post("seen", 1, "old_voice", 4, hashtags=[{"text": "x"}])],
             stop=twitterapi.CostLimitExceeded("Spend ceiling hit mid-window"))
         self.assertFalse(result["complete"])
-        self.assertEqual(result["new_authors"], [],
-                         "authors absent from a partial prior are not 'new'")
-        self.assertEqual(result["rising_hashtags"], [])
+        self.assertIsNone(result["new_authors"],
+                          "authors absent from a partial prior are not 'new'")
+        self.assertIsNone(result["rising_hashtags"])
         self.assertEqual([t["id"] for t in result["top_tweets"]], ["seen"],
                          "the rows that were bought are still returned")
 

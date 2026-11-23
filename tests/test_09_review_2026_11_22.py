@@ -178,6 +178,45 @@ class TestOutputsSayWhatTheyMean(unittest.TestCase):
         self.assertEqual([h for q in queries for h in re.findall(r"from:(\w+)", q)], handles)
         self.assertLessEqual(max(map(len, queries)), workflows.MAX_QUERY_CHARS)
 
+    def test_a_native_retweet_reports_the_media_of_the_post_it_retweets(self):
+        """Live test 2026-11-22: brief counted zero media for two retweets
+        whose photos sat under retweeted_tweet."""
+        from store import extract_tweet_media
+        photo = {"type": "photo", "media_url_https": "https://pbs.twimg.com/media/a.jpg"}
+        retweet = {"id": "2", "retweeted_tweet": {
+            "id": "1", "extendedEntities": {"media": [photo]}}}
+        self.assertEqual([m["url"] for m in extract_tweet_media(retweet)],
+                         ["https://pbs.twimg.com/media/a.jpg"])
+        self.assertEqual(extract_tweet_media({"id": "3", "retweeted_tweet": {"id": "1"}}), [])
+
+    def test_a_partial_narrative_marks_its_comparisons_not_computed(self):
+        """Live test 2026-11-22: a stopped narrative printed "0 new authors
+        found" and a note that the comparisons were computed."""
+        import axi
+
+        def stopped(*a, **k):
+            yield tweet("a", NOW - 10)
+            raise CostLimitExceeded("ceiling")
+        with mock.patch.object(jobs, "search_shards", stopped):
+            raw = jobs.narrative_tracker("topic", days=1, now=NOW,
+                                         client=mock.Mock(spend_report=lambda: ""))
+        self.assertIsNone(raw["new_authors"])
+        self.assertNotIn("are computed", raw["_note"])
+        out = axi.prepare_output(raw, command="jobs.py narrative",
+                                 collections=jobs.COLLECTIONS["narrative"])
+        self.assertIsNone(out["new_authors"])
+        self.assertEqual(out["new_authors_count"], "not computed")
+        self.assertEqual(out["rising_hashtags_count"], "not computed")
+        self.assertNotIn("new_authors_state", out)
+
+    def test_a_thread_cut_at_its_limit_does_not_state_a_total(self):
+        """Live test 2026-11-22: a thread stopped at --limit 5 read
+        "5 of 5 total" beside a reason saying more existed."""
+        import axi
+        out = axi.prepare_output({"thread": [{"id": "1"}], "thread_total": None},
+                                 command="jobs.py tweet", collections={"thread": {}})
+        self.assertEqual(out["thread_count"], "1 shown, total unknown")
+
 
 if __name__ == "__main__":
     unittest.main()

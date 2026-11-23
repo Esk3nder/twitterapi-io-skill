@@ -139,7 +139,7 @@ python3 scripts/workflows.py audience jack --verified-only # verified subset
 # history over a date range, streamed to JSONL; stdout ends with a summary row
 python3 scripts/workflows.py history openai --since 2026-06-01 --until 2026-07-01 \
   --exclude-replies --out tweets.jsonl
-# `from:` omits native retweets; opt into the second, deduplicated search pass
+# `from:` returns only some native retweets; opt into the second, deduplicated search pass
 python3 scripts/workflows.py history openai --include-retweets --out tweets.jsonl
 
 # poll for new posts; --state makes it resumable across restarts
@@ -391,8 +391,9 @@ See [`tests/TRIAGE.md`](tests/TRIAGE.md) for failure class → cause → next st
 
 ## Known limitations
 
-- **`from:USER` search excludes native retweets.** Default `history` output is
-  originals + replies + quote tweets and prints that scope. Pass
+- **`from:USER` search returns some native retweets, not reliably all.**
+  Default `history` keeps the ones it gets and counts them in its composition
+  line. Pass
   `--include-retweets` for a second `filter:nativeretweets` pass under the same
   spend ceiling; results are deduplicated by tweet id.
 - **Search-index depth is not account age.** An open-ended history may stop

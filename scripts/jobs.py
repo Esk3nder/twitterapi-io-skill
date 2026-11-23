@@ -467,7 +467,7 @@ def tweet_lookup(ref, *, limit=40, client=None):
                         "deleted, protected, or a wrong id"),
         "quoted": _tweet_row(quoted) if isinstance(quoted, dict) else None,
         "thread": [_tweet_row(t) for t in thread],
-        "thread_total": len(thread),
+        "thread_total": None if stop else len(thread),
         "_note": ("`thread` is the conversation the API returned around this "
                   "post, oldest first; it can include other people's replies."),
         **_status([stop], resume="Raise `--limit <count>` and rerun"),
@@ -530,8 +530,9 @@ def narrative_tracker(query, *, days=30, client=None, now=None,
     cur = [t for t in tweets if (parse_ts(t.get("createdAt") or "") or now) >= middle]
     prior = [t for t in tweets if (parse_ts(t.get("createdAt") or "") or now) < middle]
     reasons = [stop]
-    rising = {kind: [] for kind in TERM_KINDS}
-    new_authors = []
+    rising = dict.fromkeys(TERM_KINDS)
+    new_authors = None
+    note = "Naming the narrative is the caller's job."
     if stop:
         # Against a partial walk, an author or term it never reached would be
         # reported as "new": absence read as a confident diff.
@@ -546,8 +547,7 @@ def narrative_tracker(query, *, days=30, client=None, now=None,
                 key=lambda r: r["current"] - r["prior"], reverse=True)
         was = {_handle(t).lower() for t in prior if _handle(t)}
         new_authors = sorted({_handle(t).lower() for t in cur if _handle(t)} - was)
-    note = ("New authors and rising terms are computed; naming the narrative "
-            "is the caller's job.")
+        note = "New authors and rising terms are computed. " + note
     if "min_faves" in query.lower():
         note += (" min_faves favours the prior window: its posts had longer "
                  "to gather likes, so the two counts are not like for like.")
@@ -557,11 +557,12 @@ def narrative_tracker(query, *, days=30, client=None, now=None,
         "current_tweet_count": len(cur), "prior_tweet_count": len(prior),
         "top_tweets": _top_tweets(cur), "top_tweets_total": len(cur),
         "top_authors": _top_authors(cur),
-        "new_authors": new_authors[:40], "new_authors_total": len(new_authors),
+        "new_authors": new_authors and new_authors[:40],
+        "new_authors_total": new_authors and len(new_authors),
     }
     for kind, rows in rising.items():
-        out[f"rising_{kind}"] = rows[:15]
-        out[f"rising_{kind}_total"] = len(rows)
+        out[f"rising_{kind}"] = rows and rows[:15]
+        out[f"rising_{kind}_total"] = rows and len(rows)
     return {**out, "_note": note, **_status(reasons), "spend": c.spend_report()}
 
 

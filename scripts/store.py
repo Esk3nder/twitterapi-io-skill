@@ -233,6 +233,11 @@ def extract_tweet_media(t: dict) -> list[dict]:
         entities = t.get("entities") or {}
         candidates = entities.get("media") if isinstance(entities, dict) else []
 
+    if not candidates and isinstance(t.get("retweeted_tweet"), dict):
+        # A native retweet carries no media of its own: what it shows is the
+        # original post's, nested one level down.
+        return extract_tweet_media(t["retweeted_tweet"])
+
     out, seen = [], set()
     for item in candidates or []:
         if not isinstance(item, dict):

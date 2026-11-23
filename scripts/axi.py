@@ -212,14 +212,21 @@ def prepare_output(payload: dict, *, command: str, fields: str | None = None,
     collections = collections or {}
     defaults = defaults or {}
     for name, schema in collections.items():
-        records = list(out.get(name) or [])
         total_key = f"{name}_total"
-        total = int(out.pop(total_key, len(records)))
+        if name in out and out[name] is None:
+            # None means the job did not compute this list, which is not the
+            # same as computing it and finding nothing.
+            out.pop(total_key, None)
+            out[f"{name}_count"] = "not computed"
+            continue
+        records = list(out.get(name) or [])
+        total = out.pop(total_key, len(records))
         if schema and records and all(isinstance(item, dict) for item in records):
             selected = parse_fields(fields, schema, command, defaults.get(name))
             records = [project(item, selected, schema) for item in records]
         out[name] = records
-        out[f"{name}_count"] = f"{len(records)} of {total} total"
+        out[f"{name}_count"] = (f"{len(records)} of {int(total)} total" if total is not None
+                                else f"{len(records)} shown, total unknown")
         if not records:
             out[f"{name}_state"] = f"0 {name.replace('_', ' ')} found {context}"
     state = {"truncated": False}

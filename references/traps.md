@@ -49,8 +49,9 @@ inside one second. The walker splits such a second into replies and
 non-replies and searches each half; if a half is still full it reports
 `INCOMPLETE` with the affected timestamps rather than dropping them silently.
 
-**`from:USER` excludes native retweets.** Default `history` is originals +
-replies + quote tweets and prints that scope. Pass `--include-retweets` for a
+**`from:USER` returns some native retweets, not reliably all.** Default
+`history` keeps the ones it gets, counts them in its composition line, and
+prints that scope. Pass `--include-retweets` for a
 second `filter:nativeretweets` pass under the same ceiling. The two passes are
 deduplicated by id. `--include-retweets` needs the USER shorthand; a raw
 `--query` states its own retweet scope.
