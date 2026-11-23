@@ -12,7 +12,7 @@
 # - Hard-fails if a run exceeds $0.25, independent of test results.
 # - Missing key: prints a notice and exits 0 (skip, not failure).
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit
 
 BUDGET_USD="${E2E_BUDGET_USD:-0.25}"
 
@@ -36,10 +36,10 @@ echo
 FILES=(
   test_00_pure
   test_05_invariants
-  test_07_review_client
-  test_07_review_store
-  test_07_review_workflows
-  test_07_review_jobs
+  test_07_client
+  test_07_store
+  test_07_workflows
+  test_07_jobs
   test_08_docs
   test_axi
   test_verify

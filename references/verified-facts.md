@@ -262,10 +262,14 @@ query exhausted a $0.40 ceiling even with `min_faves:100` filtering. The guard
 correctly raised rather than returning a partial corpus. Bound narrative work
 with a tighter window, an engagement filter, or a deliberate higher ceiling.
 
-## `from:` search EXCLUDES native retweets — verified 2026-08-12
+## `from:` search and native retweets — changed between 2026-08-12 and 2026-11-22
 
-A `from:USER` advanced_search never returns native retweets. Measured on two
-accounts, so this is search-syntax behaviour, not an account quirk:
+On 2026-11-22 a `from:USER` advanced_search returned native retweets: 74 of 89
+rows for `from:jack` over 2026-11-01 to 2026-11-15, and 2 of 6 rows in a second
+account's one-day window. Whether it returns all of them is not measured, so
+`--include-retweets` still runs the dedicated `filter:nativeretweets` pass.
+
+On 2026-08-12 the same search returned none, on two accounts:
 
 | query | tweets | with `retweeted_tweet` |
 |---|---|---|

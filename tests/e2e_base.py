@@ -65,6 +65,18 @@ if os.path.realpath(STORE_DIR).startswith(_PROD_CACHE):
         f"E2E_STORE_DIR={STORE_DIR} resolves inside the production cache "
         f"{_PROD_CACHE}; refusing to run. Point E2E_STORE_DIR at a temp dir.")
 
+# scripts/ resolves its default store, and every other "~" path, from HOME
+# when it is first imported. Subprocesses get HOME overridden per call; this
+# covers in-process code, where a command that opens its default store would
+# otherwise write test fixtures into the production cache.
+os.environ["HOME"] = STORE_DIR
+import store  # noqa: E402
+
+if os.path.realpath(store.DEFAULT_DB).startswith(_PROD_CACHE):
+    raise RuntimeError(
+        f"scripts/store.py was imported before test isolation: its default "
+        f"store is {store.DEFAULT_DB}. Import tests.e2e_base first.")
+
 COST_LOG = os.environ.get("E2E_COST_LOG")
 
 
@@ -157,7 +169,7 @@ class E2ETest(unittest.TestCase):
         ~/.twitterapi-cache. Returns CompletedProcess; logs everything."""
         env = dict(os.environ)
         env["HOME"] = STORE_DIR
-        cmd = [sys.executable] + args
+        cmd = [sys.executable, *args]
         self.repro(f"HOME={STORE_DIR} {' '.join(cmd)}")
         p = subprocess.run(cmd, cwd=SCRIPTS, env=env, capture_output=True,
                            text=True, timeout=timeout)

@@ -72,7 +72,7 @@ class TestErrorSemantics(E2ETest):
                         "POST", "/oapi/x_user_stream/remove_user_from_monitor_tweet",
                         {"id_for_user": acct.get("id") or acct.get("id_for_user")})
                     self.dump_resp("cleanup attempt", cleanup)
-        except Exception as e:  # noqa: BLE001 — best-effort cleanup, then fail
+        except Exception as e:
             self.log(f"cleanup attempt failed: {type(e).__name__}: {e}")
         self.fail(
             "add_user_to_monitor_tweet did NOT return the expected body error. "

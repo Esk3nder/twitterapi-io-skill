@@ -21,8 +21,8 @@ TW_FMT = "%a %b %d %H:%M:%S %z %Y"
 class TestSelfOverlap(E2ETest):
     def test_overlap_with_self_is_identity_and_second_leg_is_cached(self):
         require_key()
-        from twitterapi import Client
         from jobs import overlap
+        from twitterapi import Client
         store = self.fresh_store("self_overlap")
         c = self.track(Client(verbose=False, store=store, max_usd=1.0))
         events = record_charges(c)
@@ -65,8 +65,8 @@ class TestDiffusionTrace(E2ETest):
 
     def test_diffusion_movers_are_only_replies_and_quotes_time_ordered(self):
         require_key()
-        from twitterapi import Client
         from jobs import diffusion_trace
+        from twitterapi import Client
         c = self.track(Client(verbose=False, max_usd=0.06,
                               store=self.fresh_store("diffusion")))
         self.repro(f"jobs.diffusion_trace('{self.TWEET}', limit=60)")

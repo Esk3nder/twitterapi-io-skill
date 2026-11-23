@@ -6,6 +6,8 @@ confident zero / false / empty — a missing field must stay unknown (NULL), and
 a present field is authoritative even when it is 0, False, or "".
 """
 import concurrent.futures
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -210,7 +212,7 @@ class TestTweetsMediaMigration(E2ETest):
                     "in_reply_to", "raw", "seen_at", "media"]
         for tid, old in before.items():
             self.assertEqual({c: after[tid][c] for c in old_cols},
-                             dict(zip(old_cols, old)),
+                             dict(zip(old_cols, old, strict=True)),
                              f"row {tid} changed during migration")
         self.assertEqual(sorted(cols), sorted(old_cols))
         indexes = {r["name"] for r in s.db.execute(
@@ -325,23 +327,71 @@ class TestConcurrentUnlockedReads(E2ETest):
             for fut in [pool.submit(work, i) for i in range(48)]:
                 try:
                     fut.result()
-                except Exception as exc:     # noqa: BLE001 — collect all
+                except Exception as exc:
                     errors.append(f"{type(exc).__name__}: {exc}")
         self.assertEqual(errors, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+class TestWalkReplaySurface(E2ETest):
+    def test_raw_tweets_returns_wire_records_in_order_or_nothing(self):
+        store = self.fresh_store("raw-tweets")
+        store.put_tweets([_tweet(id="1", text="one"), _tweet(id="2", text="two")])
+        self.assertEqual([t["text"] for t in store.raw_tweets(["2", "1"])],
+                         ["two", "one"])
+        self.assertEqual(store.raw_tweets([]), [])
+        self.assertIsNone(store.raw_tweets(["1", "missing"]),
+                          "a page with a missing row is not a page")
+
+    def test_drop_pages_removes_only_old_pages_of_that_endpoint(self):
+        store = self.fresh_store("drop-pages")
+        store.put_page("/search", {"q": "old"}, {"ids": []})
+        store.put_page("/followers", {"q": "old"}, {"ids": []})
+        store.db.execute("UPDATE pages SET fetched_at = fetched_at - 1000")
+        store.db.commit()
+        store.put_page("/search", {"q": "new"}, {"ids": []})
+        store.drop_pages("/search", 500)
+        self.assertIsNone(store.get_page("/search", {"q": "old"}))
+        self.assertIsNotNone(store.get_page("/search", {"q": "new"}))
+        self.assertIsNotNone(store.get_page("/followers", {"q": "old"}))
 
 
-class TestFollowerIdsNothingCached(unittest.TestCase):
+class TestStoreSize(E2ETest):
+    """D16: profiles were stored twice and every read loaded all of them."""
+
+    def test_accounts_keep_no_raw_copy_and_compact_drops_old_ones(self):
+        store = self.fresh_store("compact")
+        store.put_accounts([{"id": "1", "userName": "a", "followers": 5,
+                             "description": "bio"}])
+        self.assertIsNone(store.db.execute("SELECT raw FROM accounts").fetchone()[0])
+        store.db.execute("UPDATE accounts SET raw=?", ("x" * 500_000,))
+        store.db.commit()
+        freed = store.compact()
+        self.assertGreater(freed, 400_000)
+        self.assertEqual(store.profiles()["1"]["followers"], 5,
+                         "compacting drops the copy, not the profile")
+
+    def test_follower_lookup_reads_only_that_account_and_dates_the_crawl(self):
+        store = self.fresh_store("follower-narrow")
+        path = "/twitter/user/followers_ids"
+        store.put_page(path, {"userName": "a_b", "count": 5000},
+                       {"ids": ["1", "2"], "has_next_page": False})
+        # `_` is a LIKE wildcard: `axb` matches the SQL filter for `a_b`.
+        store.put_page(path, {"userName": "axb", "count": 5000},
+                       {"ids": ["9"], "has_next_page": False})
+        got = store.follower_ids_for("A_B")
+        self.assertEqual(list(got), ["1", "2"])
+        self.assertTrue(got.complete)
+        self.assertGreater(got.fetched_at, 0)
+        self.assertEqual(store.follower_ids_for("nobody").fetched_at, 0)
+
+
+class TestFollowerIdsNothingCached(E2ETest):
     """overlap probes the cache on every first run; an empty cache printed a
     false PARTIAL warning with a reason about crawl generations."""
 
     def test_empty_cache_is_unknown_and_silent(self):
-        import contextlib, io, os, tempfile
-        from store import Store
-        s = Store(os.path.join(tempfile.mkdtemp(prefix="fids-"), "s.db"))
+        s = self.fresh_store("fids-empty")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             got = s.follower_ids_for("nobody")
@@ -351,16 +401,14 @@ class TestFollowerIdsNothingCached(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
 
-class TestPutTweetsEmptyBatch(unittest.TestCase):
+class TestPutTweetsEmptyBatch(E2ETest):
     """Found by the diff review: `rows` was bound only inside `if parsed:`,
     so an empty batch (jobs.corpus stores every chunk, including one for an
     account with no posts in the window) raised UnboundLocalError and turned
     `brief` on a quiet account into an internal error."""
 
     def test_empty_and_idless_batches_store_nothing(self):
-        import tempfile
-        from store import Store
-        s = Store(os.path.join(tempfile.mkdtemp(prefix="empty-"), "s.db"))
+        s = self.fresh_store("empty-batch")
         self.assertEqual(s.put_tweets([]), 0)
         self.assertEqual(s.put_tweets([{"text": "no id"}]), 0)
 
@@ -368,6 +416,7 @@ class TestPutTweetsEmptyBatch(unittest.TestCase):
 class TestHandleCaseInCacheKey(unittest.TestCase):
     def test_handle_casing_shares_one_cache_entry(self):
         import tempfile
+
         from store import Store
         s = Store(os.path.join(tempfile.mkdtemp(prefix="case-"), "s.db"))
         self.addCleanup(s.close)
@@ -387,6 +436,7 @@ class TestHandleCaseInCacheKey(unittest.TestCase):
         keys (210 followings pages on the production store). Opening the
         store must make them reachable, not strand them as cache misses."""
         import tempfile
+
         from store import Store
         db = os.path.join(tempfile.mkdtemp(prefix="rekey-"), "s.db")
         Store(db).close()
@@ -414,3 +464,7 @@ class TestHandleCaseInCacheKey(unittest.TestCase):
                          {"v": "p2"})
         self.assertEqual(
             s.db.execute("SELECT COUNT(*) FROM pages").fetchone()[0], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

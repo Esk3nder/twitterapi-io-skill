@@ -32,7 +32,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from twitterapi import Client, ENDPOINTS, APIError, SetupError  # noqa: E402
+import twitterapi
+from twitterapi import ENDPOINTS, APIError, Client, SetupError
 
 FACTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "..", "references", "facts.json")
@@ -280,7 +281,7 @@ def check_contracts(c, facts, endpoint_names, observed_out=None):
 
         # The parser must still find records where the contract says they are.
         try:
-            items, has_next, cursor = Client._unpack(resp, spec)
+            items, _, _ = Client._unpack(resp, spec)
         except Exception as e:
             failures.append((name, "response contract failed", str(e)[:90]))
             _say(f"  FAIL   {name:22s} response contract: {str(e)[:60]}")
@@ -308,7 +309,7 @@ def check_pricing(c, facts):
 
     time.sleep(settle)
     b0 = bal()
-    n = len(list(c.follower_ids("kaitoinfra")))     # small page -> 15cr floor
+    list(c.follower_ids("kaitoinfra"))              # small page -> 15cr floor
     c.user_info("kaitoinfra")                       # profile -> 18cr
     time.sleep(settle)
     b1 = bal()
@@ -415,6 +416,10 @@ def _main(argv=None):
             "facts.json only when the live contract, not the client, moved"))
         return 1
 
+    if not a.quick:
+        os.makedirs(os.path.dirname(twitterapi.CHECKED_PATH), exist_ok=True)
+        with open(twitterapi.CHECKED_PATH, "w") as f:
+            f.write(time.strftime("%Y-%m-%d"))
     if a.update:
         facts["verified_at"] = time.strftime("%Y-%m-%d")
         for name, obs in observed.items():
